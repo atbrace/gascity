@@ -212,6 +212,7 @@
           {
             "group": "Operate",
             "pages": [
+              "runbooks/dolt-compact",
               "runbooks/managed-city-endpoints",
               "runbooks/remote-hardened-city"
             ]

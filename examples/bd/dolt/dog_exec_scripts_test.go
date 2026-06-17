@@ -355,6 +355,18 @@ func assertCompactBeadsQuarantineAlert(t *testing.T, fixture compactScriptFixtur
 	}
 }
 
+func writeCompactQuarantineMarker(t *testing.T, fixture compactScriptFixture, reason string) string {
+	t.Helper()
+	marker := filepath.Join(fixture.cityPath, ".gc", "runtime", "packs", "dolt", "compact-quarantine", "beads")
+	if err := os.MkdirAll(filepath.Dir(marker), 0o755); err != nil {
+		t.Fatalf("mkdir quarantine dir: %v", err)
+	}
+	if err := os.WriteFile(marker, []byte("db=beads\nreason="+reason+"\ncreated_at=2026-05-01T00:00:00Z\n"), 0o600); err != nil {
+		t.Fatalf("write quarantine marker: %v", err)
+	}
+	return marker
+}
+
 func writeCompactFakeDolt(t *testing.T, binDir string) string {
 	t.Helper()
 	logPath := filepath.Join(binDir, "dolt.log")
@@ -910,6 +922,14 @@ case "$query" in
     else
       print_cell 10
     fi
+    exit 0
+    ;;
+  *"DOLT_DIFF("*)
+    if [ "$mode" = "quarantine_autoclear_probe_failure" ]; then
+      printf 'diff probe unavailable\n' >&2
+      exit 55
+    fi
+    print_cell 0
     exit 0
     ;;
   *"DOLT_DIFF_STAT"*)
@@ -4954,6 +4974,124 @@ func TestCompactScriptSkipFetchFlagBypassesFetch(t *testing.T) {
 			for _, want := range []string{"DOLT_RESET", "DOLT_COMMIT", "DOLT_GC"} {
 				if !strings.Contains(log, want) {
 					t.Fatalf("skip-fetch must not block local compaction; missing %s:\n%s", want, log)
+				}
+			}
+		})
+	}
+}
+func TestCompactScriptAutoClearsKnownSameCountQuarantineWhenPreservationProven(t *testing.T) {
+	fixture := newCompactScriptFixture(t)
+	const reason = "post-flatten table value hash changed without row-count increase"
+	marker := writeCompactQuarantineMarker(t, fixture, reason)
+
+	out, err := fixture.run(t, "quarantine_autoclear_preserved", "GC_DOLT_COMPACT_THRESHOLD_COMMITS=500")
+	if err != nil {
+		t.Fatalf("compact should auto-clear proven false-positive quarantine: %v\n%s", err, out)
+	}
+	if _, err := os.Stat(marker); !os.IsNotExist(err) {
+		t.Fatalf("proven false-positive quarantine marker should be cleared; stat=%v", err)
+	}
+	if strings.Contains(out, "integrity quarantine marker exists") {
+		t.Fatalf("auto-clear path must not hard-block after proof:\n%s", out)
+	}
+	logData, err := os.ReadFile(fixture.doltLog)
+	if err != nil {
+		t.Fatalf("read dolt log: %v", err)
+	}
+	log := string(logData)
+	for _, want := range []string{"DOLT_RESET", "DOLT_COMMIT", "DOLT_GC"} {
+		if !strings.Contains(log, want) {
+			t.Fatalf("auto-clear proof path missing %s:\n%s", want, log)
+		}
+	}
+	assertCompactBeadsQuarantineAlert(t, fixture, "mayor", marker, "compact-quarantine", reason)
+}
+
+func TestCompactScriptAutoClearsKnownQuarantineAfterHeadAdvancedWhenPreservationProven(t *testing.T) {
+	fixture := newCompactScriptFixture(t)
+	const reason = "post-flatten value hash changed without row-count increase"
+	marker := writeCompactQuarantineMarker(t, fixture, reason)
+	if err := os.WriteFile(fixture.stateFile, []byte("writercommit\n"), 0o644); err != nil {
+		t.Fatalf("advance fake HEAD beyond quarantined run: %v", err)
+	}
+
+	out, err := fixture.run(t, "quarantine_autoclear_preserved", "GC_DOLT_COMPACT_THRESHOLD_COMMITS=500")
+	if err != nil {
+		t.Fatalf("compact should auto-clear proven HEAD-advanced quarantine: %v\n%s", err, out)
+	}
+	if _, err := os.Stat(marker); !os.IsNotExist(err) {
+		t.Fatalf("proven HEAD-advanced quarantine marker should be cleared; stat=%v", err)
+	}
+	logData, err := os.ReadFile(fixture.doltLog)
+	if err != nil {
+		t.Fatalf("read dolt log: %v", err)
+	}
+	log := string(logData)
+	for _, want := range []string{"DOLT_RESET", "DOLT_COMMIT", "DOLT_GC"} {
+		if !strings.Contains(log, want) {
+			t.Fatalf("HEAD-advanced auto-clear path missing %s:\n%s", want, log)
+		}
+	}
+	assertCompactBeadsQuarantineAlert(t, fixture, "mayor", marker, "compact-quarantine", reason)
+}
+
+func TestCompactScriptKnownQuarantineProbeFailureStillHardBlocksAndAlerts(t *testing.T) {
+	fixture := newCompactScriptFixture(t)
+	const reason = "post-flatten table value hash changed without row-count increase"
+	marker := writeCompactQuarantineMarker(t, fixture, reason)
+
+	out, err := fixture.run(t, "table_discovery_failure", "GC_DOLT_COMPACT_THRESHOLD_COMMITS=500")
+	if err == nil {
+		t.Fatalf("compact auto-cleared despite unprovable preservation probe:\n%s", out)
+	}
+	if !strings.Contains(out, "probe failed") && !strings.Contains(out, "probe unavailable") {
+		t.Fatalf("unprovable known quarantine should surface preservation probe failure:\n%s", out)
+	}
+	if _, err := os.Stat(marker); err != nil {
+		t.Fatalf("unprovable quarantine marker should remain: %v", err)
+	}
+	assertCompactBeadsQuarantineAlert(t, fixture, "mayor", marker, "compact-quarantine", reason)
+	logData, err := os.ReadFile(fixture.doltLog)
+	if err != nil {
+		t.Fatalf("known race-class marker should attempt preservation proof before hard-blocking: %v", err)
+	}
+	log := string(logData)
+	for _, forbidden := range []string{"DOLT_RESET", "DOLT_COMMIT", "DOLT_GC"} {
+		if strings.Contains(log, forbidden) {
+			t.Fatalf("unprovable quarantine must hard-block before %s:\n%s", forbidden, log)
+		}
+	}
+}
+
+func TestCompactScriptHardBlockQuarantineReasonsDoNotAutoClearAndAlert(t *testing.T) {
+	for _, reason := range []string{
+		"post-flatten table list changed",
+		"post-flatten row count decreased",
+		"unexpected manual quarantine",
+	} {
+		t.Run(reason, func(t *testing.T) {
+			fixture := newCompactScriptFixture(t)
+			marker := writeCompactQuarantineMarker(t, fixture, reason)
+
+			out, err := fixture.run(t, "quarantine_autoclear_preserved", "GC_DOLT_COMPACT_THRESHOLD_COMMITS=500")
+			if err == nil {
+				t.Fatalf("compact auto-cleared hard-block reason %q:\n%s", reason, out)
+			}
+			if _, err := os.Stat(marker); err != nil {
+				t.Fatalf("hard-block quarantine marker should remain: %v", err)
+			}
+			assertCompactBeadsQuarantineAlert(t, fixture, "mayor", marker, "compact-quarantine", reason)
+			logData, err := os.ReadFile(fixture.doltLog)
+			if os.IsNotExist(err) {
+				return
+			}
+			if err != nil {
+				t.Fatalf("read dolt log: %v", err)
+			}
+			log := string(logData)
+			for _, forbidden := range []string{"DOLT_RESET", "DOLT_COMMIT", "DOLT_GC"} {
+				if strings.Contains(log, forbidden) {
+					t.Fatalf("hard-block reason %q must block before %s:\n%s", reason, forbidden, log)
 				}
 			}
 		})

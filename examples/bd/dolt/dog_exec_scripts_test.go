@@ -17,26 +17,27 @@ func runDogScriptCommand(t *testing.T, scriptName, binDir, cityPath, dataDir str
 	t.Helper()
 	root := repoRoot(t)
 	cmd := exec.Command("bash", filepath.Join(root, "assets", "scripts", scriptName))
-	cmd.Env = append(filteredEnv(
-		"PATH",
-		"GC_CITY_PATH",
-		"GC_PACK_DIR",
-		"GC_DOLT_DATA_DIR",
-		"GC_DOLT_PORT",
-		"GC_DOLT_HOST",
-		"GC_DOLT_USER",
-		"GC_DOLT_PASSWORD",
-		"GC_BACKUP_DATABASES",
-		"GC_BACKUP_OFFSITE_PATH",
-		"GC_BACKUP_ARTIFACT_DIR",
-		"GC_PHANTOM_DATA_DIR",
-		"GC_ESCALATE_SCRIPT",
-		"GC_ESCALATE_SEARCH_PACKS",
-		"GC_ESCALATION_RECIPIENT",
-		"GC_SYSTEM_PACKS_DIR",
-		"DOLT_ESCALATE_SCRIPT",
-		"GC_MAINTENANCE_DONE_TARGET",
-	),
+	cmd.Env = append(
+		filteredEnv(
+			"PATH",
+			"GC_CITY_PATH",
+			"GC_PACK_DIR",
+			"GC_DOLT_DATA_DIR",
+			"GC_DOLT_PORT",
+			"GC_DOLT_HOST",
+			"GC_DOLT_USER",
+			"GC_DOLT_PASSWORD",
+			"GC_BACKUP_DATABASES",
+			"GC_BACKUP_OFFSITE_PATH",
+			"GC_BACKUP_ARTIFACT_DIR",
+			"GC_PHANTOM_DATA_DIR",
+			"GC_ESCALATE_SCRIPT",
+			"GC_ESCALATE_SEARCH_PACKS",
+			"GC_ESCALATION_RECIPIENT",
+			"GC_SYSTEM_PACKS_DIR",
+			"DOLT_ESCALATE_SCRIPT",
+			"GC_MAINTENANCE_DONE_TARGET",
+		),
 		"PATH="+binDir+":"+os.Getenv("PATH"),
 		"GC_CITY_PATH="+cityPath,
 		"GC_PACK_DIR="+root,
@@ -165,36 +166,37 @@ func (f compactScriptFixture) runWithArgs(t *testing.T, mode string, args []stri
 	t.Helper()
 	scriptArgs := append([]string{filepath.Join(f.root, "commands", "compact", "run.sh")}, args...)
 	cmd := exec.Command("sh", scriptArgs...)
-	cmd.Env = append(filteredEnv(
-		"PATH",
-		"GC_CITY_PATH",
-		"GC_PACK_DIR",
-		"GC_DOLT_DATA_DIR",
-		"GC_DOLT_PORT",
-		"GC_DOLT_HOST",
-		"GC_DOLT_USER",
-		"GC_DOLT_PASSWORD",
-		"GC_DOLT_MANAGED_LOCAL",
-		"GC_DOLT_COMPACT_THRESHOLD_COMMITS",
-		"GC_DOLT_COMPACT_CALL_TIMEOUT_SECS",
-		"GC_DOLT_COMPACT_PUSH_TIMEOUT_SECS",
-		"GC_DOLT_COMPACT_DRY_RUN",
-		"GC_DOLT_COMPACT_ONLY_DBS",
-		"GC_DOLT_COMPACT_REMOTE",
-		"GC_DOLT_COMPACT_BARE_GC",
-		"GC_DOLT_RIG_LIST_TIMEOUT_SECS",
-		"GC_DOLT_COMPACT_ALERT_TO",
-		"GC_FAKE_DOLT_COMPACT_MODE",
-		"GC_FAKE_DOLT_COUNT_FILE",
-		"GC_FAKE_DOLT_STATE_FILE",
-		"GC_FAKE_DOLT_HASH_STATE_FILE",
-		"GC_PACK_STATE_DIR",
-		"GC_CITY_RUNTIME_DIR",
-		"GC_DOLT_COMPACT_MIN_FREE_BYTES",
-		"GC_FAKE_DF_MODE",
-		"GC_DOLT_COMPACT_BACKUP_REMOTE",
-		"GC_DOLT_COMPACT_BACKUP_TIMEOUT_SECS",
-	),
+	cmd.Env = append(
+		filteredEnv(
+			"PATH",
+			"GC_CITY_PATH",
+			"GC_PACK_DIR",
+			"GC_DOLT_DATA_DIR",
+			"GC_DOLT_PORT",
+			"GC_DOLT_HOST",
+			"GC_DOLT_USER",
+			"GC_DOLT_PASSWORD",
+			"GC_DOLT_MANAGED_LOCAL",
+			"GC_DOLT_COMPACT_THRESHOLD_COMMITS",
+			"GC_DOLT_COMPACT_CALL_TIMEOUT_SECS",
+			"GC_DOLT_COMPACT_PUSH_TIMEOUT_SECS",
+			"GC_DOLT_COMPACT_DRY_RUN",
+			"GC_DOLT_COMPACT_ONLY_DBS",
+			"GC_DOLT_COMPACT_REMOTE",
+			"GC_DOLT_COMPACT_BARE_GC",
+			"GC_DOLT_RIG_LIST_TIMEOUT_SECS",
+			"GC_DOLT_COMPACT_ALERT_TO",
+			"GC_FAKE_DOLT_COMPACT_MODE",
+			"GC_FAKE_DOLT_COUNT_FILE",
+			"GC_FAKE_DOLT_STATE_FILE",
+			"GC_FAKE_DOLT_HASH_STATE_FILE",
+			"GC_PACK_STATE_DIR",
+			"GC_CITY_RUNTIME_DIR",
+			"GC_DOLT_COMPACT_MIN_FREE_BYTES",
+			"GC_FAKE_DF_MODE",
+			"GC_DOLT_COMPACT_BACKUP_REMOTE",
+			"GC_DOLT_COMPACT_BACKUP_TIMEOUT_SECS",
+		),
 		"PATH="+f.binDir+":"+os.Getenv("PATH"),
 		"GC_CITY_PATH="+f.cityPath,
 		"GC_PACK_DIR="+f.root,
@@ -1202,7 +1204,8 @@ func TestCompactScriptPushesActiveBranchToRemote(t *testing.T) {
 
 func TestCompactScriptUsesRefspecEnvOverrideForRemoteBranch(t *testing.T) {
 	fixture := newCompactScriptFixture(t)
-	out, err := fixture.run(t, "remote_active_branch",
+	out, err := fixture.run(
+		t, "remote_active_branch",
 		"GC_DOLT_COMPACT_THRESHOLD_COMMITS=500",
 		"GC_DOLT_REFSPEC_BEADS=gascity-3:trunk",
 	)
@@ -1230,7 +1233,8 @@ func TestCompactScriptUsesRefspecEnvOverrideForRemoteBranch(t *testing.T) {
 
 func TestCompactScriptRejectsRefspecEnvOverrideForDifferentActiveBranch(t *testing.T) {
 	fixture := newCompactScriptFixture(t)
-	out, err := fixture.run(t, "remote_active_branch",
+	out, err := fixture.run(
+		t, "remote_active_branch",
 		"GC_DOLT_COMPACT_THRESHOLD_COMMITS=500",
 		"GC_DOLT_REFSPEC_BEADS=main:trunk",
 	)
@@ -1254,7 +1258,8 @@ func TestCompactScriptRejectsRefspecEnvOverrideForDifferentActiveBranch(t *testi
 
 func TestCompactScriptRefspecOptionShapedOverrideFails(t *testing.T) {
 	fixture := newCompactScriptFixture(t)
-	out, err := fixture.run(t, "remote_success",
+	out, err := fixture.run(
+		t, "remote_success",
 		"GC_DOLT_COMPACT_THRESHOLD_COMMITS=500",
 		"GC_DOLT_REFSPEC_BEADS=--force",
 	)
@@ -1532,7 +1537,8 @@ func TestCompactScriptRetriesPendingPushWhenRemoteHeadBecomesLocalLogAncestor(t 
 
 func TestCompactScriptRetriesPendingPushWithRefspecRemoteBranch(t *testing.T) {
 	fixture := newCompactScriptFixture(t)
-	firstOut, err := fixture.run(t, "remote_push_failure",
+	firstOut, err := fixture.run(
+		t, "remote_push_failure",
 		"GC_DOLT_COMPACT_THRESHOLD_COMMITS=500",
 		"GC_DOLT_REFSPEC_BEADS=main:gascity-3",
 	)
@@ -1872,7 +1878,8 @@ func TestCompactScriptDryRunReportsStalePendingPushMarker(t *testing.T) {
 	pendingPush := filepath.Join(fixture.cityPath, ".gc", "runtime", "packs", "dolt", "compact-pending-push", "beads")
 	replaceCompactMarkerCreatedAt(t, pendingPush, "1970-01-01T00:00:00Z")
 
-	dryRunOut, err := fixture.run(t, "remote_success",
+	dryRunOut, err := fixture.run(
+		t, "remote_success",
 		"GC_DOLT_COMPACT_THRESHOLD_COMMITS=500",
 		"GC_DOLT_COMPACT_DRY_RUN=1",
 	)
@@ -3368,7 +3375,8 @@ func TestCompactScriptQuarantineAlertRecipientCanBeOverridden(t *testing.T) {
 		t.Fatalf("write quarantine marker: %v", err)
 	}
 
-	out, err := fixture.run(t, "success",
+	out, err := fixture.run(
+		t, "success",
 		"GC_DOLT_COMPACT_THRESHOLD_COMMITS=500",
 		"GC_DOLT_COMPACT_ALERT_TO=gascity/operator",
 	)
@@ -3406,7 +3414,8 @@ func TestCompactScriptAllowsExplicitLocalExternalEndpointWithoutManagedState(t *
 		t.Fatalf("mkdir external target db: %v", err)
 	}
 
-	out, err := fixture.run(t, "success",
+	out, err := fixture.run(
+		t, "success",
 		"GC_DOLT_MANAGED_LOCAL=0",
 		"GC_DOLT_HOST=127.0.0.2",
 		"GC_DOLT_DATA_DIR="+externalRoot,
@@ -3439,7 +3448,8 @@ func TestCompactScriptAllowsExplicitLocalExternalEndpointWithoutManagedState(t *
 
 func TestCompactScriptSkipsNonLocalExternalEndpoint(t *testing.T) {
 	fixture := newCompactScriptFixture(t)
-	out, err := fixture.run(t, "success",
+	out, err := fixture.run(
+		t, "success",
 		"GC_DOLT_MANAGED_LOCAL=0",
 		"GC_DOLT_HOST=external.example.internal",
 		"GC_DOLT_PORT=3307",
@@ -3471,7 +3481,8 @@ func TestCompactScriptSkipsNonLocalExternalEndpointWithoutPort(t *testing.T) {
 		t.Fatalf("mkdir external target root: %v", err)
 	}
 
-	out, err := fixture.run(t, "success",
+	out, err := fixture.run(
+		t, "success",
 		"GC_DOLT_MANAGED_LOCAL=0",
 		"GC_DOLT_HOST=external.example.internal",
 		"GC_DOLT_PORT=",
@@ -3528,7 +3539,8 @@ func TestCompactScriptOnlyDBsAllowlistFiltersDatabases(t *testing.T) {
 
 func TestCompactScriptOnlyDBsCanTargetUndiscoveredDatabase(t *testing.T) {
 	fixture := newCompactScriptFixture(t)
-	out, err := fixture.run(t, "success",
+	out, err := fixture.run(
+		t, "success",
 		"GC_DOLT_COMPACT_THRESHOLD_COMMITS=500",
 		"GC_DOLT_COMPACT_ONLY_DBS=ga",
 		"GC_DOLT_COMPACT_DRY_RUN=1",
@@ -4227,7 +4239,8 @@ exit 0
 	var secondOut string
 	var secondErr error
 	go func() {
-		secondOut, secondErr = runDogScriptCommand(t, "mol-dog-backup.sh", binDir, cityPath, dataDir,
+		secondOut, secondErr = runDogScriptCommand(
+			t, "mol-dog-backup.sh", binDir, cityPath, dataDir,
 			"GC_BACKUP_DATABASES=prod",
 			"GC_DOLT_BACKUP_LOCK_WAIT_SECONDS=0",
 		)
@@ -5019,6 +5032,7 @@ func TestCompactScriptSkipFetchFlagBypassesFetch(t *testing.T) {
 		})
 	}
 }
+
 func TestCompactScriptAutoClearsKnownSameCountQuarantineWhenPreservationProven(t *testing.T) {
 	fixture := newCompactScriptFixture(t)
 	const reason = "post-flatten table value hash changed without row-count increase"
@@ -5226,6 +5240,7 @@ func TestCompactScriptSkipFetchRejectsInvalidValue(t *testing.T) {
 		}
 	}
 }
+
 func TestCompactScriptDiskPreflightSufficientProceedsNormally(t *testing.T) {
 	fixture := newCompactScriptFixture(t)
 	out, err := fixture.run(t, "success")
@@ -5345,7 +5360,8 @@ func TestCompactScriptBackupSyncFailureBeforeFlattenExitsOne(t *testing.T) {
 
 func TestCompactScriptBackupSyncSuccessBeforeBareGC(t *testing.T) {
 	fixture := newCompactScriptFixture(t)
-	out, err := fixture.run(t, "success",
+	out, err := fixture.run(
+		t, "success",
 		"GC_DOLT_COMPACT_BACKUP_REMOTE=prod-backup",
 		"GC_DOLT_COMPACT_BARE_GC=1",
 	)
@@ -5359,7 +5375,8 @@ func TestCompactScriptBackupSyncSuccessBeforeBareGC(t *testing.T) {
 
 func TestCompactScriptBackupSyncFailureBeforeBareGCExitsOne(t *testing.T) {
 	fixture := newCompactScriptFixture(t)
-	out, err := fixture.run(t, "backup_sync_failure_bare_gc",
+	out, err := fixture.run(
+		t, "backup_sync_failure_bare_gc",
 		"GC_DOLT_COMPACT_BACKUP_REMOTE=prod-backup",
 		"GC_DOLT_COMPACT_BARE_GC=1",
 	)
@@ -5383,7 +5400,8 @@ func TestCompactScriptBackupInvalidRemoteNameExitsTwo(t *testing.T) {
 
 func TestCompactScriptBackupInvalidTimeoutExitsTwo(t *testing.T) {
 	fixture := newCompactScriptFixture(t)
-	out, err := fixture.run(t, "success",
+	out, err := fixture.run(
+		t, "success",
 		"GC_DOLT_COMPACT_BACKUP_REMOTE=prod-backup",
 		"GC_DOLT_COMPACT_BACKUP_TIMEOUT_SECS=notanumber",
 	)

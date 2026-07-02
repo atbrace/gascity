@@ -23,6 +23,78 @@ import (
 // target is passed as a positional argument to the outer sh -c command, not
 // interpolated into the nested shell body. That keeps routes containing shell
 // metacharacters as data instead of executable syntax.
+
+// bdFatalSkewSignatures are stderr substrings that identify a bd schema-skew
+// / unreachable-database hard failure, as opposed to any other non-zero bd
+// exit (which the guarded probes below continue to treat as "try the next
+// candidate", exactly as before this fix). Mirrored by the gc doctor
+// schema-skew check (doctor_bd_schema_skew.go) so both surfaces recognize
+// the same condition.
+var bdFatalSkewSignatures = []string{
+	"schema version mismatch",
+	"Unable to open database",
+}
+
+// bdFatalGuardFunctionName is the shell function name the guarded probe
+// helpers below invoke. Keep in sync with bdFatalGuardFunctionScript.
+const bdFatalGuardFunctionName = "bd_or_fatal"
+
+// bdFatalGuardFunctionScript emits a `sh` function definition that wraps a
+// bd invocation so a schema-skew / unreachable-database hard failure aborts
+// the work-query script (non-zero exit, stderr preserved) instead of being
+// silently swallowed as an empty result — the bug behind ga-qyw3wn. A
+// genuine empty result (bd exit 0, any stdout) is returned unchanged. Any
+// OTHER non-zero bd exit (a transient lock, etc.) still falls through
+// silently exactly as it did before this fix; only the named signature is
+// treated as fatal.
+//
+// The function prints its bd invocation's stdout and returns 0 on success,
+// returns 1 (no stdout) on an ordinary failure, and returns 2 (stderr
+// printed to fd 2) on a fatal schema-skew failure. Callers must prepend
+// this exactly once per generated `sh -c` script, before the first call
+// site that references bdFatalGuardFunctionName (see bdOrFatalGuarded).
+//
+// On failure it re-runs the same bd invocation once more to classify the
+// stderr text, since the primary invocation's stderr is discarded to avoid
+// corrupting the captured stdout on success. This doubles bd's invocation
+// count only on the (exceptional) failure path.
+func bdFatalGuardFunctionScript() string {
+	return bdFatalGuardFunctionName + `() { ` +
+		`__bdf_out=$("$@" 2>/dev/null); __bdf_rc=$?; ` +
+		`if [ $__bdf_rc -ne 0 ]; then ` +
+		`__bdf_err=$("$@" 2>&1 >/dev/null); ` +
+		`case "$__bdf_err" in ` + bdFatalSkewCaseClauses() + `) printf '%s\n' "$__bdf_err" >&2; return 2 ;; esac; ` +
+		`return 1; ` +
+		`fi; ` +
+		`printf '%s' "$__bdf_out"; ` +
+		`return 0; ` +
+		`}; `
+}
+
+// bdFatalSkewCaseClauses renders bdFatalSkewSignatures as `sh` case-pattern
+// clauses, e.g. `*"a"*|*"b"*`.
+func bdFatalSkewCaseClauses() string {
+	var b strings.Builder
+	for i, sig := range bdFatalSkewSignatures {
+		if i > 0 {
+			b.WriteString("|")
+		}
+		b.WriteString(`*"` + sig + `"*`)
+	}
+	return b.String()
+}
+
+// bdOrFatalGuarded prefixes a bd command (without its own stderr redirect)
+// with the bdFatalGuardFunctionName shell function, so callers wrap a probe
+// as `r=$(` + bdOrFatalGuarded(cmd) + `); rc=$?` and then check
+// `[ $rc -eq 2 ] && exit 1` immediately after — in a bare context, not
+// nested inside another command substitution, so the exit actually
+// terminates the script (see poolDemandFirstRowFunctionScript for the one
+// call site that must relay this through a nested subshell instead).
+func bdOrFatalGuarded(cmd string) string {
+	return bdFatalGuardFunctionName + " " + cmd
+}
+
 func bdReadyIncludeEphemeralArg(includeEphemeralReady bool) string {
 	if includeEphemeralReady {
 		return " --include-ephemeral"
@@ -92,15 +164,22 @@ func legacyEphemeralPoolDemandShell(limit int, includeEphemeralReady, quiet bool
 			` | select((`+jqMeta(beadmeta.RoutedToMetadataKey)+` == $target) or ((`+jqMeta(beadmeta.RoutedToMetadataKey)+` == "") and (`+jqMeta(beadmeta.RunTargetMetadataKey)+` == $target) and (`+jqMeta(beadmeta.KindMetadataKey)+` == "`+beadmeta.KindWorkflow+`")))`,
 		limit,
 	)
-	query := bdQueryEphemeralStatusShell("open")
-	if quiet {
-		query = bdQueryEphemeralStatusQuietShell("open")
+	if !quiet {
+		query := bdQueryEphemeralStatusShell("open")
+		return `{ ` + query + ` | jq --arg target "$target" ` + shellquote.Quote(filter) + `; } || printf "[]"`
 	}
-	jqStderr := ""
-	if quiet {
-		jqStderr = ` 2>/dev/null`
-	}
-	return `{ ` + query + ` | jq --arg target "$target" ` + shellquote.Quote(filter) + jqStderr + `; } || printf "[]"`
+	// quiet: this snippet becomes the body of the caller's own command
+	// substitution (legacy_ephemeral_candidates=$(...)), so a bare `exit`
+	// here would only terminate that subshell, not the whole script. Exit
+	// the subshell with a distinguishing status (2) on a fatal schema-skew
+	// failure instead, and rely on the caller checking $? right after the
+	// assignment (see poolDemandFirstRowFunctionScript) to relay it as a
+	// real script-terminating exit. An ordinary (non-skew) bd failure still
+	// resolves to a plain "[]", matching the non-quiet branch above.
+	return `bdq=$(` + bdOrFatalGuarded(bdQueryEphemeralStatusShell("open")) + `); bd_rc=$?; ` +
+		`[ $bd_rc -eq 2 ] && exit 2; ` +
+		`[ $bd_rc -ne 0 ] && printf "[]" && exit 0; ` +
+		`printf '%s' "$bdq" | jq --arg target "$target" ` + shellquote.Quote(filter) + ` 2>/dev/null || printf "[]"`
 }
 
 // poolDemandFirstRowFunctionScript emits the work_query Tier 3 function: it
@@ -111,12 +190,18 @@ func poolDemandFirstRowFunctionScript(includeEphemeralReady bool) string {
 	return `probe_pool_demand() { ` +
 		`target="$1"; ` +
 		`[ -z "$target" ] && return 1; ` +
-		`r=$(` + routedReadyTierCommand(includeEphemeralReady) + `); ` +
+		`r=$(` + bdOrFatalGuarded(routedReadyTierCommand(includeEphemeralReady)) + `); bd_rc=$?; ` +
+		`[ $bd_rc -eq 2 ] && exit 1; ` +
 		`[ -n "$r" ] && [ "$r" != "[]" ] && printf "%s" "$r" && exit 0; ` +
-		`legacy_candidates=$(` + bdReadyPoolDemandMigrationShell("--limit=20", includeEphemeralReady) + ` 2>/dev/null); ` +
+		`legacy_candidates=$(` + bdOrFatalGuarded(bdReadyPoolDemandMigrationShell("--limit=20", includeEphemeralReady)) + `); bd_rc=$?; ` +
+		`[ $bd_rc -eq 2 ] && exit 1; ` +
 		`r=$(printf "%s" "$legacy_candidates" | ` + poolDemandMigrationFilterJQ(1) + ` 2>/dev/null); ` +
 		`[ -n "$r" ] && [ "$r" != "[]" ] && printf "%s" "$r" && exit 0; ` +
-		`legacy_ephemeral_candidates=$(` + legacyEphemeralPoolDemandShell(20, includeEphemeralReady, true) + `); ` +
+		// legacyEphemeralPoolDemandShell's quiet snippet runs inside this
+		// assignment's own command substitution; it exits that subshell
+		// with status 2 on fatal skew, which we relay here via $?.
+		`legacy_ephemeral_candidates=$(` + legacyEphemeralPoolDemandShell(20, includeEphemeralReady, true) + `); bd_rc=$?; ` +
+		`[ $bd_rc -eq 2 ] && exit 1; ` +
 		`r=$(printf "%s" "$legacy_ephemeral_candidates" | jq '.[0:1]' 2>/dev/null); ` +
 		`[ -n "$r" ] && [ "$r" != "[]" ] && printf "%s" "$r" && exit 0; ` +
 		`return 1; ` +
@@ -130,7 +215,9 @@ func routedReadyTierCommand(includeEphemeralReady bool) string {
 	// self-blocked head (is_blocked / status==blocked) has Ready routed work
 	// behind it to fall through to instead of idle-exiting; the hook layer
 	// (filterUnreadyHookCandidates) strips the blocked head from the result.
-	return bdReadyPoolDemandShell("--sort oldest --limit=20", includeEphemeralReady) + ` 2>/dev/null`
+	// No trailing redirect here: the caller wraps this with bdOrFatalGuarded,
+	// which owns stderr handling.
+	return bdReadyPoolDemandShell("--sort oldest --limit=20", includeEphemeralReady)
 }
 
 // poolDemandCountShell emits the reconciler count-form for target: it counts
@@ -170,7 +257,8 @@ func standardAssignedWorkQueryScript(includeEphemeralReady bool) string {
 func standardAssignedInProgressWorkQueryScript(includeEphemeralReady bool) string {
 	return `for id in "$GC_SESSION_ID" "$GC_SESSION_NAME" "$GC_ALIAS"; do ` +
 		`[ -z "$id" ] && continue; ` +
-		`r=$(bd list --status in_progress --assignee="$id" --json --limit=1 2>/dev/null); ` +
+		`r=$(` + bdOrFatalGuarded(`bd list --status in_progress --assignee="$id" --json --limit=1`) + `); bd_rc=$?; ` +
+		`[ $bd_rc -eq 2 ] && exit 1; ` +
 		`[ -n "$r" ] && [ "$r" != "[]" ] && printf "%s" "$r" && exit 0; ` +
 		ephemeralAssignedInProgressProbeScript("id", includeEphemeralReady) +
 		`done; `
@@ -179,7 +267,8 @@ func standardAssignedInProgressWorkQueryScript(includeEphemeralReady bool) strin
 func standardAssignedReadyWorkQueryScript(includeEphemeralReady bool) string {
 	return `for id in "$GC_SESSION_ID" "$GC_SESSION_NAME" "$GC_ALIAS"; do ` +
 		`[ -z "$id" ] && continue; ` +
-		`r=$(bd ready` + bdReadyIncludeEphemeralArg(includeEphemeralReady) + ` --assignee="$id" --json --limit=1 2>/dev/null); ` +
+		`r=$(` + bdOrFatalGuarded(`bd ready`+bdReadyIncludeEphemeralArg(includeEphemeralReady)+` --assignee="$id" --json --limit=1`) + `); bd_rc=$?; ` +
+		`[ $bd_rc -eq 2 ] && exit 1; ` +
 		`[ -n "$r" ] && [ "$r" != "[]" ] && printf "%s" "$r" && exit 0; ` +
 		ephemeralAssignedReadyProbeScript("id", includeEphemeralReady) +
 		`done; `
@@ -196,7 +285,8 @@ func legacyControlAssignedInProgressWorkQueryScript(includeEphemeralReady bool) 
 		`legacy=""; case "$id" in *control-dispatcher) legacy="${id%control-dispatcher}workflow-control";; esac; ` +
 		`for cand in "$id" "$legacy"; do ` +
 		`[ -z "$cand" ] && continue; ` +
-		`r=$(bd list --status in_progress --assignee="$cand" --json --limit=1 2>/dev/null); ` +
+		`r=$(` + bdOrFatalGuarded(`bd list --status in_progress --assignee="$cand" --json --limit=1`) + `); bd_rc=$?; ` +
+		`[ $bd_rc -eq 2 ] && exit 1; ` +
 		`[ -n "$r" ] && [ "$r" != "[]" ] && printf "%s" "$r" && exit 0; ` +
 		ephemeralAssignedInProgressProbeScript("cand", includeEphemeralReady) +
 		`done; ` +
@@ -209,7 +299,8 @@ func legacyControlAssignedReadyWorkQueryScript(includeEphemeralReady bool) strin
 		`legacy=""; case "$id" in *control-dispatcher) legacy="${id%control-dispatcher}workflow-control";; esac; ` +
 		`for cand in "$id" "$legacy"; do ` +
 		`[ -z "$cand" ] && continue; ` +
-		`r=$(bd ready` + bdReadyIncludeEphemeralArg(includeEphemeralReady) + ` --assignee="$cand" --json --limit=1 2>/dev/null); ` +
+		`r=$(` + bdOrFatalGuarded(`bd ready`+bdReadyIncludeEphemeralArg(includeEphemeralReady)+` --assignee="$cand" --json --limit=1`) + `); bd_rc=$?; ` +
+		`[ $bd_rc -eq 2 ] && exit 1; ` +
 		`[ -n "$r" ] && [ "$r" != "[]" ] && printf "%s" "$r" && exit 0; ` +
 		ephemeralAssignedReadyProbeScript("cand", includeEphemeralReady) +
 		`done; ` +
@@ -218,8 +309,9 @@ func legacyControlAssignedReadyWorkQueryScript(includeEphemeralReady bool) strin
 
 func ephemeralAssignedInProgressProbeScript(shellVar string, includeEphemeralReady bool) string {
 	_ = includeEphemeralReady
-	return `r=$(` + bdQueryEphemeralStatusQuietShell("in_progress") + ` | ` +
-		`jq --arg id "$` + shellVar + `" '[.[] | select((.assignee // "") == $id)] | .[:1]' 2>/dev/null); ` +
+	return `ebdq=$(` + bdOrFatalGuarded(bdQueryEphemeralStatusShell("in_progress")) + `); bd_rc=$?; ` +
+		`[ $bd_rc -eq 2 ] && exit 1; ` +
+		`r=$(printf '%s' "$ebdq" | jq --arg id "$` + shellVar + `" '[.[] | select((.assignee // "") == $id)] | .[:1]' 2>/dev/null); ` +
 		`[ -n "$r" ] && [ "$r" != "[]" ] && printf "%s" "$r" && exit 0; `
 }
 
@@ -228,8 +320,9 @@ func ephemeralAssignedReadyProbeScript(shellVar string, includeEphemeralReady bo
 		return ""
 	}
 	filter := legacyEphemeralReadyFilterJQ(`select((.assignee // "") == $id)`, 1)
-	return `r=$(` + bdQueryEphemeralStatusQuietShell("open") + ` | ` +
-		`jq --arg id "$` + shellVar + `" ` + shellquote.Quote(filter) + ` 2>/dev/null); ` +
+	return `ebdq=$(` + bdOrFatalGuarded(bdQueryEphemeralStatusShell("open")) + `); bd_rc=$?; ` +
+		`[ $bd_rc -eq 2 ] && exit 1; ` +
+		`r=$(printf '%s' "$ebdq" | jq --arg id "$` + shellVar + `" ` + shellquote.Quote(filter) + ` 2>/dev/null); ` +
 		`[ -n "$r" ] && [ "$r" != "[]" ] && printf "%s" "$r" && exit 0; `
 }
 
@@ -241,7 +334,7 @@ func poolDemandOriginGateScript() string {
 }
 
 func routedPoolWorkQueryProbeScript(includeEphemeralReady bool, targetCount int) string {
-	script := poolDemandOriginGateScript() + poolDemandFirstRowFunctionScript(includeEphemeralReady)
+	script := bdFatalGuardFunctionScript() + poolDemandOriginGateScript() + poolDemandFirstRowFunctionScript(includeEphemeralReady)
 	for i := 1; i <= targetCount; i++ {
 		script += fmt.Sprintf(`probe_pool_demand "$%d"; `, i)
 	}
@@ -358,14 +451,16 @@ func buildWorkQuery(a *Agent, includeEphemeralReady bool) string {
 	target := a.poolDemandTarget()
 	legacyTarget := legacyWorkflowControlQualifiedName(target)
 	if legacyTarget == "" {
-		script := standardAssignedWorkQueryScript(includeEphemeralReady) +
+		script := bdFatalGuardFunctionScript() +
+			standardAssignedWorkQueryScript(includeEphemeralReady) +
 			poolDemandOriginGateScript() +
 			poolDemandFirstRowFunctionScript(includeEphemeralReady) +
 			`probe_pool_demand "$1"; ` +
 			`printf "[]"`
 		return shellquote.Join([]string{"sh", "-c", script, "--", target})
 	}
-	script := legacyControlAssignedWorkQueryScript(includeEphemeralReady) +
+	script := bdFatalGuardFunctionScript() +
+		legacyControlAssignedWorkQueryScript(includeEphemeralReady) +
 		poolDemandOriginGateScript() +
 		poolDemandFirstRowFunctionScript(includeEphemeralReady) +
 		`probe_pool_demand "$1"; ` +
@@ -391,9 +486,9 @@ func (a *Agent) EffectiveAssignedInProgressQueryForBeads(beads BeadsConfig) stri
 func buildAssignedInProgressQuery(a *Agent, includeEphemeralReady bool) string {
 	target := a.poolDemandTarget()
 	if legacyWorkflowControlQualifiedName(target) != "" {
-		return shellquote.Join([]string{"sh", "-c", legacyControlAssignedInProgressWorkQueryScript(includeEphemeralReady) + `printf "[]"`})
+		return shellquote.Join([]string{"sh", "-c", bdFatalGuardFunctionScript() + legacyControlAssignedInProgressWorkQueryScript(includeEphemeralReady) + `printf "[]"`})
 	}
-	return shellquote.Join([]string{"sh", "-c", standardAssignedInProgressWorkQueryScript(includeEphemeralReady) + `printf "[]"`})
+	return shellquote.Join([]string{"sh", "-c", bdFatalGuardFunctionScript() + standardAssignedInProgressWorkQueryScript(includeEphemeralReady) + `printf "[]"`})
 }
 
 // EffectiveAssignedReadyQuery returns the assigned-ready-only command for
@@ -413,9 +508,9 @@ func (a *Agent) EffectiveAssignedReadyQueryForBeads(beads BeadsConfig) string {
 func buildAssignedReadyQuery(a *Agent, includeEphemeralReady bool) string {
 	target := a.poolDemandTarget()
 	if legacyWorkflowControlQualifiedName(target) != "" {
-		return shellquote.Join([]string{"sh", "-c", legacyControlAssignedReadyWorkQueryScript(includeEphemeralReady) + `printf "[]"`})
+		return shellquote.Join([]string{"sh", "-c", bdFatalGuardFunctionScript() + legacyControlAssignedReadyWorkQueryScript(includeEphemeralReady) + `printf "[]"`})
 	}
-	return shellquote.Join([]string{"sh", "-c", standardAssignedReadyWorkQueryScript(includeEphemeralReady) + `printf "[]"`})
+	return shellquote.Join([]string{"sh", "-c", bdFatalGuardFunctionScript() + standardAssignedReadyWorkQueryScript(includeEphemeralReady) + `printf "[]"`})
 }
 
 // EffectiveRoutedPoolQuery returns the routed-pool-only command for prompt

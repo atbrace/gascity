@@ -58,6 +58,7 @@ v2-routed-to-namespace
 run-target-routed-to-backfill
 work-option-metadata-migration
 backlog-depth
+bd-schema-skew
 order-tracking-retention
 session-model
 dolt-server

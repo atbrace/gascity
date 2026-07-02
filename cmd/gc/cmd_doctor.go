@@ -297,6 +297,7 @@ func buildDoctorChecks(cityPath string, cfg *config.City, cfgErr error, opts bui
 		register(newRunTargetRoutedToBackfillCheck(cfg, cityPath, storeFactory))
 		register(newWorkOptionMetadataMigrationCheck(cfg, cityPath, storeFactory))
 		register(newBacklogDepthCheck(cityPath, storeFactory))
+		register(newBdSchemaSkewCheck(cityPath))
 		register(newOrderTrackingRetentionCheck(cityPath, storeFactory))
 		register(&sessionModelDoctorCheck{cfg: cfg, cityPath: cityPath, newStore: storeFactory})
 	}

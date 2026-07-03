@@ -1888,7 +1888,7 @@ func TestInstallOverlayManagedProviders(t *testing.T) {
 	}
 	antigravityHooks := string(fs.Files["/work/.agents/hooks.json"])
 	for hookName, wantCommand := range map[string]string{
-		"gascity-prime":       `GC_PROVIDER_SESSION_ID_REQUIRED=antigravity GC_PROVIDER_SESSION_ID=\"${ANTIGRAVITY_CONVERSATION_ID:-}\" GC_MANAGED_SESSION_HOOK=1 GC_HOOK_EVENT_NAME=SessionStart gc prime --hook --hook-format antigravity`,
+		"gascity-prime":       jsonEscape(t, antigravityGuardShellNoExit()) + `; GC_PROVIDER_SESSION_ID_REQUIRED=antigravity GC_PROVIDER_SESSION_ID=\"${ANTIGRAVITY_CONVERSATION_ID:-}\" GC_MANAGED_SESSION_HOOK=1 GC_HOOK_EVENT_NAME=SessionStart gc prime --hook --hook-format antigravity`,
 		"gascity-nudge-drain": "gc hook run --timeout 15s --timeout-exit-code 0 -- nudge drain --inject --hook-format antigravity",
 		"gascity-mail-check":  "gc hook run --timeout 15s --timeout-exit-code 0 -- mail check --inject --hook-format antigravity",
 	} {
@@ -2066,6 +2066,111 @@ func TestInstallAntigravityMergesExistingHooks(t *testing.T) {
 		if !strings.Contains(data, want) {
 			t.Errorf("merged Antigravity hooks missing %q:\n%s", want, data)
 		}
+	}
+}
+
+// antigravityGuardShellNoExit mirrors bdSchemaCompatGuardShell() but omits
+// "; exit 1": ga-3w44ma's spike found Antigravity's PreInvocation non-zero-exit
+// semantics are unconfirmed and, per the only reachable secondary sources,
+// likely unsafe (may "trigger fallback actions or crash the active turn")
+// rather than confirmed non-blocking like Claude Code/Codex's SessionStart
+// (ga-ua1h7d) — so the antigravity guard must never change the composed
+// command's own exit status. Shares bdSchemaSkewHookCaseClauses() with the
+// production guard so the skew signatures can't drift between the two
+// variants.
+func antigravityGuardShellNoExit() string {
+	return `_gcbd_skew=$(bd doctor 2>&1); case "$_gcbd_skew" in ` +
+		bdSchemaSkewHookCaseClauses() +
+		`) printf '%s\n' "$_gcbd_skew" >&2 ;; esac`
+}
+
+// antigravityHookCommand extracts the first PreInvocation command for the
+// named top-level hook key from an antigravity .agents/hooks.json document
+// (whose hook names, unlike Claude/Codex, ARE the top-level keys — there is
+// no "hooks" wrapper). Decoding via json.Unmarshal (rather than substring
+// matching against the raw, JSON-escaped file bytes) avoids the
+// escaped-vs-unescaped mismatch class of bug that caused ga-hutkxc Finding 1.
+func antigravityHookCommand(t *testing.T, data []byte, hookName string) string {
+	t.Helper()
+	var cfg map[string]map[string][]struct {
+		Command string `json:"command"`
+	}
+	if err := json.Unmarshal(data, &cfg); err != nil {
+		t.Fatalf("unmarshal antigravity hooks: %v", err)
+	}
+	entries := cfg[hookName]["PreInvocation"]
+	if len(entries) == 0 {
+		t.Fatalf("missing antigravity hook %q PreInvocation entries in:\n%s", hookName, data)
+	}
+	return entries[0].Command
+}
+
+// TestInstallAntigravityGascityPrimeIncludesSchemaCompatGuard is ga-3w44ma's
+// guard-text cross-check (mirrors TestBdSchemaCompatGuardShellDetectsBothSkewSignatures):
+// it asserts the installed "gascity-prime" command is derived from the shared
+// skew-signature source of truth rather than a hand-transcribed, independently
+// drifting copy.
+func TestInstallAntigravityGascityPrimeIncludesSchemaCompatGuard(t *testing.T) {
+	fs := fsys.NewFake()
+	if err := Install(fs, "/city", "/work", []string{"antigravity"}); err != nil {
+		t.Fatalf("Install: %v", err)
+	}
+
+	command := antigravityHookCommand(t, fs.Files["/work/.agents/hooks.json"], "gascity-prime")
+	if !strings.Contains(command, antigravityGuardShellNoExit()) {
+		t.Fatalf("gascity-prime command missing schema-compat guard (or guard has drifted from bdSchemaSkewHookCaseClauses()): %s", command)
+	}
+	if strings.Contains(command, `esac; exit 1`) || strings.Contains(command, `>&2; exit 1`) {
+		t.Fatalf("gascity-prime guard must never change the command's own exit status (unconfirmed/unsafe non-zero-exit semantics, ga-3w44ma): %s", command)
+	}
+	for _, want := range []string{
+		`GC_PROVIDER_SESSION_ID_REQUIRED=antigravity`,
+		`GC_PROVIDER_SESSION_ID="${ANTIGRAVITY_CONVERSATION_ID:-}"`,
+		`GC_MANAGED_SESSION_HOOK=1 GC_HOOK_EVENT_NAME=SessionStart gc prime --hook --hook-format antigravity`,
+	} {
+		if !strings.Contains(command, want) {
+			t.Errorf("gascity-prime command lost substantive body %q: %s", want, command)
+		}
+	}
+}
+
+// TestInstallAntigravityUpgradesStaleGascityPrimeToSchemaCompatGuard proves
+// ga-3w44ma's FR-03: an already-deployed, pre-guard "gascity-prime" entry
+// converges to the guarded form via antigravity's existing merge-based
+// install (writeJSONOverlayManaged / overlay.MergeSettingsJSON's "last
+// writer wins" branch for non-"hooks"-wrapper documents) with no new
+// upgrade-detector, mirroring the Claude/Codex
+// TestInstall*UpgradesPreGuardSessionStartToSchemaCompatGuard tests'
+// stale-to-guarded intent.
+func TestInstallAntigravityUpgradesStaleGascityPrimeToSchemaCompatGuard(t *testing.T) {
+	fs := fsys.NewFake()
+	stalePrimeCommand := `export PATH="$HOME/go/bin:$HOME/.local/bin:/opt/homebrew/bin:/usr/local/bin:$PATH" && GC_PROVIDER_SESSION_ID_REQUIRED=antigravity GC_PROVIDER_SESSION_ID="${ANTIGRAVITY_CONVERSATION_ID:-}" GC_MANAGED_SESSION_HOOK=1 GC_HOOK_EVENT_NAME=SessionStart gc prime --hook --hook-format antigravity`
+	fs.Files["/work/.agents/hooks.json"] = []byte(`{
+  "gascity-prime": {
+    "PreInvocation": [
+      {
+        "type": "command",
+        "command": "` + jsonEscape(t, stalePrimeCommand) + `",
+        "timeout": 30
+      }
+    ]
+  }
+}
+`)
+
+	if err := Install(fs, "/city", "/work", []string{"antigravity"}); err != nil {
+		t.Fatalf("Install: %v", err)
+	}
+
+	command := antigravityHookCommand(t, fs.Files["/work/.agents/hooks.json"], "gascity-prime")
+	if command == stalePrimeCommand {
+		t.Fatalf("stale gascity-prime command was not upgraded to the guarded form: %s", command)
+	}
+	if !strings.Contains(command, antigravityGuardShellNoExit()) {
+		t.Fatalf("upgraded gascity-prime command missing schema-compat guard: %s", command)
+	}
+	if !strings.Contains(command, `gc prime --hook --hook-format antigravity`) {
+		t.Fatalf("upgraded gascity-prime command lost its substantive body: %s", command)
 	}
 }
 

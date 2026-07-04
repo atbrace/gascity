@@ -1,6 +1,8 @@
 package main
 
 import (
+	"bytes"
+	"encoding/json"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -428,6 +430,83 @@ esac
 	}
 	if readyCalls != 1 {
 		t.Fatalf("bd ready calls = %d, want exactly 1; all calls:\n%s", readyCalls, string(logData))
+	}
+}
+
+// TestControlReadyFallbackReadyLogsWhenResultHitsLimit is ga-bbj6wv Finding 1:
+// a fallback batch that comes back at exactly controlReadyFallbackLimit is a
+// truncation signal (some candidate/route may have been starved of ready
+// beads that exist but didn't fit) and must be observable, not silent.
+func TestControlReadyFallbackReadyLogsWhenResultHitsLimit(t *testing.T) {
+	configureIsolatedRuntimeEnv(t)
+	tmp := t.TempDir()
+
+	items := make([]map[string]string, controlReadyFallbackLimit)
+	for i := range items {
+		items[i] = map[string]string{"id": fmt.Sprintf("ga-fallback-%d", i)}
+	}
+	payload, err := json.Marshal(items)
+	if err != nil {
+		t.Fatalf("marshal fixture beads: %v", err)
+	}
+	payloadPath := filepath.Join(tmp, "payload.json")
+	if err := os.WriteFile(payloadPath, payload, 0o644); err != nil {
+		t.Fatalf("write payload: %v", err)
+	}
+	bdPath := filepath.Join(tmp, "bd")
+	script := fmt.Sprintf("#!/bin/sh\ncat %q\n", payloadPath)
+	if err := os.WriteFile(bdPath, []byte(script), 0o755); err != nil {
+		t.Fatalf("write fake bd: %v", err)
+	}
+	t.Setenv("PATH", tmp+string(os.PathListSeparator)+os.Getenv("PATH"))
+	t.Setenv("GC_BEADS", "bd")
+
+	var logBuf bytes.Buffer
+	restore := captureLogOutput(&logBuf)
+	defer restore()
+
+	dir := t.TempDir()
+	result, err := controlReadyFallbackReady(dir, nil, false)
+	if err != nil {
+		t.Fatalf("controlReadyFallbackReady: %v", err)
+	}
+	if len(result) != controlReadyFallbackLimit {
+		t.Fatalf("len(result) = %d, want %d", len(result), controlReadyFallbackLimit)
+	}
+	if !strings.Contains(logBuf.String(), "may be truncated") {
+		t.Fatalf("expected a truncation warning in log output, got: %q", logBuf.String())
+	}
+	if !strings.Contains(logBuf.String(), dir) {
+		t.Fatalf("expected log to name the dir %q, got: %q", dir, logBuf.String())
+	}
+}
+
+// TestControlReadyFallbackReadyNoWarningBelowLimit is the negative case: a
+// batch below the limit is a complete result, not a truncation signal, and
+// must not log anything.
+func TestControlReadyFallbackReadyNoWarningBelowLimit(t *testing.T) {
+	configureIsolatedRuntimeEnv(t)
+	tmp := t.TempDir()
+	bdPath := filepath.Join(tmp, "bd")
+	if err := os.WriteFile(bdPath, []byte("#!/bin/sh\nprintf '[{\"id\":\"ga-fallback-only\"}]'\n"), 0o755); err != nil {
+		t.Fatalf("write fake bd: %v", err)
+	}
+	t.Setenv("PATH", tmp+string(os.PathListSeparator)+os.Getenv("PATH"))
+	t.Setenv("GC_BEADS", "bd")
+
+	var logBuf bytes.Buffer
+	restore := captureLogOutput(&logBuf)
+	defer restore()
+
+	result, err := controlReadyFallbackReady(t.TempDir(), nil, false)
+	if err != nil {
+		t.Fatalf("controlReadyFallbackReady: %v", err)
+	}
+	if len(result) != 1 {
+		t.Fatalf("len(result) = %d, want 1", len(result))
+	}
+	if logBuf.Len() != 0 {
+		t.Fatalf("expected no log output below the limit, got: %q", logBuf.String())
 	}
 }
 

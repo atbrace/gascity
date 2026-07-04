@@ -50,8 +50,15 @@ const controlReadyExcludeType = "epic"
 // controlReadyFallbackLimit bounds the single batched bd ready call issued
 // when the cache can't answer. It must be generous enough that per-candidate/
 // per-route filtering in Go (each capped at workflowServeScanLimit) is never
-// starved by an earlier truncation at the bd layer.
-const controlReadyFallbackLimit = 500
+// starved by an earlier truncation at the bd layer -- unlike the shell script
+// this replaces (which ran each candidate/route's own independently-capped bd
+// call), this single batched call's cap is shared across every candidate and
+// route, so it must hold a whole city's ready set even during the write
+// bursts that make the cache dirty in the first place. It costs one bd call
+// regardless of value, so err on the generous side; controlReadyFallbackReady
+// also logs if a response ever comes back exactly at this limit, so silent
+// truncation is at least observable.
+const controlReadyFallbackLimit = 5000
 
 // controlReadyCacheTTL bounds how long a primed control-ready snapshot is
 // reused before the next tick re-primes it. A fresh CachingStore is built
@@ -285,6 +292,9 @@ func controlReadyFallbackReady(dir string, env map[string]string, includeEphemer
 	if err := json.Unmarshal([]byte(trimmed), &result); err != nil {
 		return nil, fmt.Errorf("control-ready fallback: unexpected bd ready output: %s", trimmed)
 	}
+	if len(result) == controlReadyFallbackLimit {
+		log.Printf("control-ready fallback: bd ready for %s returned exactly the %d-item limit -- city-wide ready set may be truncated, some candidates/routes could see fewer beads than are actually ready", dir, controlReadyFallbackLimit)
+	}
 	beads.SortBeadsReadyOrder(result)
 	return result, nil
 }
@@ -308,6 +318,15 @@ type controlReadyCacheEntry struct {
 // no rig configured) and the sibling control-bead-processing path
 // (runControlDispatcherInStore) would already be failing loudly if it were a
 // real production gap.
+//
+// Known limitation (low-impact, not fixed here): concurrent callers racing a
+// stale/missing entry for the same dir each independently open+prime their
+// own store rather than coalescing behind one in-flight prime -- last writer
+// into controlReadyCacheRegistry wins. Same class of gap already accepted
+// for CachingStore.List/Ready cache-miss reads; worth revisiting with a
+// singleflight if overlapping invocations against the same city/dir become
+// common (e.g. a restart handoff window), but the control-dispatcher serve
+// loop's typical call pattern is sequential-per-tick per dir.
 func controlReadyCacheFor(dir, cityPath string, cfg *config.City) *beads.CachingStore {
 	controlReadyCacheRegistry.mu.Lock()
 	entry, ok := controlReadyCacheRegistry.byDir[dir]

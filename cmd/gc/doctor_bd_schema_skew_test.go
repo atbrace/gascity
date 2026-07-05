@@ -79,4 +79,13 @@ func TestBdSchemaSkewCheckOtherSkewSignature(t *testing.T) {
 	if res.Status != doctor.StatusWarning {
 		t.Fatalf("Status = %v, want Warning for the 'Unable to open database' signature too: %#v", res.Status, res)
 	}
+	// "Unable to open database" is ambiguous — it covers both a skewed binary
+	// and a simply-unreachable store — so the remedy must mention checking
+	// store reachability, not only rebuilding bd (ga-7xzmtd review note).
+	if !strings.Contains(strings.ToLower(res.Message), "unreachable") {
+		t.Errorf("Message %q should acknowledge the store may be unreachable, not only schema-skewed", res.Message)
+	}
+	if !strings.Contains(res.FixHint, "reachable") {
+		t.Errorf("FixHint %q should tell the operator to confirm the store is reachable first", res.FixHint)
+	}
 }

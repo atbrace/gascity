@@ -24,12 +24,27 @@ import (
 // interpolated into the nested shell body. That keeps routes containing shell
 // metacharacters as data instead of executable syntax.
 
-// bdFatalSkewSignatures are stderr substrings that identify a bd schema-skew
-// / unreachable-database hard failure, as opposed to any other non-zero bd
-// exit (which the guarded probes below continue to treat as "try the next
-// candidate", exactly as before this fix). Mirrored by the gc doctor
-// schema-skew check (doctor_bd_schema_skew.go) so both surfaces recognize
-// the same condition.
+// bdFatalSkewSignatures are stderr substrings that mark a bd failure as fatal
+// (abort the script, preserve the message) rather than "try the next
+// candidate". On the surface these signatures actually gate — the bd_or_fatal
+// work-query / on_boot / on_death probes, which run `bd list/ready/update/
+// query` — only "schema version mismatch" is reachable: those commands fail
+// through beads' lowercase "failed to open database" (cmd/bd/main.go) or the
+// schema-skew error, never the title-cased "Unable to open database", which
+// beads emits only from its `bd doctor` checks (cmd/bd/doctor/*).
+//
+// "Unable to open database" is retained so this list stays byte-identical to
+// the `bd doctor`-based surfaces that DO emit it — the SessionStart guard
+// (internal/hooks.bdSchemaSkewHookSignatures) and the gc doctor schema-skew
+// check (doctor_bd_schema_skew.go.bdSchemaSkewSignatures) — keeping one shared
+// vocabulary across all three. It is simply a dead pattern on this surface,
+// not a live detector.
+//
+// A genuinely unreachable store on this surface (bd's "failed to open
+// database") is deliberately NOT treated as fatal: a transient mid-restart
+// Dolt blip must still fall through silently as an ordinary rc=1, exactly as
+// any other non-fatal bd failure does, so the reconciler is never hard-wedged
+// by a momentary store hiccup.
 var bdFatalSkewSignatures = []string{
 	"schema version mismatch",
 	"Unable to open database",
@@ -40,13 +55,15 @@ var bdFatalSkewSignatures = []string{
 const bdFatalGuardFunctionName = "bd_or_fatal"
 
 // bdFatalGuardFunctionScript emits a `sh` function definition that wraps a
-// bd invocation so a schema-skew / unreachable-database hard failure aborts
-// the work-query script (non-zero exit, stderr preserved) instead of being
-// silently swallowed as an empty result — the bug behind ga-qyw3wn. A
-// genuine empty result (bd exit 0, any stdout) is returned unchanged. Any
-// OTHER non-zero bd exit (a transient lock, etc.) still falls through
-// silently exactly as it did before this fix; only the named signature is
-// treated as fatal.
+// bd invocation so a schema-skew hard failure aborts the work-query script
+// (non-zero exit, stderr preserved) instead of being silently swallowed as
+// an empty result — the bug behind ga-qyw3wn. On this surface the wrapped
+// commands (bd list/ready/update/query) emit "schema version mismatch" on
+// skew; an unreachable store is intentionally not fatal here (see
+// bdFatalSkewSignatures for why). A genuine empty result (bd exit 0, any
+// stdout) is returned unchanged. Any OTHER non-zero bd exit (a transient
+// lock, an unreachable store, etc.) still falls through silently exactly as
+// it did before this fix; only the named signature is treated as fatal.
 //
 // The function prints its bd invocation's stdout and returns 0 on success,
 // returns 1 (no stdout) on an ordinary failure, and returns 2 (stderr

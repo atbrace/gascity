@@ -96,8 +96,18 @@ func (c *bdSchemaSkewCheck) Run(_ *doctor.CheckContext) *doctor.CheckResult {
 			continue
 		}
 		res.Status = doctor.StatusWarning
-		res.Message = fmt.Sprintf("bd at %s is schema-skewed against the live database (matched %q)", bdPath, sig)
 		res.Details = []string{strings.TrimSpace(output)}
+		if sig == "Unable to open database" {
+			// beads emits "Unable to open database" both for a schema-skewed
+			// binary and for a simply-unreachable store (a down or still-
+			// starting shared Dolt sql-server, wrong BEADS_DIR/port). Naming
+			// only the "rebuild your bd" remedy misdirects the operator when
+			// the real cause is a down server, so cover both.
+			res.Message = fmt.Sprintf("bd at %s cannot open the live database (matched %q): the store may be schema-skewed or simply unreachable", bdPath, sig)
+			res.FixHint = "confirm the bead store is reachable (dolt sql-server up, correct BEADS_DIR/port); if it is, rebuild or PATH-reorder the resolved bd binary ahead of any stale copy so it knows the live schema version"
+			return res
+		}
+		res.Message = fmt.Sprintf("bd at %s is schema-skewed against the live database (matched %q)", bdPath, sig)
 		res.FixHint = "rebuild or PATH-reorder the resolved bd binary ahead of any stale copy so it knows the live schema version"
 		return res
 	}

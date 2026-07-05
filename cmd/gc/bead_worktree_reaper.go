@@ -15,6 +15,26 @@ import (
 	"github.com/gastownhall/gascity/internal/sling"
 )
 
+// hqBeadWorktreeBucket is the rigBeadStores map key under which HQ-targeting
+// bead worktrees are scanned. It mirrors a rig name but points at
+// cityPath/.gc/worktrees/_hq instead of a rig's worktree directory.
+const hqBeadWorktreeBucket = "_hq"
+
+// withHQBeadStore returns a copy of rigStores with hqStore additionally keyed
+// under hqBeadWorktreeBucket, so reapClosedBeadWorktrees also scans the HQ
+// worktree bucket. rigStores is never mutated. If hqStore is nil, the
+// returned map omits the HQ key entirely.
+func withHQBeadStore(rigStores map[string]beads.Store, hqStore beads.Store) map[string]beads.Store {
+	merged := make(map[string]beads.Store, len(rigStores)+1)
+	for k, v := range rigStores {
+		merged[k] = v
+	}
+	if hqStore != nil {
+		merged[hqBeadWorktreeBucket] = hqStore
+	}
+	return merged
+}
+
 // reapClosedBeadWorktrees scans per-bead git worktrees under
 // cityPath/.gc/worktrees/<rig>/ and removes any that are associated with a
 // closed bead and pass all safety gates (no uncommitted work, no unpushed

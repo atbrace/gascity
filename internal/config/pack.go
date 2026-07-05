@@ -2737,6 +2737,7 @@ func (ov *AgentOverride) toAgentPatch() *AgentPatch {
 		TmuxAlias:               ov.TmuxAlias,
 		Scope:                   ov.Scope,
 		Suspended:               ov.Suspended,
+		WorkQueryUnfiltered:     ov.WorkQueryUnfiltered,
 		Pool:                    ov.Pool,
 		Env:                     ov.Env,
 		EnvRemove:               ov.EnvRemove,

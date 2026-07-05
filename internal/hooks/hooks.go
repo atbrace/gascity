@@ -1034,7 +1034,7 @@ func managedPromptTarget(base string, rest []string, hookFormat string) (string,
 }
 
 func parseGCCommandBody(body string) (map[string]string, []string, bool) {
-	body = strings.TrimPrefix(body, sessionStartGuardedPrefix())
+	body = stripSessionStartGuard(body)
 	tokens := shellquote.Split(body)
 	if len(tokens) == 0 {
 		return nil, nil, false
@@ -1096,7 +1096,7 @@ func parseManagedGCCommand(command string) (string, string, map[string]string, [
 		prefix = canonicalGCPathPrefix
 		body = strings.TrimPrefix(body, canonicalGCPathPrefix)
 	}
-	body = strings.TrimPrefix(body, sessionStartGuardedPrefix())
+	body = stripSessionStartGuard(body)
 	tokens := shellquote.Split(body)
 	if len(tokens) == 0 {
 		return "", "", nil, nil, false
@@ -1518,11 +1518,33 @@ func bdSchemaSkewHookCaseClauses() string {
 	return b.String()
 }
 
-// bdSchemaCompatGuardShell emits a shell snippet that probes `bd doctor` —
-// the same lightweight, database-opening command cmd/gc's advisory
-// bd-schema-skew check uses — and exits non-zero with the diagnostic
-// message intact on stderr when the resolved `bd` binary is schema-skewed
-// against the live database (ga-ua1h7d / architect decision ga-2gs3pl-A).
+// bdDoctorProbeShell captures `bd doctor`'s combined stdout+stderr into the
+// shell variable $_gcbd_skew, bounding the probe with `timeout` (or macOS /
+// Homebrew coreutils' `gtimeout`) so a hung or slow Dolt sql-server cannot
+// stall session start fleet-wide (ga-7xzmtd review item 1). When neither
+// wrapper is on PATH (e.g. a macOS box without coreutils) it falls back to an
+// unbounded `bd doctor`, preserving the prior behavior there. The 10s bound
+// matches the Go-side advisory probe (cmd/gc's bdSchemaSkewProbeTimeout). A
+// timeout kill leaves $_gcbd_skew without a skew signature, so the guard falls
+// through (exit 0) and lets the session proceed rather than blocking on a
+// wedged bd.
+//
+// Any change to this text changes the SessionStart guard, and thus the guard
+// prefix stripped by stripSessionStartGuard: freeze the pre-change prefix into
+// sessionStartLegacyGuardedPrefixes() in the same change so already-deployed
+// hooks stay recognizable and upgradeable.
+func bdDoctorProbeShell() string {
+	return `if command -v timeout >/dev/null 2>&1; then _gcbd_skew=$(timeout 10 bd doctor 2>&1); ` +
+		`elif command -v gtimeout >/dev/null 2>&1; then _gcbd_skew=$(gtimeout 10 bd doctor 2>&1); ` +
+		`else _gcbd_skew=$(bd doctor 2>&1); fi;`
+}
+
+// bdSchemaCompatGuardShell emits a shell snippet that probes `bd doctor` (via
+// the time-bounded bdDoctorProbeShell) — the same lightweight, database-opening
+// command cmd/gc's advisory bd-schema-skew check uses — and exits non-zero with
+// the diagnostic message intact on stderr when the resolved `bd` binary is
+// schema-skewed against the live database (ga-ua1h7d / architect decision
+// ga-2gs3pl-A).
 //
 // This does NOT stop the underlying provider session: neither Claude Code
 // nor Codex treats a non-zero SessionStart hook exit as a boot-blocking
@@ -1532,7 +1554,8 @@ func bdSchemaSkewHookCaseClauses() string {
 // prime --hook` itself. A healthy bd, or bd missing from PATH entirely
 // (case falls through unmatched), leaves this a no-op: exit 0, no output.
 func bdSchemaCompatGuardShell() string {
-	return `_gcbd_skew=$(bd doctor 2>&1); case "$_gcbd_skew" in ` +
+	return bdDoctorProbeShell() +
+		` case "$_gcbd_skew" in ` +
 		bdSchemaSkewHookCaseClauses() +
 		`) printf '%s\n' "$_gcbd_skew" >&2; exit 1 ;; esac`
 }
@@ -1547,6 +1570,47 @@ func bdSchemaCompatGuardShell() string {
 // bodies both parse to the same env/args shape.
 func sessionStartGuardedPrefix() string {
 	return bdSchemaCompatGuardShell() + `; `
+}
+
+// sessionStartPreTimeoutGuardedPrefix is the exact SessionStart guard prefix
+// gc emitted before the `bd doctor` probe was time-bounded (ga-7xzmtd review
+// item 1). Frozen verbatim — never rebuilt from the current guard helpers — so
+// a hook already deployed carrying this guard is still recognized as managed
+// (and thus upgraded to the current, bounded guard) instead of being misread
+// as user-authored and stranded. Do not edit this literal; add a new frozen
+// literal to sessionStartLegacyGuardedPrefixes whenever the guard text changes
+// again.
+const sessionStartPreTimeoutGuardedPrefix = `_gcbd_skew=$(bd doctor 2>&1); case "$_gcbd_skew" in *"schema version mismatch"*|*"Unable to open database"*) printf '%s\n' "$_gcbd_skew" >&2; exit 1 ;; esac; `
+
+// sessionStartLegacyGuardedPrefixes lists SessionStart guard prefixes emitted
+// by prior gc versions. stripSessionStartGuard consults it so a hook carrying
+// an older guard is still recognized and can be upgraded in place. It grows by
+// one frozen literal each time the guard text changes; the current guard is
+// sessionStartGuardedPrefix() and is handled separately (tried first).
+func sessionStartLegacyGuardedPrefixes() []string {
+	return []string{sessionStartPreTimeoutGuardedPrefix}
+}
+
+// stripSessionStartGuard removes a leading SessionStart guard prefix from body,
+// trying the current guard (sessionStartGuardedPrefix) first and then every
+// known legacy guard (sessionStartLegacyGuardedPrefixes). It returns body
+// unchanged when no guard prefix is present.
+//
+// Recognizing legacy guards is what keeps an already-deployed hook upgradeable
+// after the guard text changes (ga-7xzmtd review item 4): stripping only the
+// current guard would leave a stale guard attached, the tokenizer would then
+// miss the `gc` command word, and the hook would be silently reclassified as
+// user-authored — never upgraded again.
+func stripSessionStartGuard(body string) string {
+	if rest, ok := strings.CutPrefix(body, sessionStartGuardedPrefix()); ok {
+		return rest
+	}
+	for _, legacy := range sessionStartLegacyGuardedPrefixes() {
+		if rest, ok := strings.CutPrefix(body, legacy); ok {
+			return rest
+		}
+	}
+	return body
 }
 
 // sessionStartCurrentFormBody is the canonical current-form managed
@@ -1640,7 +1704,7 @@ func upgradeClaudeHookCommand(event, command string) (string, bool) {
 		// original (unstripped) body so any already-present guard is
 		// discarded wholesale rather than duplicated: sessionStartCurrentFormBody
 		// always supplies a fresh one.
-		tail := strings.TrimPrefix(body, sessionStartGuardedPrefix())
+		tail := stripSessionStartGuard(body)
 		if equalsLegacyCommandBody(tail, `gc prime --hook`) ||
 			equalsLegacyCommandBody(tail, `gc prime --hook --hook-format codex`) ||
 			equalsLegacyCommandBody(tail, sessionStartPreviousManagedFormBody) ||

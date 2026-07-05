@@ -482,6 +482,108 @@ func TestInstallCodexUpgradesPreGuardSessionStartToSchemaCompatGuard(t *testing.
 	}
 }
 
+// TestStripSessionStartGuardRecognizesLegacyPreTimeoutGuard verifies the guard
+// stripper (used by parseGCCommandBody / parseManagedGCCommand and the Claude
+// upgrade path) removes both the current bounded guard and the frozen
+// pre-timeout guard, so a hook carrying either parses to the same body — the
+// recognition that keeps a hook deployed with an older guard upgradeable
+// instead of stranded (ga-7xzmtd review item 4).
+func TestStripSessionStartGuardRecognizesLegacyPreTimeoutGuard(t *testing.T) {
+	body := sessionStartPreGuardFormBody("")
+
+	if got := stripSessionStartGuard(sessionStartGuardedPrefix() + body); got != body {
+		t.Fatalf("current guard not stripped: got %q, want %q", got, body)
+	}
+	if got := stripSessionStartGuard(sessionStartPreTimeoutGuardedPrefix + body); got != body {
+		t.Fatalf("legacy pre-timeout guard not stripped: got %q, want %q", got, body)
+	}
+	// An unrecognized leading guard is left intact (treated as user authorship,
+	// never silently rewritten).
+	foreign := `foo=$(bar); ` + body
+	if got := stripSessionStartGuard(foreign); got != foreign {
+		t.Fatalf("unrecognized prefix must be left intact: got %q", got)
+	}
+
+	// parseManagedGCCommand must recognize a command carrying the legacy guard,
+	// so codexHookCommandLooksManaged / upgradeCodexHookCommand can upgrade it.
+	legacyCmd := canonicalGCPathPrefix + sessionStartPreTimeoutGuardedPrefix + body
+	_, _, env, args, ok := parseManagedGCCommand(legacyCmd)
+	if !ok {
+		t.Fatalf("parseManagedGCCommand did not recognize legacy-guarded command: %q", legacyCmd)
+	}
+	if env["GC_HOOK_EVENT_NAME"] != "SessionStart" {
+		t.Fatalf("parsed env missing SessionStart marker: %#v", env)
+	}
+	if len(args) < 1 || args[0] != "prime" {
+		t.Fatalf("parsed args = %#v, want prime ...", args)
+	}
+}
+
+// TestInstallClaudeUpgradesLegacyPreTimeoutGuardToBounded covers ga-7xzmtd
+// review item 4: a SessionStart command carrying the pre-timeout guard (the
+// exact form gc emitted before the bd doctor probe was time-bounded) must be
+// recognized as managed via the frozen legacy prefix and upgraded to the
+// current bounded guard — not stranded because its guard no longer
+// exact-matches sessionStartGuardedPrefix().
+func TestInstallClaudeUpgradesLegacyPreTimeoutGuardToBounded(t *testing.T) {
+	fs := fsys.NewFake()
+	current, err := readEmbedded("config/claude.json")
+	if err != nil {
+		t.Fatalf("readEmbedded: %v", err)
+	}
+	legacyBody := sessionStartPreTimeoutGuardedPrefix + sessionStartPreGuardFormBody("")
+	stale := strings.Replace(string(current), jsonEscape(t, sessionStartCurrentFormBody("")), jsonEscape(t, legacyBody), 1)
+	if stale == string(current) {
+		t.Fatal("stale fixture did not diverge from current embedded config — check legacy guard pattern")
+	}
+	fs.Files["/city/hooks/claude.json"] = []byte(stale)
+	fs.Files["/city/.gc/settings.json"] = []byte(stale)
+
+	if err := Install(fs, "/city", "/work", []string{"claude"}); err != nil {
+		t.Fatalf("Install: %v", err)
+	}
+
+	sessionStartCommand := claudeHookCommand(t, fs.Files["/city/hooks/claude.json"], "SessionStart")
+	if !strings.Contains(sessionStartCommand, "timeout 10 bd doctor") {
+		t.Fatalf("upgraded SessionStart command missing bounded guard:\n%s", sessionStartCommand)
+	}
+	if got := commandBodyAfterCanonicalPrefix(sessionStartCommand); got != sessionStartCurrentFormBody("") {
+		t.Fatalf("upgraded SessionStart body = %q, want %q", got, sessionStartCurrentFormBody(""))
+	}
+}
+
+// TestInstallCodexUpgradesLegacyPreTimeoutGuardToBounded is the Codex-side
+// counterpart: the native hooks.json upgrade path (parseManagedGCCommand ->
+// upgradeCodexHookCommand) must recognize the pre-timeout guard and rewrite it
+// to the bounded guard (ga-7xzmtd review item 4).
+func TestInstallCodexUpgradesLegacyPreTimeoutGuardToBounded(t *testing.T) {
+	fs := fsys.NewFake()
+	legacyBody := sessionStartPreTimeoutGuardedPrefix + sessionStartPreGuardFormBody("")
+	fs.Files["/work/.codex/hooks.json"] = []byte(fmt.Sprintf(`{
+  "hooks": {
+    "SessionStart": [{
+      "matcher": "startup",
+      "hooks": [{
+        "type": "command",
+        "command": "export PATH=\"$HOME/go/bin:$HOME/.local/bin:$PATH\" && %s"
+      }]
+    }]
+  }
+}`, jsonEscape(t, legacyBody)))
+
+	if err := Install(fs, "/city", "/work", []string{"codex"}); err != nil {
+		t.Fatalf("Install: %v", err)
+	}
+
+	sessionStartCommand := codexHookCommand(t, fs.Files["/work/.codex/hooks.json"])
+	if !strings.Contains(sessionStartCommand, "timeout 10 bd doctor") {
+		t.Fatalf("upgraded codex SessionStart missing bounded guard: %s", sessionStartCommand)
+	}
+	if got := commandBodyAfterCanonicalPrefix(sessionStartCommand); got != sessionStartCurrentFormBody("/city") {
+		t.Fatalf("upgraded codex SessionStart body = %q, want %q", got, sessionStartCurrentFormBody("/city"))
+	}
+}
+
 // TestBdSchemaCompatGuardShellDetectsBothSkewSignatures locks the shell
 // snippet ga-ua1h7d's SessionStart guard emits: it must probe `bd doctor`,
 // switch on both known schema-skew signatures (mirroring
@@ -495,6 +597,15 @@ func TestBdSchemaCompatGuardShellDetectsBothSkewSignatures(t *testing.T) {
 	guard := bdSchemaCompatGuardShell()
 	if !strings.Contains(guard, "bd doctor") {
 		t.Fatalf("guard does not probe bd doctor: %s", guard)
+	}
+	// The probe must be time-bounded (ga-7xzmtd review item 1) so a hung Dolt
+	// sql-server cannot stall session start, with an unbounded fallback when
+	// no timeout wrapper is on PATH.
+	if !strings.Contains(guard, "timeout 10 bd doctor") {
+		t.Fatalf("guard does not bound the bd doctor probe with timeout: %s", guard)
+	}
+	if !strings.Contains(guard, "command -v timeout") || !strings.Contains(guard, "else _gcbd_skew=$(bd doctor 2>&1)") {
+		t.Fatalf("guard does not fall back to an unbounded probe when timeout is absent: %s", guard)
 	}
 	for _, sig := range []string{"schema version mismatch", "Unable to open database"} {
 		if !strings.Contains(guard, sig) {
@@ -2079,7 +2190,8 @@ func TestInstallAntigravityMergesExistingHooks(t *testing.T) {
 // production guard so the skew signatures can't drift between the two
 // variants.
 func antigravityGuardShellNoExit() string {
-	return `_gcbd_skew=$(bd doctor 2>&1); case "$_gcbd_skew" in ` +
+	return bdDoctorProbeShell() +
+		` case "$_gcbd_skew" in ` +
 		bdSchemaSkewHookCaseClauses() +
 		`) printf '%s\n' "$_gcbd_skew" >&2 ;; esac`
 }

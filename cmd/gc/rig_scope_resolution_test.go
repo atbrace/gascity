@@ -52,3 +52,76 @@ func TestRigFromRedirectedBeadsDirIgnoresCwdOutsideCity(t *testing.T) {
 		t.Fatalf("rigFromRedirectedBeadsDir() ok = true, want false; rig = %+v", rig)
 	}
 }
+
+// TestRigFromRedirectedBeadsDirCityBeadsRedirectIsNotAnError verifies that a
+// .beads/redirect pointing at the city's own top-level .beads dir (as written
+// by "gc worktree hq" for HQ-targeting bead worktrees) resolves to "no rig"
+// without an error, rather than tripping the "points outside declared city
+// rigs" error meant for genuinely unexpected redirect targets.
+func TestRigFromRedirectedBeadsDirCityBeadsRedirectIsNotAnError(t *testing.T) {
+	cityDir := t.TempDir()
+	if err := os.MkdirAll(filepath.Join(cityDir, ".beads"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	hqWorktree := filepath.Join(cityDir, ".gc", "worktrees", "_hq", "builder-ga-99999")
+	if err := os.MkdirAll(filepath.Join(hqWorktree, ".beads"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(
+		filepath.Join(hqWorktree, ".beads", "redirect"),
+		[]byte(filepath.Join(cityDir, ".beads")+"\n"),
+		0o644,
+	); err != nil {
+		t.Fatal(err)
+	}
+
+	cfg := &config.City{
+		Workspace: config.Workspace{Name: "demo"},
+		Rigs: []config.Rig{
+			{Name: "frontend", Path: filepath.Join("rigs", "frontend"), Prefix: "fr"},
+		},
+	}
+
+	rig, ok, err := rigFromRedirectedBeadsDir(cfg, cityDir, normalizePathForCompare(hqWorktree))
+	if err != nil {
+		t.Fatalf("rigFromRedirectedBeadsDir() error = %v, want nil (redirect targets the city's own .beads)", err)
+	}
+	if ok {
+		t.Fatalf("rigFromRedirectedBeadsDir() ok = true, want false; rig = %+v", rig)
+	}
+}
+
+// TestRigFromRedirectedBeadsDirMismatchedRedirectStillErrors locks in the
+// pre-existing safety net: a .beads/redirect pointing somewhere that is
+// neither a declared rig's .beads dir nor the city's own .beads dir is a
+// genuine misconfiguration and must still surface as an error.
+func TestRigFromRedirectedBeadsDirMismatchedRedirectStillErrors(t *testing.T) {
+	cityDir := t.TempDir()
+	bogusTarget := filepath.Join(t.TempDir(), ".beads")
+	worktree := filepath.Join(cityDir, "somewhere", "else")
+	if err := os.MkdirAll(filepath.Join(worktree, ".beads"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(
+		filepath.Join(worktree, ".beads", "redirect"),
+		[]byte(bogusTarget+"\n"),
+		0o644,
+	); err != nil {
+		t.Fatal(err)
+	}
+
+	cfg := &config.City{
+		Workspace: config.Workspace{Name: "demo"},
+		Rigs: []config.Rig{
+			{Name: "frontend", Path: filepath.Join("rigs", "frontend"), Prefix: "fr"},
+		},
+	}
+
+	_, ok, err := rigFromRedirectedBeadsDir(cfg, cityDir, normalizePathForCompare(worktree))
+	if err == nil {
+		t.Fatalf("rigFromRedirectedBeadsDir() error = nil, want error for mismatched redirect target")
+	}
+	if ok {
+		t.Fatalf("rigFromRedirectedBeadsDir() ok = true, want false alongside error")
+	}
+}

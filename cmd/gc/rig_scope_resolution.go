@@ -39,6 +39,7 @@ func rigFromRedirectedBeadsDir(cfg *config.City, cityPath, dir string) (config.R
 	if !pathWithinScope(normalizePathForCompare(dir), cityScope) {
 		return config.Rig{}, false, nil
 	}
+	cityBeadsDir := normalizePathForCompare(filepath.Join(cityPath, ".beads"))
 	for current := dir; current != "" && current != filepath.Dir(current); current = filepath.Dir(current) {
 		if !pathWithinScope(normalizePathForCompare(current), cityScope) {
 			break
@@ -51,6 +52,12 @@ func rigFromRedirectedBeadsDir(cfg *config.City, cityPath, dir string) (config.R
 		targetBeadsDir := normalizePathForCompare(strings.TrimSpace(string(redirectTarget)))
 		if targetBeadsDir == "" {
 			continue
+		}
+		// A redirect to the city's own top-level .beads dir (e.g. an HQ
+		// bead worktree from "gc worktree hq") is a deliberate non-rig
+		// target, not a misconfiguration — resolve to "no rig" cleanly.
+		if targetBeadsDir == cityBeadsDir {
+			return config.Rig{}, false, nil
 		}
 		for _, rig := range cfg.Rigs {
 			if strings.TrimSpace(rig.Path) == "" {

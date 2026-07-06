@@ -146,6 +146,28 @@ func TestDoWorktreeHQPropagatesScriptFailure(t *testing.T) {
 	}
 }
 
+func TestDoWorktreeHQRejectsPathTraversalBeadID(t *testing.T) {
+	cityDir := t.TempDir()
+	recordFile := filepath.Join(t.TempDir(), "argv.txt")
+	fakeSetupScript(t, cityDir, recordFile, 0)
+	t.Setenv("GC_TEMPLATE", "gascity/builder")
+
+	var stdout, stderr bytes.Buffer
+	_, err := doWorktreeHQ(cityDir, "../../../escape", &stdout, &stderr)
+	if err == nil {
+		t.Fatal("doWorktreeHQ() error = nil, want error for a path-traversal bead ID")
+	}
+
+	if got := readRecordedArgs(t, recordFile); got != nil {
+		t.Errorf("setup script should not be invoked for a path-traversal bead ID, got argv %q", got)
+	}
+
+	escaped := filepath.Join(cityDir, ".gc", "worktrees", "escape")
+	if _, statErr := os.Stat(escaped); !os.IsNotExist(statErr) {
+		t.Errorf("path-traversal bead ID must not create anything outside the HQ bucket, found %s", escaped)
+	}
+}
+
 func TestDoWorktreeHQMissingBeadID(t *testing.T) {
 	cityDir := t.TempDir()
 	t.Setenv("GC_TEMPLATE", "gascity/builder")

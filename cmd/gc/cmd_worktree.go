@@ -97,7 +97,12 @@ func doWorktreeHQ(cityPath, beadID string, stdout, stderr io.Writer) (string, er
 		return "", fmt.Errorf("cannot resolve calling role: neither GC_TEMPLATE nor GC_AGENT is set")
 	}
 
-	worktreeDir := filepath.Join(cityPath, ".gc", "worktrees", hqBeadWorktreeBucket, role+"-"+beadID)
+	bucketDir := filepath.Join(cityPath, ".gc", "worktrees", hqBeadWorktreeBucket)
+	worktreeDir := filepath.Join(bucketDir, role+"-"+beadID)
+	// Scope gate: reject bead IDs whose resolved path escapes the HQ bucket.
+	if !isStrictlyUnderDir(bucketDir, worktreeDir) {
+		return "", fmt.Errorf("bead ID %q resolves outside the HQ worktree bucket", beadID)
+	}
 	scriptPath := filepath.Join(cityPath, hqWorktreeSetupScriptRelPath)
 
 	cmd := exec.Command(scriptPath, cityPath, worktreeDir, role, "--freshen-commit") // #nosec G204 -- fixed, unmodified in-repo script

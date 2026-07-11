@@ -181,23 +181,50 @@ func isLegacyT3BridgeExecScript(script string) bool {
 func newSessionProvider() runtime.Provider {
 	ctx := loadSessionProviderContext()
 	sessionBeads := loadProviderSessionSnapshot(ctx)
-	return newSessionProviderFromContext(ctx, sessionBeads)
+	return sessionProviderOrExit(newSessionProviderFromContextWithError(ctx, sessionBeads))
+}
+
+func newSessionProviderWithError() (runtime.Provider, error) {
+	ctx := loadSessionProviderContext()
+	sessionBeads := loadProviderSessionSnapshot(ctx)
+	return withSessionProviderConstructionContext(newSessionProviderFromContextWithError(ctx, sessionBeads))
 }
 
 func newSessionProviderForCity(cfg *config.City, cityPath string) runtime.Provider {
 	ctx := sessionProviderContextForCity(cfg, cityPath, os.Getenv("GC_SESSION"))
 	sessionBeads := loadProviderSessionSnapshot(ctx)
-	return newSessionProviderFromContext(ctx, sessionBeads)
+	return sessionProviderOrExit(newSessionProviderFromContextWithError(ctx, sessionBeads))
+}
+
+func newSessionProviderForCityWithError(cfg *config.City, cityPath string) (runtime.Provider, error) {
+	ctx := sessionProviderContextForCity(cfg, cityPath, os.Getenv("GC_SESSION"))
+	sessionBeads := loadProviderSessionSnapshot(ctx)
+	return withSessionProviderConstructionContext(newSessionProviderFromContextWithError(ctx, sessionBeads))
 }
 
 func newStatusSessionProviderForCity(cfg *config.City, cityPath string) runtime.Provider {
 	ctx := sessionProviderContextForCity(cfg, cityPath, os.Getenv("GC_SESSION"))
-	return newBoundedStatusProvider(newSessionProviderFromContext(ctx, nil))
+	sp := sessionProviderOrExit(newSessionProviderFromContextWithError(ctx, nil))
+	return newBoundedStatusProvider(sp)
+}
+
+func newStatusSessionProviderForCityWithError(cfg *config.City, cityPath string) (runtime.Provider, error) {
+	return newStatusSessionProviderForCityWithSnapshotWithError(cfg, cityPath, nil)
 }
 
 func newStatusSessionProviderForCityWithSnapshot(cfg *config.City, cityPath string, sessionBeads *sessionBeadSnapshot) runtime.Provider {
 	ctx := sessionProviderContextForCity(cfg, cityPath, os.Getenv("GC_SESSION"))
-	return newBoundedStatusProvider(newSessionProviderFromContext(ctx, sessionBeads))
+	sp := sessionProviderOrExit(newSessionProviderFromContextWithError(ctx, sessionBeads))
+	return newBoundedStatusProvider(sp)
+}
+
+func newStatusSessionProviderForCityWithSnapshotWithError(cfg *config.City, cityPath string, sessionBeads *sessionBeadSnapshot) (runtime.Provider, error) {
+	ctx := sessionProviderContextForCity(cfg, cityPath, os.Getenv("GC_SESSION"))
+	sp, err := withSessionProviderConstructionContext(newSessionProviderFromContextWithError(ctx, sessionBeads))
+	if err != nil {
+		return nil, err
+	}
+	return newBoundedStatusProvider(sp), nil
 }
 
 func registerStatusProviderACPRoutes(sp runtime.Provider, snapshot *sessionBeadSnapshot, cityName string, cfg *config.City) {
@@ -237,7 +264,10 @@ func loadProviderSessionSnapshot(ctx sessionProviderContext) *sessionBeadSnapsho
 }
 
 func newSessionProviderFromContext(ctx sessionProviderContext, sessionBeads *sessionBeadSnapshot) runtime.Provider {
-	sp, err := newSessionProviderFromContextWithError(ctx, sessionBeads)
+	return sessionProviderOrExit(newSessionProviderFromContextWithError(ctx, sessionBeads))
+}
+
+func sessionProviderOrExit(sp runtime.Provider, err error) runtime.Provider {
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "%v\n", err) //nolint:errcheck // best-effort stderr
 		os.Exit(1)
@@ -247,6 +277,13 @@ func newSessionProviderFromContext(ctx sessionProviderContext, sessionBeads *ses
 
 func newSessionProviderFromContextWithError(ctx sessionProviderContext, sessionBeads *sessionBeadSnapshot) (runtime.Provider, error) {
 	return resolveSessionTransportProvider(ctx, sessionBeads)
+}
+
+func withSessionProviderConstructionContext(sp runtime.Provider, err error) (runtime.Provider, error) {
+	if err != nil {
+		return nil, fmt.Errorf("constructing session provider: %w", err)
+	}
+	return sp, nil
 }
 
 // resolveSessionTransportProvider is the single Resolver seam that composes the

@@ -1,8 +1,11 @@
 package main
 
 import (
+	"bytes"
 	"errors"
+	"fmt"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"strings"
 	"sync"
@@ -1321,5 +1324,226 @@ func TestNewSessionProviderFromContext_PackRuntimeCollisionSurfaces(t *testing.T
 	ctx := sessionProviderContextForCity(cfg, t.TempDir(), "")
 	if _, err := newSessionProviderFromContextWithError(ctx, nil); err == nil {
 		t.Fatal("builtin-shadowing pack runtime must fail provider construction, not fall back silently")
+	}
+}
+
+func TestErrorReturningSessionProviderFactoriesPreserveSuccessBehavior(t *testing.T) {
+	t.Setenv("GC_CITY", "")
+	t.Setenv("GC_SESSION", "fake")
+
+	base := runtime.NewFake()
+	oldBuild := buildSessionProviderByName
+	buildSessionProviderByName = func(*config.City, string, config.SessionConfig, string, string) (runtime.Provider, error) {
+		return base, nil
+	}
+	t.Cleanup(func() { buildSessionProviderByName = oldBuild })
+
+	cfg := &config.City{Session: config.SessionConfig{Provider: "fake"}}
+	tests := map[string]struct {
+		build      func() (runtime.Provider, error)
+		wantStatus bool
+	}{
+		"default": {
+			build: newSessionProviderWithError,
+		},
+		"city": {
+			build: func() (runtime.Provider, error) {
+				return newSessionProviderForCityWithError(cfg, "")
+			},
+		},
+		"status": {
+			build: func() (runtime.Provider, error) {
+				return newStatusSessionProviderForCityWithError(cfg, "")
+			},
+			wantStatus: true,
+		},
+		"status with snapshot": {
+			build: func() (runtime.Provider, error) {
+				return newStatusSessionProviderForCityWithSnapshotWithError(cfg, "", nil)
+			},
+			wantStatus: true,
+		},
+	}
+
+	for name, tt := range tests {
+		t.Run(name, func(t *testing.T) {
+			sp, err := tt.build()
+			if err != nil {
+				t.Fatalf("factory error = %v, want nil", err)
+			}
+			if tt.wantStatus {
+				bounded, ok := sp.(*statusProvider)
+				if !ok {
+					t.Fatalf("factory provider = %T, want *statusProvider", sp)
+				}
+				if bounded.base != base {
+					t.Fatalf("status provider base = %T, want injected provider %T", bounded.base, base)
+				}
+				return
+			}
+			if sp != base {
+				t.Fatalf("factory provider = %T, want injected provider %T", sp, base)
+			}
+		})
+	}
+}
+
+func TestErrorReturningSessionProviderFactoriesReturnContextualErrors(t *testing.T) {
+	t.Setenv("GC_CITY", "")
+	t.Setenv("GC_SESSION", "broken")
+
+	wantErr := errors.New("injected provider failure")
+	oldBuild := buildSessionProviderByName
+	buildSessionProviderByName = func(*config.City, string, config.SessionConfig, string, string) (runtime.Provider, error) {
+		return nil, wantErr
+	}
+	t.Cleanup(func() { buildSessionProviderByName = oldBuild })
+
+	cfg := &config.City{Session: config.SessionConfig{Provider: "broken"}}
+	tests := map[string]func() (runtime.Provider, error){
+		"default": newSessionProviderWithError,
+		"city": func() (runtime.Provider, error) {
+			return newSessionProviderForCityWithError(cfg, "")
+		},
+		"status": func() (runtime.Provider, error) {
+			return newStatusSessionProviderForCityWithError(cfg, "")
+		},
+		"status with snapshot": func() (runtime.Provider, error) {
+			return newStatusSessionProviderForCityWithSnapshotWithError(cfg, "", nil)
+		},
+	}
+
+	for name, build := range tests {
+		t.Run(name, func(t *testing.T) {
+			sp, err := build()
+			if sp != nil {
+				t.Fatalf("factory provider = %T, want nil", sp)
+			}
+			if !errors.Is(err, wantErr) {
+				t.Fatalf("factory error = %v, want wrapped %v", err, wantErr)
+			}
+			if got, want := err.Error(), "constructing session provider: injected provider failure"; got != want {
+				t.Fatalf("factory error = %q, want %q", got, want)
+			}
+		})
+	}
+}
+
+func TestNewSessionProviderFromContextWithErrorPreservesRawErrorForExistingCallers(t *testing.T) {
+	wantErr := errors.New("injected provider failure")
+	oldBuild := buildSessionProviderByName
+	buildSessionProviderByName = func(*config.City, string, config.SessionConfig, string, string) (runtime.Provider, error) {
+		return nil, wantErr
+	}
+	t.Cleanup(func() { buildSessionProviderByName = oldBuild })
+
+	sp, err := newSessionProviderFromContextWithError(sessionProviderContext{providerName: "broken"}, nil)
+	if sp != nil {
+		t.Fatalf("raw factory provider = %T, want nil", sp)
+	}
+	if !errors.Is(err, wantErr) {
+		t.Fatalf("raw factory error = %v, want original %v", err, wantErr)
+	}
+	if got, want := err.Error(), "injected provider failure"; got != want {
+		t.Fatalf("raw factory error = %q, want %q; existing supervisor and completion callers must not receive new context", got, want)
+	}
+	if got, want := fmt.Sprintf("session provider: %v", err), "session provider: injected provider failure"; got != want {
+		t.Fatalf("supervisor boundary error = %q, want %q", got, want)
+	}
+}
+
+func TestLegacySessionProviderFactoriesExitOnConstructionError(t *testing.T) {
+	if scenario, ok := legacySessionProviderFactoryExitScenario(os.Args); ok {
+		runLegacySessionProviderFactoryExitHelper(t, scenario)
+		return
+	}
+
+	for _, scenario := range []string{"default", "city", "status", "status-with-snapshot", "context"} {
+		t.Run(scenario, func(t *testing.T) {
+			helperRoot := t.TempDir()
+			cmd := exec.Command(
+				os.Args[0],
+				"-test.run=^TestLegacySessionProviderFactoriesExitOnConstructionError$",
+				"--",
+				"provider-factory-exit-helper",
+				scenario,
+			)
+			cmd.Dir = helperRoot
+			cmd.Env = sanitizedBaseEnv(
+				"GC_SESSION=broken",
+				"GC_HOME="+filepath.Join(helperRoot, "gc-home"),
+				"GC_CEILING_DIRECTORIES="+helperRoot,
+			)
+			var stdout, stderr bytes.Buffer
+			cmd.Stdout = &stdout
+			cmd.Stderr = &stderr
+			err := cmd.Run()
+			var exitErr *exec.ExitError
+			if !errors.As(err, &exitErr) {
+				t.Fatalf("helper error = %v, want process exit", err)
+			}
+			if got := exitErr.ExitCode(); got != 1 {
+				t.Fatalf("helper exit code = %d, want 1; stdout=%q stderr=%q", got, stdout.String(), stderr.String())
+			}
+			if got := stdout.String(); got != "" {
+				t.Fatalf("helper stdout = %q, want empty", got)
+			}
+			if got, want := stderr.String(), "injected provider failure\n"; got != want {
+				t.Fatalf("helper stderr = %q, want %q", got, want)
+			}
+		})
+	}
+}
+
+func legacySessionProviderFactoryExitScenario(args []string) (string, bool) {
+	for index, arg := range args {
+		if arg == "--" && index+3 == len(args) && args[index+1] == "provider-factory-exit-helper" {
+			return args[index+2], true
+		}
+	}
+	return "", false
+}
+
+func runLegacySessionProviderFactoryExitHelper(t *testing.T, scenario string) {
+	t.Helper()
+	t.Setenv("GC_CITY", "")
+	t.Setenv("GC_SESSION", "broken")
+	buildSessionProviderByName = func(*config.City, string, config.SessionConfig, string, string) (runtime.Provider, error) {
+		return nil, errors.New("injected provider failure")
+	}
+	defer fmt.Fprintln(os.Stdout, "legacy provider factory defer ran") //nolint:errcheck // must be bypassed by compatibility os.Exit
+
+	cfg := &config.City{Session: config.SessionConfig{Provider: "broken"}}
+	switch scenario {
+	case "default":
+		_ = newSessionProvider()
+	case "city":
+		_ = newSessionProviderForCity(cfg, "")
+	case "status":
+		_ = newStatusSessionProviderForCity(cfg, "")
+	case "status-with-snapshot":
+		_ = newStatusSessionProviderForCityWithSnapshot(cfg, "", nil)
+	case "context":
+		_ = newSessionProviderFromContext(sessionProviderContext{providerName: "broken"}, nil)
+	default:
+		t.Fatalf("unknown helper scenario %q", scenario)
+	}
+}
+
+func TestLegacySessionProviderFactoryHelperIgnoresAmbientControlEnvironment(t *testing.T) {
+	const obsoleteHelperEnv = "GC_TEST_PROVIDER_FACTORY_EXIT"
+	helperRoot := t.TempDir()
+	cmd := exec.Command(os.Args[0], "-test.run=^TestLegacySessionProviderFactoriesExitOnConstructionError$")
+	cmd.Dir = helperRoot
+	cmd.Env = sanitizedBaseEnv(
+		obsoleteHelperEnv+"=bogus",
+		"GC_HOME="+filepath.Join(helperRoot, "gc-home"),
+		"GC_CEILING_DIRECTORIES="+helperRoot,
+	)
+	var stdout, stderr bytes.Buffer
+	cmd.Stdout = &stdout
+	cmd.Stderr = &stderr
+	if err := cmd.Run(); err != nil {
+		t.Fatalf("ambient helper control changed child behavior: %v; stdout=%q stderr=%q", err, stdout.String(), stderr.String())
 	}
 }

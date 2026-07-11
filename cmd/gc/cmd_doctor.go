@@ -280,11 +280,14 @@ func buildDoctorChecks(cityPath string, cfg *config.City, cfgErr error, opts bui
 	if cfgErr == nil && cfg != nil && !controllerRunning {
 		cityName := loadedCityName(cfg, cityPath)
 		st := cfg.Workspace.SessionTemplate
-		sp := newSessionProvider()
-
-		register(doctor.NewAgentSessionsCheck(cfg, cityName, st, sp))
-		register(doctor.NewZombieSessionsCheck(cfg, cityName, st, sp))
-		register(doctor.NewOrphanSessionsCheck(cfg, cityName, st, sp))
+		sp, err := newSessionProviderWithError()
+		if err != nil {
+			register(doctor.ErrorCheck("session-provider", err.Error()))
+		} else {
+			register(doctor.NewAgentSessionsCheck(cfg, cityName, st, sp))
+			register(doctor.NewZombieSessionsCheck(cfg, cityName, st, sp))
+			register(doctor.NewOrphanSessionsCheck(cfg, cityName, st, sp))
+		}
 	}
 
 	storeFactory := openStoreForCity(cityPath)

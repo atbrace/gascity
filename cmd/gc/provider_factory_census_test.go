@@ -13,23 +13,11 @@ import (
 	"testing"
 )
 
-var legacySessionProviderFactoryReferences = map[string]int{
-	"cmd_convoy_dispatch.go:<package>:newSessionProvider":                                   1,
-	"cmd_doctor.go:buildDoctorChecks:newSessionProvider":                                    1,
-	"cmd_rig.go:<package>:newSessionProvider":                                               1,
-	"session_template_start.go:materializeSessionForAgentConfig:newSessionProvider":         1,
-	"session_template_start.go:materializeSessionForTemplateWithOptions:newSessionProvider": 1,
-}
+var legacySessionProviderFactoryReferences = map[string]int{}
 
-var legacySessionProviderAliasCalls = map[string]int{
-	"cmd_convoy_dispatch.go:runControlDispatcherWithStoreAndConfig:dispatchControlSessionProvider": 2,
-	"cmd_rig.go:doRigList:rigListSessionProvider":                                                  1,
-}
+var legacySessionProviderAliasCalls = map[string]int{}
 
-var legacySessionProviderAliasBindings = map[string]int{
-	"cmd_convoy_dispatch.go:<package>:dispatchControlSessionProvider=newSessionProvider": 1,
-	"cmd_rig.go:<package>:rigListSessionProvider=newSessionProvider":                     1,
-}
+var legacySessionProviderAliasBindings = map[string]int{}
 
 var legacySessionProviderExitHelperUses = map[string]int{
 	"providers.go:newSessionProvider:sessionProviderOrExit":                          1,
@@ -97,11 +85,11 @@ func TestLegacySessionProviderFactoryCallerCensus(t *testing.T) {
 	if !maps.Equal(census.exitHelperUses, legacySessionProviderExitHelperUses) {
 		t.Fatalf("sessionProviderOrExit ownership census changed\n got:\n%s\nwant:\n%s", formatProviderFactoryCensus(census.exitHelperUses), formatProviderFactoryCensus(legacySessionProviderExitHelperUses))
 	}
-	if census.directCalls != 3 {
-		t.Fatalf("direct legacy provider factory invocation count = %d, want 3", census.directCalls)
+	if census.directCalls != 0 {
+		t.Fatalf("direct legacy provider factory invocation count = %d, want 0", census.directCalls)
 	}
-	if invocations := census.invocationCount(); invocations != 6 {
-		t.Fatalf("legacy provider factory invocation count = %d, want 6", invocations)
+	if invocations := census.invocationCount(); invocations != 0 {
+		t.Fatalf("legacy provider factory invocation count = %d, want 0", invocations)
 	}
 }
 

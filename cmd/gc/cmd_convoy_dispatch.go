@@ -26,7 +26,7 @@ import (
 	"github.com/spf13/cobra"
 )
 
-var dispatchControlSessionProvider = newSessionProvider
+var dispatchControlSessionProvider = newSessionProviderWithError
 
 const maxControlQuarantineReasonMetadata = 512
 
@@ -228,7 +228,10 @@ func runControlDispatcherWithStoreAndConfig(cityPath, storePath string, store be
 				return decorateDrainItemRecipe(recipe, source, store, workflowStoreRefForDir(storePath, cityPath, loadedCityName(cfg, cityPath), cfg), loadedCityName(cfg, cityPath), cityPath, cfg)
 			}
 		case "retry-eval":
-			sp := dispatchControlSessionProvider()
+			sp, err := dispatchControlSessionProvider()
+			if err != nil {
+				return err
+			}
 			opts.RecycleSession = func(subject beads.Bead) error {
 				if strings.TrimSpace(subject.Assignee) == "" {
 					return fmt.Errorf("subject %s missing assignee for pooled retry recycle", subject.ID)
@@ -237,7 +240,10 @@ func runControlDispatcherWithStoreAndConfig(cityPath, storePath string, store be
 			}
 		case "retry", "ralph":
 			opts.FormulaSearchPaths = workflowFormulaSearchPaths(cfg, bead)
-			sp := dispatchControlSessionProvider()
+			sp, err := dispatchControlSessionProvider()
+			if err != nil {
+				return err
+			}
 			opts.RecycleSession = func(subject beads.Bead) error {
 				if strings.TrimSpace(subject.Assignee) == "" {
 					return fmt.Errorf("subject %s missing assignee for pooled retry recycle", subject.ID)

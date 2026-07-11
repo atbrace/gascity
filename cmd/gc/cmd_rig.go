@@ -26,7 +26,7 @@ const rigDeferredStoreInitWait = 30 * time.Second
 var (
 	rigReloadControllerConfig = reloadControllerConfig
 	rigWaitForStoreAccessible = waitForRigStoreAccessible
-	rigListSessionProvider    = newSessionProvider
+	rigListSessionProvider    = newSessionProviderWithError
 )
 
 func newRigCmd(stdout, stderr io.Writer) *cobra.Command {
@@ -759,7 +759,10 @@ func doRigList(fs fsys.FS, cityPath string, jsonOutput bool, stdout, stderr io.W
 		// slower than the text path, which skips running-status detection).
 		var sp runtime.Provider
 		if len(cfg.Rigs) > 0 {
-			sp = rigListSessionProvider()
+			sp, err = rigListSessionProvider()
+			if err != nil {
+				return writeJSONError(stdout, stderr, "session_provider_failed", fmt.Sprintf("gc rig list: %v", err), 1)
+			}
 		}
 		for i := range cfg.Rigs {
 			running := rigHasRunningAgent(cfg, cfg.Rigs[i].Name, sp)

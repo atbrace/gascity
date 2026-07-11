@@ -1,11 +1,9 @@
 package main
 
 import (
-	"bytes"
 	"errors"
 	"fmt"
 	"os"
-	"os/exec"
 	"path/filepath"
 	"strings"
 	"sync"
@@ -651,7 +649,10 @@ func TestNewSessionProvider_PreregistersACPBeadAndLegacyNames(t *testing.T) {
 		t.Fatalf("Create(session bead): %v", err)
 	}
 
-	sp := newSessionProvider()
+	sp, err := newSessionProvider()
+	if err != nil {
+		t.Fatalf("newSessionProvider: %v", err)
+	}
 
 	if err := sp.Attach("custom-reviewer"); err == nil || !strings.Contains(err.Error(), "ACP transport") {
 		t.Fatalf("Attach(custom-reviewer) error = %v, want ACP transport error", err)
@@ -829,7 +830,10 @@ func TestNewSessionProvider_PreregistersACPNamedSessionRuntimeName(t *testing.T)
 	t.Setenv("GC_CITY", cityDir)
 	writeACPNamedSessionRouteCityTOML(t, cityDir, "test-city")
 
-	sp := newSessionProvider()
+	sp, err := newSessionProvider()
+	if err != nil {
+		t.Fatalf("newSessionProvider: %v", err)
+	}
 	namedRuntime := config.NamedSessionRuntimeName("test-city", config.Workspace{}, "reviewer")
 	if err := sp.Attach(namedRuntime); err == nil || !strings.Contains(err.Error(), "ACP transport") {
 		t.Fatalf("Attach(%q) error = %v, want ACP transport error", namedRuntime, err)
@@ -844,7 +848,10 @@ func TestNewSessionProvider_PreregistersProviderDefaultACPNamedSessionRuntimeNam
 	t.Setenv("GC_CITY", cityDir)
 	writeProviderDefaultACPNamedSessionRouteCityTOML(t, cityDir, "test-city")
 
-	sp := newSessionProvider()
+	sp, err := newSessionProvider()
+	if err != nil {
+		t.Fatalf("newSessionProvider: %v", err)
+	}
 	namedRuntime := config.NamedSessionRuntimeName("test-city", config.Workspace{}, "reviewer")
 	if err := sp.Attach(namedRuntime); err == nil || !strings.Contains(err.Error(), "ACP transport") {
 		t.Fatalf("Attach(%q) error = %v, want ACP transport error", namedRuntime, err)
@@ -868,7 +875,10 @@ func TestNewSessionProviderWrapsACPProvidersWithoutACPAgents(t *testing.T) {
 		},
 	}, t.TempDir(), "fake")
 
-	sp := newSessionProviderFromContext(ctx, nil)
+	sp, err := newSessionProviderFromContext(ctx, nil)
+	if err != nil {
+		t.Fatalf("newSessionProviderFromContext: %v", err)
+	}
 	if _, ok := sp.(interface{ RouteACP(string) }); !ok {
 		t.Fatalf("provider = %T, want ACP-routing wrapper", sp)
 	}
@@ -891,7 +901,10 @@ func TestNewSessionProviderWrapsCustomACPProvidersWithExplicitACPConfig(t *testi
 		},
 	}, t.TempDir(), "fake")
 
-	sp := newSessionProviderFromContext(ctx, nil)
+	sp, err := newSessionProviderFromContext(ctx, nil)
+	if err != nil {
+		t.Fatalf("newSessionProviderFromContext: %v", err)
+	}
 	if _, ok := sp.(interface{ RouteACP(string) }); !ok {
 		t.Fatalf("provider = %T, want ACP-routing wrapper", sp)
 	}
@@ -923,9 +936,9 @@ func TestNewSessionProviderIgnoresACPInitFailureForUnusedACPProviders(t *testing
 		},
 	}, t.TempDir(), "fake")
 
-	sp, err := newSessionProviderFromContextWithError(ctx, nil)
+	sp, err := newSessionProviderFromContext(ctx, nil)
 	if err != nil {
-		t.Fatalf("newSessionProviderFromContextWithError: %v", err)
+		t.Fatalf("newSessionProviderFromContext: %v", err)
 	}
 	if _, ok := sp.(interface{ RouteACP(string) }); ok {
 		t.Fatalf("provider = %T, want plain provider fallback when ACP is unavailable", sp)
@@ -960,8 +973,8 @@ func TestNewSessionProviderRequiresACPInitForACPAgents(t *testing.T) {
 		},
 	}, t.TempDir(), "fake")
 
-	if _, err := newSessionProviderFromContextWithError(ctx, nil); err == nil {
-		t.Fatal("newSessionProviderFromContextWithError() error = nil, want ACP init failure")
+	if _, err := newSessionProviderFromContext(ctx, nil); err == nil {
+		t.Fatal("newSessionProviderFromContext() error = nil, want ACP init failure")
 	}
 }
 
@@ -993,8 +1006,8 @@ func TestNewSessionProviderRequiresACPInitForImplicitACPTemplates(t *testing.T) 
 		},
 	}, t.TempDir(), "fake")
 
-	if _, err := newSessionProviderFromContextWithError(ctx, nil); err == nil {
-		t.Fatal("newSessionProviderFromContextWithError() error = nil, want ACP init failure")
+	if _, err := newSessionProviderFromContext(ctx, nil); err == nil {
+		t.Fatal("newSessionProviderFromContext() error = nil, want ACP init failure")
 	}
 }
 
@@ -1023,7 +1036,10 @@ func TestNewSessionProviderRoutesObservedACPProviderSessionsWithoutACPAgents(t *
 		t.Fatalf("Create(provider session bead): %v", err)
 	}
 
-	sp := newSessionProvider()
+	sp, err := newSessionProvider()
+	if err != nil {
+		t.Fatalf("newSessionProvider: %v", err)
+	}
 	if err := sp.Attach("provider-session"); err == nil || !strings.Contains(err.Error(), "ACP transport") {
 		t.Fatalf("Attach(provider-session) error = %v, want ACP transport error", err)
 	}
@@ -1054,7 +1070,10 @@ func TestNewSessionProviderRoutesLegacyObservedACPProviderSessionsWithoutTranspo
 		t.Fatalf("Create(provider session bead): %v", err)
 	}
 
-	sp := newSessionProvider()
+	sp, err := newSessionProvider()
+	if err != nil {
+		t.Fatalf("newSessionProvider: %v", err)
+	}
 	if err := sp.Attach("provider-session"); err == nil || !strings.Contains(err.Error(), "ACP transport") {
 		t.Fatalf("Attach(provider-session) error = %v, want ACP transport error", err)
 	}
@@ -1095,10 +1114,13 @@ func TestStatusSessionProviderSkipsSessionSnapshot(t *testing.T) {
 		return nil, errors.New("session snapshot should not load for status")
 	}
 
-	sp := newStatusSessionProviderForCity(&config.City{
+	sp, err := newStatusSessionProviderForCity(&config.City{
 		Workspace: config.Workspace{Name: "city"},
 		Session:   config.SessionConfig{Provider: "subprocess"},
 	}, "/tmp/city")
+	if err != nil {
+		t.Fatalf("newStatusSessionProviderForCity: %v", err)
+	}
 	if sp == nil {
 		t.Fatal("newStatusSessionProviderForCity() = nil")
 	}
@@ -1135,7 +1157,10 @@ func TestStatusSessionProviderUsesProvidedSnapshotToWrapObservedACPSessions(t *t
 		},
 	}})
 
-	sp := newStatusSessionProviderForCityWithSnapshot(cfg, t.TempDir(), snapshot)
+	sp, err := newStatusSessionProviderForCityWithSnapshot(cfg, t.TempDir(), snapshot)
+	if err != nil {
+		t.Fatalf("newStatusSessionProviderForCityWithSnapshot: %v", err)
+	}
 	if err := sp.Attach("provider-session"); err == nil || !strings.Contains(err.Error(), "ACP transport") {
 		t.Fatalf("Attach(provider-session) error = %v, want ACP transport error from snapshot-backed wrapper", err)
 	}
@@ -1310,9 +1335,9 @@ func TestNewSessionProviderFromContext_PackRuntimeSelected(t *testing.T) {
 		"packrt": {Name: "packrt", Command: script, PackName: "p", PackDir: filepath.Dir(script)},
 	}}
 	ctx := sessionProviderContextForCity(cfg, t.TempDir(), "packrt")
-	sp, err := newSessionProviderFromContextWithError(ctx, nil)
+	sp, err := newSessionProviderFromContext(ctx, nil)
 	if err != nil {
-		t.Fatalf("newSessionProviderFromContextWithError: %v", err)
+		t.Fatalf("newSessionProviderFromContext: %v", err)
 	}
 	assertProviderPkg(t, sp, "exec")
 }
@@ -1322,7 +1347,7 @@ func TestNewSessionProviderFromContext_PackRuntimeCollisionSurfaces(t *testing.T
 		"tmux": {Name: "tmux", Command: "/bin/true", PackName: "badpack"},
 	}}
 	ctx := sessionProviderContextForCity(cfg, t.TempDir(), "")
-	if _, err := newSessionProviderFromContextWithError(ctx, nil); err == nil {
+	if _, err := newSessionProviderFromContext(ctx, nil); err == nil {
 		t.Fatal("builtin-shadowing pack runtime must fail provider construction, not fall back silently")
 	}
 }
@@ -1344,22 +1369,22 @@ func TestErrorReturningSessionProviderFactoriesPreserveSuccessBehavior(t *testin
 		wantStatus bool
 	}{
 		"default": {
-			build: newSessionProviderWithError,
+			build: newSessionProvider,
 		},
 		"city": {
 			build: func() (runtime.Provider, error) {
-				return newSessionProviderForCityWithError(cfg, "")
+				return newSessionProviderForCity(cfg, "")
 			},
 		},
 		"status": {
 			build: func() (runtime.Provider, error) {
-				return newStatusSessionProviderForCityWithError(cfg, "")
+				return newStatusSessionProviderForCity(cfg, "")
 			},
 			wantStatus: true,
 		},
 		"status with snapshot": {
 			build: func() (runtime.Provider, error) {
-				return newStatusSessionProviderForCityWithSnapshotWithError(cfg, "", nil)
+				return newStatusSessionProviderForCityWithSnapshot(cfg, "", nil)
 			},
 			wantStatus: true,
 		},
@@ -1401,15 +1426,15 @@ func TestErrorReturningSessionProviderFactoriesReturnContextualErrors(t *testing
 
 	cfg := &config.City{Session: config.SessionConfig{Provider: "broken"}}
 	tests := map[string]func() (runtime.Provider, error){
-		"default": newSessionProviderWithError,
+		"default": newSessionProvider,
 		"city": func() (runtime.Provider, error) {
-			return newSessionProviderForCityWithError(cfg, "")
+			return newSessionProviderForCity(cfg, "")
 		},
 		"status": func() (runtime.Provider, error) {
-			return newStatusSessionProviderForCityWithError(cfg, "")
+			return newStatusSessionProviderForCity(cfg, "")
 		},
 		"status with snapshot": func() (runtime.Provider, error) {
-			return newStatusSessionProviderForCityWithSnapshotWithError(cfg, "", nil)
+			return newStatusSessionProviderForCityWithSnapshot(cfg, "", nil)
 		},
 	}
 
@@ -1429,7 +1454,7 @@ func TestErrorReturningSessionProviderFactoriesReturnContextualErrors(t *testing
 	}
 }
 
-func TestNewSessionProviderFromContextWithErrorPreservesRawErrorForExistingCallers(t *testing.T) {
+func TestNewSessionProviderFromContextPreservesRawErrorForExistingCallers(t *testing.T) {
 	wantErr := errors.New("injected provider failure")
 	oldBuild := buildSessionProviderByName
 	buildSessionProviderByName = func(*config.City, string, config.SessionConfig, string, string) (runtime.Provider, error) {
@@ -1437,7 +1462,7 @@ func TestNewSessionProviderFromContextWithErrorPreservesRawErrorForExistingCalle
 	}
 	t.Cleanup(func() { buildSessionProviderByName = oldBuild })
 
-	sp, err := newSessionProviderFromContextWithError(sessionProviderContext{providerName: "broken"}, nil)
+	sp, err := newSessionProviderFromContext(sessionProviderContext{providerName: "broken"}, nil)
 	if sp != nil {
 		t.Fatalf("raw factory provider = %T, want nil", sp)
 	}
@@ -1449,101 +1474,5 @@ func TestNewSessionProviderFromContextWithErrorPreservesRawErrorForExistingCalle
 	}
 	if got, want := fmt.Sprintf("session provider: %v", err), "session provider: injected provider failure"; got != want {
 		t.Fatalf("supervisor boundary error = %q, want %q", got, want)
-	}
-}
-
-func TestLegacySessionProviderFactoriesExitOnConstructionError(t *testing.T) {
-	if scenario, ok := legacySessionProviderFactoryExitScenario(os.Args); ok {
-		runLegacySessionProviderFactoryExitHelper(t, scenario)
-		return
-	}
-
-	for _, scenario := range []string{"default", "city", "status", "status-with-snapshot", "context"} {
-		t.Run(scenario, func(t *testing.T) {
-			helperRoot := t.TempDir()
-			cmd := exec.Command(
-				os.Args[0],
-				"-test.run=^TestLegacySessionProviderFactoriesExitOnConstructionError$",
-				"--",
-				"provider-factory-exit-helper",
-				scenario,
-			)
-			cmd.Dir = helperRoot
-			cmd.Env = sanitizedBaseEnv(
-				"GC_SESSION=broken",
-				"GC_HOME="+filepath.Join(helperRoot, "gc-home"),
-				"GC_CEILING_DIRECTORIES="+helperRoot,
-			)
-			var stdout, stderr bytes.Buffer
-			cmd.Stdout = &stdout
-			cmd.Stderr = &stderr
-			err := cmd.Run()
-			var exitErr *exec.ExitError
-			if !errors.As(err, &exitErr) {
-				t.Fatalf("helper error = %v, want process exit", err)
-			}
-			if got := exitErr.ExitCode(); got != 1 {
-				t.Fatalf("helper exit code = %d, want 1; stdout=%q stderr=%q", got, stdout.String(), stderr.String())
-			}
-			if got := stdout.String(); got != "" {
-				t.Fatalf("helper stdout = %q, want empty", got)
-			}
-			if got, want := stderr.String(), "injected provider failure\n"; got != want {
-				t.Fatalf("helper stderr = %q, want %q", got, want)
-			}
-		})
-	}
-}
-
-func legacySessionProviderFactoryExitScenario(args []string) (string, bool) {
-	for index, arg := range args {
-		if arg == "--" && index+3 == len(args) && args[index+1] == "provider-factory-exit-helper" {
-			return args[index+2], true
-		}
-	}
-	return "", false
-}
-
-func runLegacySessionProviderFactoryExitHelper(t *testing.T, scenario string) {
-	t.Helper()
-	t.Setenv("GC_CITY", "")
-	t.Setenv("GC_SESSION", "broken")
-	buildSessionProviderByName = func(*config.City, string, config.SessionConfig, string, string) (runtime.Provider, error) {
-		return nil, errors.New("injected provider failure")
-	}
-	defer fmt.Fprintln(os.Stdout, "legacy provider factory defer ran") //nolint:errcheck // must be bypassed by compatibility os.Exit
-
-	cfg := &config.City{Session: config.SessionConfig{Provider: "broken"}}
-	switch scenario {
-	case "default":
-		_ = newSessionProvider()
-	case "city":
-		_ = newSessionProviderForCity(cfg, "")
-	case "status":
-		_ = newStatusSessionProviderForCity(cfg, "")
-	case "status-with-snapshot":
-		_ = newStatusSessionProviderForCityWithSnapshot(cfg, "", nil)
-	case "context":
-		_ = newSessionProviderFromContext(sessionProviderContext{providerName: "broken"}, nil)
-	default:
-		t.Fatalf("unknown helper scenario %q", scenario)
-	}
-}
-
-func TestLegacySessionProviderFactoryHelperIgnoresAmbientControlEnvironment(t *testing.T) {
-	const obsoleteHelperEnv = "GC_TEST_PROVIDER_FACTORY_EXIT"
-	helperRoot := t.TempDir()
-	cmd := exec.Command(os.Args[0], "-test.run=^TestLegacySessionProviderFactoriesExitOnConstructionError$")
-	cmd.Dir = helperRoot
-	cmd.Env = sanitizedBaseEnv(
-		obsoleteHelperEnv+"=bogus",
-		"GC_HOME="+filepath.Join(helperRoot, "gc-home"),
-		"GC_CEILING_DIRECTORIES="+helperRoot,
-	)
-	var stdout, stderr bytes.Buffer
-	cmd.Stdout = &stdout
-	cmd.Stderr = &stderr
-	if err := cmd.Run(); err != nil {
-		t.Fatalf("ambient helper control changed child behavior: %v; stdout=%q stderr=%q", err, stdout.String(), stderr.String())
 	}
 }

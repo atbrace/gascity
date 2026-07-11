@@ -119,7 +119,7 @@ func materializeSessionForTemplateWithOptions(
 			return "", err
 		}
 		sessionTransport := config.ResolveSessionCreateTransport(spec.Agent.Session, resolved)
-		sp, err := newSessionProviderWithError()
+		sp, err := newSessionProvider()
 		if err != nil {
 			return "", err
 		}
@@ -279,7 +279,7 @@ func materializeSessionForAgentConfig(cityPath string, cfg *config.City, store b
 		return "", err
 	}
 	sessionTransport := config.ResolveSessionCreateTransport(agentCfg.Session, resolved)
-	sp, err := newSessionProviderWithError()
+	sp, err := newSessionProvider()
 	if err != nil {
 		return "", err
 	}

@@ -332,7 +332,7 @@ func cmdSlingWithJSON(args []string, isFormula, doNudge, force bool, title strin
 		return 1
 	}
 
-	sp, err := newSessionProviderWithError()
+	sp, err := newSessionProvider()
 	if err != nil {
 		return fail("session_provider_failed", fmt.Sprintf("gc sling: %v", err))
 	}

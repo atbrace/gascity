@@ -224,7 +224,7 @@ func cmdSessionNew(args []string, alias, title, titleHint string, noAttach, json
 	// coordination-class store for relocation-safety.
 	sessStore := cliSessionStore(store, cfg, cityPath)
 
-	sp, err := newSessionProviderWithError()
+	sp, err := newSessionProvider()
 	if err != nil {
 		fmt.Fprintf(stderr, "gc session new: %v\n", err) //nolint:errcheck // best-effort stderr
 		return 1
@@ -956,7 +956,7 @@ func doSessionListFallback(stateFilter, templateFilter string, jsonOutput bool, 
 
 	sessionBeads := newSessionBeadSnapshot(allSessionBeads)
 	sp, err := withSessionProviderConstructionContext(
-		newSessionProviderFromContextWithError(providerCtx, sessionBeads),
+		newSessionProviderFromContext(providerCtx, sessionBeads),
 	)
 	if err != nil {
 		message := fmt.Sprintf("gc session list: %v", err)
@@ -1477,7 +1477,7 @@ func cmdSessionAttach(args []string, stdout, stderr io.Writer) int {
 		return 1
 	}
 
-	sp, err := newSessionProviderWithError()
+	sp, err := newSessionProvider()
 	if err != nil {
 		fmt.Fprintf(stderr, "gc session attach: %v\n", err) //nolint:errcheck // best-effort stderr
 		return 1
@@ -1710,7 +1710,7 @@ func cmdSessionSuspend(args []string, stdout, stderr io.Writer, jsonOutput ...bo
 	}
 
 	// Fallback: controller not running — direct suspend via worker handle.
-	sp, err := newSessionProviderWithError()
+	sp, err := newSessionProvider()
 	if err != nil {
 		fmt.Fprintf(stderr, "gc session suspend: %v\n", err) //nolint:errcheck // best-effort stderr
 		return 1
@@ -1789,7 +1789,7 @@ func cmdSessionClose(args []string, stdout, stderr io.Writer, jsonOutput ...bool
 		return 1
 	}
 
-	sp, err := newSessionProviderWithError()
+	sp, err := newSessionProvider()
 	if err != nil {
 		fmt.Fprintf(stderr, "gc session close: %v\n", err) //nolint:errcheck // best-effort stderr
 		return 1
@@ -1890,7 +1890,7 @@ func cmdSessionRename(args []string, stdout, stderr io.Writer, jsonOutput ...boo
 		return 1
 	}
 
-	sp, err := newSessionProviderWithError()
+	sp, err := newSessionProvider()
 	if err != nil {
 		fmt.Fprintf(stderr, "gc session rename: %v\n", err) //nolint:errcheck // best-effort stderr
 		return 1
@@ -1980,7 +1980,7 @@ func cmdSessionPrune(beforeStr, statesStr string, stdout, stderr io.Writer, json
 	}
 	sessStore := cliSessionStore(store, cfg, cityPath)
 
-	sp, err := newSessionProviderWithError()
+	sp, err := newSessionProvider()
 	if err != nil {
 		fmt.Fprintf(stderr, "gc session prune: %v\n", err) //nolint:errcheck // best-effort stderr
 		return 1
@@ -2232,7 +2232,7 @@ func doSessionPeekFallback(target string, lines int, jsonOutput bool, stdout, st
 		return 1
 	}
 
-	sp, err := newSessionProviderWithError()
+	sp, err := newSessionProvider()
 	if err != nil {
 		fmt.Fprintf(stderr, "gc session peek: %v\n", err) //nolint:errcheck // best-effort stderr
 		return 1
@@ -2336,7 +2336,7 @@ func cmdSessionKill(args []string, stdout, stderr io.Writer, jsonOutput ...bool)
 		return 1
 	}
 
-	sp, err := newSessionProviderWithError()
+	sp, err := newSessionProvider()
 	if err != nil {
 		fmt.Fprintf(stderr, "gc session kill: %v\n", err) //nolint:errcheck // best-effort stderr
 		return 1
@@ -2558,7 +2558,7 @@ func cmdSessionSubmit(args []string, intent session.SubmitIntent, jsonOutput boo
 		return 1
 	}
 
-	sp, err := newSessionProviderWithError()
+	sp, err := newSessionProvider()
 	if err != nil {
 		fmt.Fprintf(stderr, "gc session submit: %v\n", err) //nolint:errcheck // best-effort stderr
 		return 1

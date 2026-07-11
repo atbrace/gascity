@@ -52,7 +52,7 @@ straight to kill.`,
 	return cmd
 }
 
-var sessionProviderForStopCity = newSessionProviderForCityWithError
+var sessionProviderForStopCity = newSessionProviderForCity
 
 // cmdStop stops the city by terminating all configured agent sessions.
 // If a path is given, operates there; otherwise uses cwd.

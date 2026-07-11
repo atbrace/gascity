@@ -162,7 +162,7 @@ func cmdHandoff(args []string, target string, auto bool, hookFormat string, stdo
 		return doHandoffAuto(store, sessStore, rec, current.display, args, hookFormat, stdout, stderr)
 	}
 
-	sp, err := newSessionProviderWithError()
+	sp, err := newSessionProvider()
 	if err != nil {
 		fmt.Fprintf(stderr, "gc handoff: %v\n", err) //nolint:errcheck // best-effort stderr
 		return 1
@@ -213,7 +213,7 @@ func cmdHandoffRemote(args []string, target string, stdout, stderr io.Writer) in
 		return 1
 	}
 
-	sp, err := newSessionProviderWithError()
+	sp, err := newSessionProvider()
 	if err != nil {
 		fmt.Fprintf(stderr, "gc handoff: %v\n", err) //nolint:errcheck // best-effort stderr
 		return 1

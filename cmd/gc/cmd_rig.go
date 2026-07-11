@@ -26,7 +26,7 @@ const rigDeferredStoreInitWait = 30 * time.Second
 var (
 	rigReloadControllerConfig = reloadControllerConfig
 	rigWaitForStoreAccessible = waitForRigStoreAccessible
-	rigListSessionProvider    = newSessionProviderWithError
+	rigListSessionProvider    = newSessionProvider
 )
 
 func newRigCmd(stdout, stderr io.Writer) *cobra.Command {

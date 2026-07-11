@@ -647,7 +647,7 @@ func cmdNudgePoll(args []string, sessionName string, interval, quiescence time.D
 	stopRuntime := configureNudgePollRuntime(stderr)
 	defer stopRuntime()
 
-	sp, err := newSessionProviderWithError()
+	sp, err := newSessionProvider()
 	if err != nil {
 		fmt.Fprintf(stderr, "gc nudge poll: %v\n", err) //nolint:errcheck
 		return 1
@@ -731,7 +731,7 @@ func deliverSessionNudge(target nudgeTarget, message string, mode nudgeDeliveryM
 		fmt.Fprintf(stderr, "gc session nudge: opening city store for %q\n", target.agentKey()) //nolint:errcheck
 		return 1
 	}
-	sp, err := newSessionProviderWithError()
+	sp, err := newSessionProvider()
 	if err != nil {
 		fmt.Fprintf(stderr, "gc session nudge: %v\n", err) //nolint:errcheck
 		return 1
@@ -1072,7 +1072,7 @@ func sendMailNotify(target nudgeTarget, sender string) error {
 	if store.Store == nil {
 		return fmt.Errorf("opening city store for %q", target.agentKey())
 	}
-	sp, err := newSessionProviderWithError()
+	sp, err := newSessionProvider()
 	if err != nil {
 		return err
 	}

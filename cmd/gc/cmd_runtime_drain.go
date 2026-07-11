@@ -207,7 +207,7 @@ func cmdRuntimeDrain(args []string, jsonOutput bool, stdout, stderr io.Writer) i
 		fmt.Fprintf(stderr, "gc runtime drain: %v\n", err) //nolint:errcheck // best-effort stderr
 		return 1
 	}
-	sp, err := newSessionProviderWithError()
+	sp, err := newSessionProvider()
 	if err != nil {
 		fmt.Fprintf(stderr, "gc runtime drain: %v\n", err) //nolint:errcheck // best-effort stderr
 		return 1
@@ -293,7 +293,7 @@ func cmdRuntimeUndrain(args []string, jsonOutput bool, stdout, stderr io.Writer)
 		fmt.Fprintf(stderr, "gc runtime undrain: %v\n", err) //nolint:errcheck // best-effort stderr
 		return 1
 	}
-	sp, err := newSessionProviderWithError()
+	sp, err := newSessionProvider()
 	if err != nil {
 		fmt.Fprintf(stderr, "gc runtime undrain: %v\n", err) //nolint:errcheck // best-effort stderr
 		return 1
@@ -377,7 +377,7 @@ func cmdRuntimeDrainCheck(args []string, jsonOutput bool, stdout, stderr io.Writ
 			fmt.Fprintf(stderr, "gc runtime drain-check: %v\n", err) //nolint:errcheck // best-effort stderr
 			return 1                                                 // silent — same as current "not draining" behavior
 		}
-		sp, err := newSessionProviderWithError()
+		sp, err := newSessionProvider()
 		if err != nil {
 			fmt.Fprintf(stderr, "gc runtime drain-check: %v\n", err) //nolint:errcheck // best-effort stderr
 			return 1
@@ -390,7 +390,7 @@ func cmdRuntimeDrainCheck(args []string, jsonOutput bool, stdout, stderr io.Writ
 	if err != nil {
 		return 1 // not in agent context → not draining
 	}
-	sp, err := newSessionProviderWithError()
+	sp, err := newSessionProvider()
 	if err != nil {
 		fmt.Fprintf(stderr, "gc runtime drain-check: %v\n", err) //nolint:errcheck // best-effort stderr
 		return 1
@@ -472,7 +472,7 @@ func cmdRuntimeDrainAck(args []string, jsonOutput bool, stdout, stderr io.Writer
 			fmt.Fprintf(stderr, "gc runtime drain-ack: %v\n", err) //nolint:errcheck // best-effort stderr
 			return 1
 		}
-		sp, err := newSessionProviderWithError()
+		sp, err := newSessionProvider()
 		if err != nil {
 			fmt.Fprintf(stderr, "gc runtime drain-ack: %v\n", err) //nolint:errcheck // best-effort stderr
 			return 1
@@ -486,7 +486,7 @@ func cmdRuntimeDrainAck(args []string, jsonOutput bool, stdout, stderr io.Writer
 		fmt.Fprintf(stderr, "gc runtime drain-ack: %v\n", err) //nolint:errcheck // best-effort stderr
 		return 1
 	}
-	sp, err := newSessionProviderWithError()
+	sp, err := newSessionProvider()
 	if err != nil {
 		fmt.Fprintf(stderr, "gc runtime drain-ack: %v\n", err) //nolint:errcheck // best-effort stderr
 		return 1
@@ -541,7 +541,7 @@ func cmdRuntimeRequestRestart(stdout, stderr io.Writer) int {
 		return 1
 	}
 
-	sp, err := newSessionProviderWithError()
+	sp, err := newSessionProvider()
 	if err != nil {
 		fmt.Fprintf(stderr, "gc runtime request-restart: %v\n", err) //nolint:errcheck // best-effort stderr
 		return 1

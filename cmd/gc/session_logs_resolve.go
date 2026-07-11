@@ -24,7 +24,7 @@ func resolveStoredSessionLogSource(cityPath string, cfg *config.City, sessFront 
 		return "", "", false, ""
 	}
 	if logCtx.sessionID != "" {
-		sp, err := newSessionProviderWithError()
+		sp, err := newSessionProvider()
 		if err != nil {
 			return "", logCtx.provider, true, err.Error()
 		}

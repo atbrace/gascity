@@ -1996,7 +1996,7 @@ func reconcileCities(
 			providerName := effectiveProviderName(cfg.Session.Provider)
 			ctx := sessionProviderContextForCity(cfg, path, providerName)
 			snapshot := loadProviderSessionSnapshot(ctx)
-			resolvedSP, err := newSessionProviderFromContextWithError(ctx, snapshot)
+			resolvedSP, err := newSessionProviderFromContext(ctx, snapshot)
 			if err != nil {
 				return err
 			}

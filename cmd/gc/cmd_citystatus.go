@@ -181,7 +181,7 @@ func cmdCityStatus(args []string, jsonOutput bool, stdout, stderr io.Writer) int
 		return code
 	}
 	statusSnapshot := loadStatusSessionSnapshot(cityPath, cfg, cliSessionStore(store, cfg, cityPath), stderr)
-	sp, err := newStatusSessionProviderForCityWithSnapshotWithError(cfg, cityPath, statusSnapshot)
+	sp, err := newStatusSessionProviderForCityWithSnapshot(cfg, cityPath, statusSnapshot)
 	if err != nil {
 		message := fmt.Sprintf("gc status: %v", err)
 		if jsonOutput {

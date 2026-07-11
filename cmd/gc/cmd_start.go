@@ -812,7 +812,7 @@ func doStartStandalone(args []string, controllerMode bool, stdout, stderr io.Wri
 		}
 	}
 
-	sp, err := newSessionProviderWithError()
+	sp, err := newSessionProvider()
 	if err != nil {
 		fmt.Fprintf(stderr, "gc start: %v\n", err) //nolint:errcheck // best-effort stderr
 		return 1

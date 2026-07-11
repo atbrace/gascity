@@ -76,7 +76,7 @@ func cmdSessionReset(args []string, stdout, stderr io.Writer, jsonOutput ...bool
 		return 1
 	}
 
-	sp, err := newSessionProviderWithError()
+	sp, err := newSessionProvider()
 	if err != nil {
 		fmt.Fprintf(stderr, "gc session reset: %v\n", err) //nolint:errcheck // best-effort stderr
 		return 1

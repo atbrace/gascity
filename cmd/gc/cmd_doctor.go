@@ -280,7 +280,7 @@ func buildDoctorChecks(cityPath string, cfg *config.City, cfgErr error, opts bui
 	if cfgErr == nil && cfg != nil && !controllerRunning {
 		cityName := loadedCityName(cfg, cityPath)
 		st := cfg.Workspace.SessionTemplate
-		sp, err := newSessionProviderWithError()
+		sp, err := newSessionProvider()
 		if err != nil {
 			register(doctor.ErrorCheck("session-provider", err.Error()))
 		} else {

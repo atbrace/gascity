@@ -26,7 +26,7 @@ import (
 	"github.com/spf13/cobra"
 )
 
-var dispatchControlSessionProvider = newSessionProviderWithError
+var dispatchControlSessionProvider = newSessionProvider
 
 const maxControlQuarantineReasonMetadata = 512
 

@@ -52,7 +52,7 @@ straight to kill.`,
 	return cmd
 }
 
-var sessionProviderForStopCity = newSessionProviderForCity
+var sessionProviderForStopCity = newSessionProviderForCityWithError
 
 // cmdStop stops the city by terminating all configured agent sessions.
 // If a path is given, operates there; otherwise uses cwd.
@@ -288,7 +288,11 @@ func cmdStopBody(cityPath string, cfg *config.City, force bool, stdout, stderr i
 		return 0
 	}
 
-	sp := sessionProviderForStopCity(cfg, cityPath)
+	sp, err := sessionProviderForStopCity(cfg, cityPath)
+	if err != nil {
+		fmt.Fprintf(stderr, "gc stop: %v\n", err) //nolint:errcheck // best-effort stderr
+		return 1
+	}
 	st := cfg.Workspace.SessionTemplate
 	var sessionNames []string
 	desired := make(map[string]bool, len(cfg.Agents))

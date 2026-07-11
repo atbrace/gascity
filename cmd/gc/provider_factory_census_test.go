@@ -14,7 +14,6 @@ import (
 )
 
 var legacySessionProviderFactoryReferences = map[string]int{
-	"cmd_citystatus.go:cmdCityStatus:newStatusSessionProviderForCityWithSnapshot":           1,
 	"cmd_convoy_dispatch.go:<package>:newSessionProvider":                                   1,
 	"cmd_doctor.go:buildDoctorChecks:newSessionProvider":                                    1,
 	"cmd_handoff.go:cmdHandoff:newSessionProvider":                                          1,
@@ -24,14 +23,8 @@ var legacySessionProviderFactoryReferences = map[string]int{
 	"cmd_nudge.go:sendMailNotify:newSessionProvider":                                        1,
 	"cmd_restart.go:cmdRigRestart:newSessionProvider":                                       1,
 	"cmd_rig.go:<package>:newSessionProvider":                                               1,
-	"cmd_runtime_drain.go:cmdRuntimeDrain:newSessionProvider":                               1,
-	"cmd_runtime_drain.go:cmdRuntimeDrainAck:newSessionProvider":                            2,
-	"cmd_runtime_drain.go:cmdRuntimeDrainCheck:newSessionProvider":                          2,
-	"cmd_runtime_drain.go:cmdRuntimeRequestRestart:newSessionProvider":                      1,
-	"cmd_runtime_drain.go:cmdRuntimeUndrain:newSessionProvider":                             1,
 	"cmd_sling.go:cmdSlingWithJSON:newSessionProvider":                                      1,
 	"cmd_start.go:doStartStandalone:newSessionProvider":                                     1,
-	"cmd_status.go:cmdRigStatus:newStatusSessionProviderForCityWithSnapshot":                1,
 	"cmd_stop.go:<package>:newSessionProviderForCity":                                       1,
 	"session_template_start.go:materializeSessionForAgentConfig:newSessionProvider":         1,
 	"session_template_start.go:materializeSessionForTemplateWithOptions:newSessionProvider": 1,
@@ -115,11 +108,11 @@ func TestLegacySessionProviderFactoryCallerCensus(t *testing.T) {
 	if !maps.Equal(census.exitHelperUses, legacySessionProviderExitHelperUses) {
 		t.Fatalf("sessionProviderOrExit ownership census changed\n got:\n%s\nwant:\n%s", formatProviderFactoryCensus(census.exitHelperUses), formatProviderFactoryCensus(legacySessionProviderExitHelperUses))
 	}
-	if census.directCalls != 20 {
-		t.Fatalf("direct legacy provider factory invocation count = %d, want 20", census.directCalls)
+	if census.directCalls != 11 {
+		t.Fatalf("direct legacy provider factory invocation count = %d, want 11", census.directCalls)
 	}
-	if invocations := census.invocationCount(); invocations != 24 {
-		t.Fatalf("legacy provider factory invocation count = %d, want 24", invocations)
+	if invocations := census.invocationCount(); invocations != 15 {
+		t.Fatalf("legacy provider factory invocation count = %d, want 15", invocations)
 	}
 }
 

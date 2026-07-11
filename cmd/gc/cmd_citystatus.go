@@ -181,7 +181,15 @@ func cmdCityStatus(args []string, jsonOutput bool, stdout, stderr io.Writer) int
 		return code
 	}
 	statusSnapshot := loadStatusSessionSnapshot(cityPath, cfg, cliSessionStore(store, cfg, cityPath), stderr)
-	sp := newStatusSessionProviderForCityWithSnapshot(cfg, cityPath, statusSnapshot)
+	sp, err := newStatusSessionProviderForCityWithSnapshotWithError(cfg, cityPath, statusSnapshot)
+	if err != nil {
+		message := fmt.Sprintf("gc status: %v", err)
+		if jsonOutput {
+			return writeJSONError(stdout, stderr, "session_provider_failed", message, 1)
+		}
+		fmt.Fprintln(stderr, message) //nolint:errcheck // best-effort stderr
+		return 1
+	}
 	dops := newDrainOps(sp)
 	c, reason := cityStatusAPIClient(cityPath)
 	return routeCityStatus(cityPath, cfg, sp, dops, c, reason, jsonOutput, stdout, stderr)

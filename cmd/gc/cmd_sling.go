@@ -332,7 +332,10 @@ func cmdSlingWithJSON(args []string, isFormula, doNudge, force bool, title strin
 		return 1
 	}
 
-	sp := newSessionProvider()
+	sp, err := newSessionProviderWithError()
+	if err != nil {
+		return fail("session_provider_failed", fmt.Sprintf("gc sling: %v", err))
+	}
 
 	var storeDir string
 	var store beads.Store

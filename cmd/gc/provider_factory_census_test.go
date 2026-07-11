@@ -16,13 +16,7 @@ import (
 var legacySessionProviderFactoryReferences = map[string]int{
 	"cmd_convoy_dispatch.go:<package>:newSessionProvider":                                   1,
 	"cmd_doctor.go:buildDoctorChecks:newSessionProvider":                                    1,
-	"cmd_handoff.go:cmdHandoff:newSessionProvider":                                          1,
-	"cmd_handoff.go:cmdHandoffRemote:newSessionProvider":                                    1,
-	"cmd_nudge.go:cmdNudgePoll:newSessionProvider":                                          1,
-	"cmd_nudge.go:deliverSessionNudge:newSessionProvider":                                   1,
-	"cmd_nudge.go:sendMailNotify:newSessionProvider":                                        1,
 	"cmd_rig.go:<package>:newSessionProvider":                                               1,
-	"cmd_sling.go:cmdSlingWithJSON:newSessionProvider":                                      1,
 	"session_template_start.go:materializeSessionForAgentConfig:newSessionProvider":         1,
 	"session_template_start.go:materializeSessionForTemplateWithOptions:newSessionProvider": 1,
 }
@@ -103,11 +97,11 @@ func TestLegacySessionProviderFactoryCallerCensus(t *testing.T) {
 	if !maps.Equal(census.exitHelperUses, legacySessionProviderExitHelperUses) {
 		t.Fatalf("sessionProviderOrExit ownership census changed\n got:\n%s\nwant:\n%s", formatProviderFactoryCensus(census.exitHelperUses), formatProviderFactoryCensus(legacySessionProviderExitHelperUses))
 	}
-	if census.directCalls != 9 {
-		t.Fatalf("direct legacy provider factory invocation count = %d, want 9", census.directCalls)
+	if census.directCalls != 3 {
+		t.Fatalf("direct legacy provider factory invocation count = %d, want 3", census.directCalls)
 	}
-	if invocations := census.invocationCount(); invocations != 12 {
-		t.Fatalf("legacy provider factory invocation count = %d, want 12", invocations)
+	if invocations := census.invocationCount(); invocations != 6 {
+		t.Fatalf("legacy provider factory invocation count = %d, want 6", invocations)
 	}
 }
 

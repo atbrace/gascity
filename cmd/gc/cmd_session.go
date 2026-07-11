@@ -224,7 +224,11 @@ func cmdSessionNew(args []string, alias, title, titleHint string, noAttach, json
 	// coordination-class store for relocation-safety.
 	sessStore := cliSessionStore(store, cfg, cityPath)
 
-	sp := newSessionProvider()
+	sp, err := newSessionProviderWithError()
+	if err != nil {
+		fmt.Fprintf(stderr, "gc session new: %v\n", err) //nolint:errcheck // best-effort stderr
+		return 1
+	}
 	if err := validateResolvedSessionTransport(resolved, sessionTransport, sp); err != nil {
 		fmt.Fprintf(stderr, "gc session new: %v\n", err) //nolint:errcheck // best-effort stderr
 		return 1
@@ -950,7 +954,18 @@ func doSessionListFallback(stateFilter, templateFilter string, jsonOutput bool, 
 		return 1
 	}
 
-	sp := newSessionProviderFromContext(providerCtx, sessionBeads)
+	sessionBeads := newSessionBeadSnapshot(allSessionBeads)
+	sp, err := withSessionProviderConstructionContext(
+		newSessionProviderFromContextWithError(providerCtx, sessionBeads),
+	)
+	if err != nil {
+		message := fmt.Sprintf("gc session list: %v", err)
+		if jsonOutput {
+			return writeJSONError(stdout, stderr, "session_provider_failed", message, 1)
+		}
+		fmt.Fprintln(stderr, message) //nolint:errcheck // best-effort stderr
+		return 1
+	}
 	catalog, err := workerSessionCatalogWithConfig("", sessStore, sp, providerCtx.cfg)
 	if err != nil {
 		if jsonOutput {
@@ -1462,7 +1477,11 @@ func cmdSessionAttach(args []string, stdout, stderr io.Writer) int {
 		return 1
 	}
 
-	sp := newSessionProvider()
+	sp, err := newSessionProviderWithError()
+	if err != nil {
+		fmt.Fprintf(stderr, "gc session attach: %v\n", err) //nolint:errcheck // best-effort stderr
+		return 1
+	}
 	catalog, err := workerSessionCatalogWithConfig(cityPath, sessStore, sp, cfg)
 	if err != nil {
 		fmt.Fprintf(stderr, "gc session attach: %v\n", err) //nolint:errcheck // best-effort stderr
@@ -1691,7 +1710,11 @@ func cmdSessionSuspend(args []string, stdout, stderr io.Writer, jsonOutput ...bo
 	}
 
 	// Fallback: controller not running — direct suspend via worker handle.
-	sp := newSessionProvider()
+	sp, err := newSessionProviderWithError()
+	if err != nil {
+		fmt.Fprintf(stderr, "gc session suspend: %v\n", err) //nolint:errcheck // best-effort stderr
+		return 1
+	}
 	handle, err := workerHandleForSessionWithConfig(cityPath, sessStore, sp, cfg, sessionID)
 	if err != nil {
 		fmt.Fprintf(stderr, "gc session suspend: %v\n", err) //nolint:errcheck // best-effort stderr
@@ -1766,7 +1789,11 @@ func cmdSessionClose(args []string, stdout, stderr io.Writer, jsonOutput ...bool
 		return 1
 	}
 
-	sp := newSessionProvider()
+	sp, err := newSessionProviderWithError()
+	if err != nil {
+		fmt.Fprintf(stderr, "gc session close: %v\n", err) //nolint:errcheck // best-effort stderr
+		return 1
+	}
 	handle, err := workerHandleForSessionWithConfig(cityPath, sessStore, sp, cfg, sessionID)
 	if err != nil {
 		fmt.Fprintf(stderr, "gc session close: %v\n", err) //nolint:errcheck // best-effort stderr
@@ -1863,7 +1890,11 @@ func cmdSessionRename(args []string, stdout, stderr io.Writer, jsonOutput ...boo
 		return 1
 	}
 
-	sp := newSessionProvider()
+	sp, err := newSessionProviderWithError()
+	if err != nil {
+		fmt.Fprintf(stderr, "gc session rename: %v\n", err) //nolint:errcheck // best-effort stderr
+		return 1
+	}
 	handle, err := workerHandleForSessionWithConfig(cityPath, sessStore, sp, cfg, sessionID)
 	if err != nil {
 		fmt.Fprintf(stderr, "gc session rename: %v\n", err) //nolint:errcheck // best-effort stderr
@@ -1949,7 +1980,11 @@ func cmdSessionPrune(beforeStr, statesStr string, stdout, stderr io.Writer, json
 	}
 	sessStore := cliSessionStore(store, cfg, cityPath)
 
-	sp := newSessionProvider()
+	sp, err := newSessionProviderWithError()
+	if err != nil {
+		fmt.Fprintf(stderr, "gc session prune: %v\n", err) //nolint:errcheck // best-effort stderr
+		return 1
+	}
 	catalog, err := workerSessionCatalogWithConfig("", sessStore, sp, nil)
 	if err != nil {
 		fmt.Fprintf(stderr, "gc session prune: %v\n", err) //nolint:errcheck // best-effort stderr
@@ -2197,7 +2232,11 @@ func doSessionPeekFallback(target string, lines int, jsonOutput bool, stdout, st
 		return 1
 	}
 
-	sp := newSessionProvider()
+	sp, err := newSessionProviderWithError()
+	if err != nil {
+		fmt.Fprintf(stderr, "gc session peek: %v\n", err) //nolint:errcheck // best-effort stderr
+		return 1
+	}
 	handle, err := workerHandleForSessionWithConfig(cityPath, sessStore, sp, cfg, sessionID)
 	if err != nil {
 		fmt.Fprintf(stderr, "gc session peek: %v\n", err) //nolint:errcheck // best-effort stderr
@@ -2297,7 +2336,11 @@ func cmdSessionKill(args []string, stdout, stderr io.Writer, jsonOutput ...bool)
 		return 1
 	}
 
-	sp := newSessionProvider()
+	sp, err := newSessionProviderWithError()
+	if err != nil {
+		fmt.Fprintf(stderr, "gc session kill: %v\n", err) //nolint:errcheck // best-effort stderr
+		return 1
+	}
 	// Best-effort session read via the session front door (relocation-safe: the
 	// generic sessStore is already the session-class store). Unlike the raw
 	// sessStore.Get, the front-door Get wraps "loading session %q", returns
@@ -2515,7 +2558,11 @@ func cmdSessionSubmit(args []string, intent session.SubmitIntent, jsonOutput boo
 		return 1
 	}
 
-	sp := newSessionProvider()
+	sp, err := newSessionProviderWithError()
+	if err != nil {
+		fmt.Fprintf(stderr, "gc session submit: %v\n", err) //nolint:errcheck // best-effort stderr
+		return 1
+	}
 	handle, err := workerHandleForSessionWithConfig(cityPath, sessStore, sp, cfg, sessionID)
 	if err != nil {
 		fmt.Fprintf(stderr, "gc session submit: %v\n", err) //nolint:errcheck // best-effort stderr

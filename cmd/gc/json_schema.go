@@ -200,6 +200,10 @@ func filterJSONFlag(args []string) ([]string, bool) {
 	return filtered, jsonRequested
 }
 
+func isJSONControlArg(arg string) bool {
+	return arg == "--json" || strings.HasPrefix(arg, "--json=")
+}
+
 func fallbackCommandArgs(args []string) []string {
 	var words []string
 	for i := 0; i < len(args); i++ {
@@ -232,11 +236,7 @@ func parseJSONSchemaRequest(args []string) (jsonSchemaRequest, bool) {
 		}
 		switch {
 		case arg == "--json-schema":
-			request.role = jsonSchemaManifestRole
-			if i+1 < len(args) && isJSONSchemaRole(args[i+1]) {
-				request.role = args[i+1]
-				i++
-			}
+			request.role, i = consumeJSONSchemaRole(args, i)
 		case strings.HasPrefix(arg, "--json-schema="):
 			request.role = strings.TrimPrefix(arg, "--json-schema=")
 			if request.role == "" {
@@ -254,6 +254,14 @@ func parseJSONSchemaRequest(args []string) (jsonSchemaRequest, bool) {
 		return jsonSchemaRequest{}, false
 	}
 	return request, true
+}
+
+func consumeJSONSchemaRole(args []string, index int) (string, int) {
+	role := jsonSchemaManifestRole
+	if index+1 < len(args) && isJSONSchemaRole(args[index+1]) {
+		return args[index+1], index + 1
+	}
+	return role, index
 }
 
 func isJSONSchemaRole(value string) bool {

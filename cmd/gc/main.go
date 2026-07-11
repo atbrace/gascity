@@ -156,6 +156,10 @@ func run(args []string, stdout, stderr io.Writer) int {
 	if args == nil {
 		args = []string{}
 	}
+	root.SetArgs(args)
+	root.SetOut(execStdout)
+	root.SetErr(stderr)
+	materializePackCommandTreeForArgs(root, args, execStdout, stderr)
 	bufferJSONExecution := shouldBufferJSONExecution(root, args)
 	reportJSONFailure := shouldReportJSONExecutionError(root, args)
 	if bufferJSONExecution {
@@ -164,9 +168,6 @@ func run(args []string, stdout, stderr io.Writer) int {
 		observedStdout = &countingWriter{target: stdout}
 		execStdout.target = observedStdout
 	}
-	root.SetArgs(args)
-	root.SetOut(execStdout)
-	root.SetErr(stderr)
 	if handled, code := handleJSONSchemaRequest(root, args, stdout); handled {
 		return code
 	}
@@ -216,13 +217,19 @@ func newRootCmd(stdout, stderr io.Writer) *cobra.Command {
 		SilenceUsage:  true,
 		Args:          cobra.ArbitraryArgs,
 		RunE: func(cmd *cobra.Command, args []string) error {
+			if packCommandFlagsHaveEmptyExplicitScope(cmd) {
+				fmt.Fprintln(stderr, "gc: --city and --rig require non-empty values") //nolint:errcheck // best-effort stderr
+				printCommandUsage(stderr, cmd)
+				return errExit
+			}
 			if len(args) == 0 {
 				return cmd.Help()
 			}
 			// Lazy fallback: if eager discovery missed a pack command
 			// (e.g. config changed after binary started), try one more time.
-			if tryPackCommandFallback(args, stdout, stderr) {
-				return nil
+			packAction := resolvePackCommandFallback(args, stdout, stderr)
+			if packAction.selected {
+				return packAction.execute().err()
 			}
 			fmt.Fprintf(stderr, "gc: unknown command %q\n\n", args[0]) //nolint:errcheck // best-effort stderr
 			printCommandUsage(stderr, cmd)

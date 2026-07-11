@@ -313,15 +313,42 @@ TDD sequence and acceptance:
   neither can enable.
 - No installation ID exists before a complete verified-TTY notice write and
   the one-record notice+ID+spool-generation commit.
-- Short/failed notice writes and every injected persistence crash point leave
-  the prior record and no final ID artifact.
+- For pending or disabled activation, short/failed notice writes and every
+  atomic-write `not-applied` failure leave the prior record and no final ID
+  artifact. Stale-notice activation first durably raises the notice floor and
+  clears the old spool, rereads that exact record, and only then performs
+  notice output, entropy, and acceptance; every second-phase failure retains
+  the inactive floor barrier. An applied, byte-exact record with
+  parent-directory sync pending is the logical activation, is retried, and is
+  visible as enabled to a separately opened peer; the activating invocation
+  remains unrecordable. Disable, signed pause, and cleanup success remain
+  durability-strict.
 - Concurrent activation produces at most one complete notice, one ID, and no
   recording permit for either first invocation.
 - `on` is TTY-only, idempotent while enabled, blocked by cleanup/pause/build/
   environment gates, and rotates identity only after `off`.
-- Disable and signed-pause cleanup ownership uses monotonic state/cleanup
-  epochs, never randomness; injected entropy failure can block `on` or drop an
-  event but cannot block durable opt-out or pause.
+- Disable and signed-pause cleanup ownership uses a private persisted monotonic
+  counter namespace plus monotonic state/cleanup epochs, never randomness, and
+  retains a lease on the exact validated atomic config record. The namespace
+  and exact-record incarnation participate in activation bases, cleanup
+  owners, recording permits, and mutation CAS but not exported status. A
+  mutation reloads the newly named record under the same `state.lock` and
+  issues authority only from that post-write lease. A barrier,
+  notice-floor invalidation, or cleanup completion that resets
+  terminal-adjacent numeric counters first advances the namespace; in the last
+  namespace, opt-out and completion use a same-namespace numeric reset plus
+  atomic record replacement. Stale bases/tokens must lose even when the full
+  numeric tuple repeats, including after corrupt recovery. The last namespace is a
+  non-wrapping inactive durable fallback, and terminal/overflow shapes load
+  fail-closed. `RecordingPermit.Close` releases the shared idempotent lease;
+  read-only and rejected paths close leases internally. Injected entropy
+  failure can block `on` or drop an event but cannot block durable opt-out or
+  pause.
+- Notice invalidation monotonically rebases under the same lock when its
+  observed record was concurrently replaced but the currently named enabled
+  record still has an older floor. It preserves ID/pause/cleanup state,
+  reissues cleanup ownership on the replacement, treats an equal floor as
+  converged, and never unlocks into an old-notice greater-epoch resume window.
 - `OpenProduction` is lazy and non-creating. Preparing an invocation or reading
   status cannot create the metrics root, repair state, or start a process.
 - Status is a pure projection over an already-open read-only view; byte-level

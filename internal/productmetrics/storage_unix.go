@@ -44,6 +44,25 @@ type unixStorageIterator struct {
 	pendingName string
 }
 
+type unixStorageRecordLease struct {
+	mu sync.Mutex
+	fd int
+}
+
+func (lease *unixStorageRecordLease) close() error {
+	lease.mu.Lock()
+	defer lease.mu.Unlock()
+	if lease.fd < 0 {
+		return nil
+	}
+	fd := lease.fd
+	lease.fd = -1
+	if err := unix.Close(fd); err != nil {
+		return fmt.Errorf("productmetrics: close retained config record: %w", err)
+	}
+	return nil
+}
+
 func platformOpenStorageRoot(home gchome.ProductUsageHome, mutable bool, hooks storageTestHooks) (storageDirectoryBackend, error) {
 	if !isCleanAbsoluteProductRoot(home) {
 		return nil, errors.New("productmetrics: invalid or unstable product-usage home")
@@ -544,25 +563,35 @@ func (iterator *unixStorageIterator) close() error {
 }
 
 func (directory *unixStorageDirectory) readFile(name string, maximumBytes int64) ([]byte, error) {
+	data, lease, _, err := directory.readFileLease(name, maximumBytes)
+	if lease != nil {
+		err = errors.Join(err, lease.close())
+	}
+	return data, err
+}
+
+func (directory *unixStorageDirectory) readFileLease(name string, maximumBytes int64) ([]byte, storageRecordBackend, storageMetadata, error) {
 	directoryFD, err := directory.duplicateFD()
 	if err != nil {
-		return nil, err
+		return nil, nil, storageMetadata{}, err
 	}
 	defer closeUnixFD(directoryFD)
 	path := filepath.Join(directory.path, name)
 	fileFD, err := openFileAt(directoryFD, name, unixFileReadFlags, 0)
 	if err != nil {
-		return nil, storagePathError("open file", path, err)
+		return nil, nil, storageMetadata{}, storagePathError("open file", path, err)
 	}
-	defer closeUnixFD(fileFD)
 	metadata, err := validateOpenedRegularFile(directoryFD, name, fileFD, path, directory.euid, false, directory.hooks)
 	if err != nil {
-		return nil, err
+		_ = unix.Close(fileFD)
+		return nil, nil, storageMetadata{}, err
 	}
+	lease := &unixStorageRecordLease{fd: fileFD}
 	if metadata.size < 0 || metadata.size > maximumBytes {
-		return nil, fmt.Errorf("productmetrics: file %q exceeds the read limit", path)
+		return nil, lease, metadata, fmt.Errorf("productmetrics: file %q exceeds the read limit", path)
 	}
-	return readFDWithLimit(fileFD, maximumBytes)
+	data, err := readFDWithLimit(fileFD, maximumBytes)
+	return data, lease, metadata, err
 }
 
 func openFileAt(directoryFD int, name string, flags int, mode uint32) (int, error) {
@@ -628,36 +657,43 @@ func readFDWithLimit(fd int, maximumBytes int64) ([]byte, error) {
 }
 
 func (directory *unixStorageDirectory) writeFileAtomic(name string, data []byte) (returnErr error) {
+	_, err := directory.writeFileAtomically(name, data, false)
+	return err
+}
+
+func (directory *unixStorageDirectory) writeFileAtomicOutcome(name string, data []byte) (storageWriteResult, error) {
 	return directory.writeFileAtomically(name, data, false)
 }
 
 func (directory *unixStorageDirectory) writeFileAtomicNoReplace(name string, data []byte) error {
-	return directory.writeFileAtomically(name, data, true)
+	_, err := directory.writeFileAtomically(name, data, true)
+	return err
 }
 
-func (directory *unixStorageDirectory) writeFileAtomically(name string, data []byte, noReplace bool) (returnErr error) {
+func (directory *unixStorageDirectory) writeFileAtomically(name string, data []byte, noReplace bool) (result storageWriteResult, returnErr error) {
+	result.state = storageWriteNotApplied
 	if !directory.mutable {
-		return errors.New("productmetrics: read-only storage cannot write")
+		return result, errors.New("productmetrics: read-only storage cannot write")
 	}
 	directoryFD, err := directory.duplicateFD()
 	if err != nil {
-		return err
+		return result, err
 	}
 	defer closeUnixFD(directoryFD)
 	path := filepath.Join(directory.path, name)
 	if noReplace {
 		if err := requireAbsentEntry(directoryFD, name, path, directory.hooks, errStorageEntryExists); err != nil {
-			return err
+			return result, err
 		}
 	} else {
 		if err := validateExistingRegularFile(directoryFD, name, path, directory.euid, directory.hooks); err != nil {
-			return err
+			return result, err
 		}
 	}
 
 	tempName, tempFD, err := createPrivateTempFile(directoryFD, directory.path, directory.euid, directory.hooks)
 	if err != nil {
-		return err
+		return result, err
 	}
 	tempExists := true
 	defer func() {
@@ -674,34 +710,37 @@ func (directory *unixStorageDirectory) writeFileAtomically(name string, data []b
 	}()
 
 	if err := writeAllFD(tempFD, data, directory.hooks); err != nil {
-		return fmt.Errorf("productmetrics: write temporary file: %w", err)
+		return result, fmt.Errorf("productmetrics: write temporary file: %w", err)
 	}
 	if err := syncFileFD(tempFD, directory.hooks); err != nil {
-		return fmt.Errorf("productmetrics: sync temporary file: %w", err)
+		return result, fmt.Errorf("productmetrics: sync temporary file: %w", err)
 	}
 	if err := unix.Close(tempFD); err != nil {
 		tempFD = -1
-		return fmt.Errorf("productmetrics: close temporary file: %w", err)
+		return result, fmt.Errorf("productmetrics: close temporary file: %w", err)
 	}
 	tempFD = -1
 	if noReplace {
 		if err := installNoReplace(directoryFD, tempName, name, directory.hooks); err != nil {
-			return storagePathError("install no-replace file", path, err)
+			return result, storagePathError("install no-replace file", path, err)
 		}
+		result.state = storageWriteAppliedSyncPending
 		if err := unix.Unlinkat(directoryFD, tempName, 0); err != nil {
-			return fmt.Errorf("productmetrics: remove installed temporary link: %w", err)
+			return result, fmt.Errorf("productmetrics: remove installed temporary link: %w", err)
 		}
 		tempExists = false
 	} else {
 		if err := renameAt(directoryFD, tempName, directoryFD, name, directory.hooks); err != nil {
-			return storagePathError("rename temporary file", path, err)
+			return result, storagePathError("rename temporary file", path, err)
 		}
+		result.state = storageWriteAppliedSyncPending
 		tempExists = false
 	}
 	if err := syncDirectoryFD(directoryFD, directory.hooks); err != nil {
-		return fmt.Errorf("productmetrics: sync directory after atomic rename: %w", err)
+		return result, fmt.Errorf("productmetrics: sync directory after atomic rename: %w", err)
 	}
-	return nil
+	result.state = storageWriteAppliedDurable
+	return result, nil
 }
 
 func installNoReplace(directoryFD int, sourceName, targetName string, hooks storageTestHooks) error {

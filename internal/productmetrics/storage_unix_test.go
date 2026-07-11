@@ -32,6 +32,10 @@ func inspectStorageTestHome(t *testing.T, createRoot bool) gchome.ProductUsageHo
 	if runtime.GOOS == "darwin" {
 		trustedTempRoot = "/private/tmp"
 	}
+	// Go 1.26's testing.T.TempDir prefers GOTMPDIR over TMPDIR. Set both so
+	// repository test runners may keep their build scratch space below /data
+	// without moving this trust-boundary fixture below that unsafe ancestor.
+	t.Setenv("GOTMPDIR", trustedTempRoot)
 	t.Setenv("TMPDIR", trustedTempRoot)
 	privateAncestor := t.TempDir()
 	if err := os.Chmod(privateAncestor, 0o700); err != nil {
@@ -862,6 +866,7 @@ func TestStorageRootCreationRetryRecoversMissingIntermediateParentSync(t *testin
 	if runtime.GOOS == "darwin" {
 		trustedTempRoot = "/private/tmp"
 	}
+	t.Setenv("GOTMPDIR", trustedTempRoot)
 	t.Setenv("TMPDIR", trustedTempRoot)
 	privateAncestor := t.TempDir()
 	if err := os.Chmod(privateAncestor, 0o700); err != nil {

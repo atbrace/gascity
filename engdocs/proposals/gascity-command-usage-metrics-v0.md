@@ -279,7 +279,18 @@ on a later eligible invocation. After a successful write, one atomic
 `config.toml` replacement commits `preference=enabled`, the notice version, a
 cryptographically random installation UUID, a new state generation, and a
 random local spool generation together. A failed commit leaves the prior
-record intact and no final installation-ID artifact exists.
+record intact and no final installation-ID artifact exists when the atomic
+replacement was not applied. The storage boundary distinguishes that outcome
+from an applied replacement whose parent-directory sync reported failure. If
+the latter reads back byte-for-byte as the complete new record, it is the
+logical activation point: the process retries the directory sync, reports
+activation rather than an ordinary failure, and still excludes the activating
+invocation. A crash may conservatively lose that opt-in, but cannot expose a
+partial record or a separately authoritative ID. This applied-but-sync-pending
+rule is limited to notice acceptance and greater-epoch resume. Durable disable,
+signed pause, and cleanup completion do not report success until their sync is
+proven; their visible applied state is already fail-closed while retry remains
+required.
 
 Each process snapshots recording eligibility before waiting on `state.lock`.
 That per-invocation snapshot is sticky: a pending invocation remains
@@ -297,9 +308,26 @@ may retain its ID but cannot enqueue or upload. Every v0+ loader compares the
 persisted floor to its compiled maximum and fails closed if the floor is newer,
 so an older binary cannot resume the superseded generation. Re-acceptance CASes
 that exact state, creates a fresh spool generation, and preserves the ID unless
-the notice explicitly changes identity/retention semantics. Superseded
+the notice explicitly changes identity/retention semantics. Automatic and
+explicit stale-notice acceptance are two-phase: they first durably raise the
+floor and clear the old spool, then reread the exact installed record before
+notice output, entropy, or acceptance. A short/failed notice write, entropy
+failure, or not-applied acceptance replacement therefore leaves the old
+generation inactive. Superseded
 generations are cleanup-only and can never upload. Headless installations
 remain paused until an eligible TTY invocation shows the revised notice.
+If the generation or cleanup epoch is terminal-adjacent, invalidation instead
+durably advances the counter namespace, resets the numeric counters, preserves
+the ID and cleanup kind, raises the notice floor, and clears the active spool.
+Any cleanup owner is reissued in the new namespace, so the old owner cannot
+clear the new barrier and the new owner remains completable.
+
+Notice invalidation retains the exact record observed before its lock attempt.
+If another valid mutation replaces that record first, the invalidator does not
+unlock into a resume window: while holding the same `state.lock`, it raises any
+still-older floor on the currently named enabled record and clears its spool.
+An equal floor is already converged and preserves a peer's newly accepted
+spool; a newer floor fails closed.
 
 The notice is neither printed nor treated as delivered for non-TTY output or
 any machine/protocol/service context. The closed census includes:
@@ -483,12 +511,17 @@ Writes use temp-file, fsync, atomic rename, and parent-directory fsync.
 Loaders reject symlinks and fail closed on parse/schema/permission errors.
 
 `config.toml` is the single atomic preference/identity record. It contains
-`state_schema`, monotonic `state_generation`, preference,
+`state_schema`, a private monotonic `counter_namespace`, monotonic
+`state_generation`, preference,
 `required_notice_version`, accepted notice version, optional installation ID,
 optional random `spool_generation`, typed `cleanup_kind` and monotonic
-`cleanup_epoch`, and scalar `paused_through_metrics_epoch`. The pair
-(`state_generation`, `cleanup_epoch`) is the non-secret cleanup ownership
-token; disable and signed pause never require entropy. Enabled state is invalid
+`cleanup_epoch`, and scalar `paused_through_metrics_epoch`. The numeric triple
+(`counter_namespace`, `state_generation`, `cleanup_epoch`) plus a retained
+lease on the exact validated atomic config record is the non-secret cleanup
+ownership token; disable and signed pause never require entropy. The private
+namespace and exact-record incarnation are also part of every activation
+basis, recording permit, and mutation CAS, but are never exposed by status.
+Enabled state is invalid
 unless the same committed record contains a valid ID and, when the current
 notice/metrics epoch is uploadable, a spool generation; initial pending and
 disabled records contain neither. Stale-notice and server-paused records may
@@ -496,13 +529,34 @@ retain an ID but cannot contain an active spool generation. There is no
 separately authoritative ID file and therefore no crash window where failed
 activation leaves a final ID behind.
 
-Every state mutation increments `state_generation`. A recording permit captures
-that generation, installation ID, spool generation, release version, and
-metrics release epoch. `RecordOnce` reloads under `state.lock` and writes only
-when every value still exactly matches; a permit obtained before `off`,
-`off`/`on` rotation, notice invalidation, upgrade, or server pause is a silent
-drop. A later `on` always creates a fresh spool generation. Old generation
-directories are cleanup-only and can never become uploadable again.
+Every ordinary state mutation increments `state_generation`, and cleanup
+ownership advances `cleanup_epoch`. Their reserved terminal value is invalid
+on load, so an exhausted record is fail-closed rather than recordable. If the
+next disable, signed-pause, notice-invalidation, or cleanup mutation would
+enter that terminal value, the atomic mutation advances `counter_namespace`
+before resetting the numeric counters. Safely writable corrupt-state recovery
+advances a decodable current-schema namespace; otherwise it may use the final
+namespace as a fail-closed numeric placement hint. Recovery never treats a
+scalar decoded from corrupt bytes as authority: while holding `state.lock`, it
+must still match the retained descriptor for that exact corrupt record and
+issues cleanup ownership only from the post-replacement record. Disable clears
+the ID and spool, while pause and notice invalidation retain the ID but clear
+the spool. Exact-record permit and owner matching therefore invalidates all
+prior authority even when the complete low numeric tuple repeats. A recording
+permit captures a lease on the exact atomic record plus the counter namespace,
+generation, installation ID, spool generation, release version, and metrics
+release epoch. Callers close the permit after the invocation; copied permits
+share one idempotently closed lease. `RecordOnce`
+reloads under `state.lock` and writes only when every value still exactly
+matches; a permit obtained before `off`, `off`/`on` rotation, notice
+invalidation, upgrade, or server pause is a silent drop. The final namespace
+cannot advance or wrap and cannot contain an active spool; it is a durable
+fail-closed fallback. Opt-out and cleanup completion remain available even
+when its ordinary counters are exhausted by atomically replacing the record
+without incrementing them; the new exact-record incarnation prevents stale
+authority from crossing that replacement. A later `on` from a non-terminal
+clean-disabled namespace always creates a fresh spool generation. Old
+generation directories are cleanup-only and can never become uploadable again.
 
 The complete `RecordOnce` allow predicate is conjunctive: official supported
 build with compiled endpoint; no disable environment or managed-automation
@@ -512,14 +566,15 @@ spool generation; and an exact permit match. False, unknown, corrupt, timed-out,
 or unreadable at any term means silent drop before queue/spawn/network work.
 
 `on`, first-run activation, stale-notice activation, signed server pause, and
-`off` serialize through `state.lock` and commit only against the generation
-they observed. An enable attempt based on a pre-disable generation loses: if it
+`off` serialize through `state.lock` and commit only against the counter
+namespace and generation they observed. An enable attempt based on a
+pre-disable version loses: if it
 commits first, disable supersedes it; if disable commits first, the stale
 enable CAS fails. An enable based on the final clean-disabled generation is a
 later transition even if wall-clock calls overlap.
-A signed pause response may mutate or purge only if its state generation, ID,
-spool generation, release version, and metrics epoch still match the batch
-that elicited it.
+A signed pause response may mutate or purge only if its counter namespace,
+state generation, ID, spool generation, release version, and metrics epoch
+still match the batch that elicited it.
 
 `spawn-throttle` is a bounded record containing a cryptographically random
 UUIDv4 attempt token and attempted instant; `status.toml` contains bounded
@@ -718,6 +773,7 @@ type Service struct { /* private */ }
 
 func OpenProduction(ProductionOptions) (*Service, error)
 func (s *Service) RecordingPermit(InvocationContext) RecordingPermit
+func (p RecordingPermit) Close() error
 func (s *Service) MaybeActivateNotice(InvocationContext, io.Writer) NoticeResult
 func (s *Service) RecordOnce(RecordingPermit, CommandID) RecordResult
 func (s *Service) DisableAndPurge(context.Context) (PurgeResult, error)

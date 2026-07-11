@@ -6,6 +6,8 @@ import (
 	"fmt"
 	"io/fs"
 	"path/filepath"
+	"runtime"
+	"sync"
 
 	"github.com/gastownhall/gascity/internal/gchome"
 )
@@ -62,6 +64,93 @@ type storageRenameResult struct {
 	state storageRenameState
 }
 
+type storageWriteState uint8
+
+const (
+	storageWriteNotApplied storageWriteState = iota
+	storageWriteAppliedSyncPending
+	storageWriteAppliedDurable
+)
+
+type storageWriteResult struct {
+	state storageWriteState
+}
+
+type recordIncarnation struct {
+	dev uint64
+	ino uint64
+}
+
+type storageRecordBackend interface {
+	close() error
+}
+
+// storageRecordLease retains the validated descriptor for one exact atomic
+// config record. Keeping that descriptor open prevents its inode from being
+// reused while stale in-process authority still exists.
+type storageRecordLease struct {
+	mu      sync.Mutex
+	backend storageRecordBackend
+	record  recordIncarnation
+}
+
+func newStorageRecordLease(backend storageRecordBackend, metadata storageMetadata) *storageRecordLease {
+	if backend == nil {
+		return nil
+	}
+	lease := &storageRecordLease{
+		backend: backend,
+		record:  recordIncarnation{dev: metadata.dev, ino: metadata.ino},
+	}
+	runtime.SetFinalizer(lease, func(retained *storageRecordLease) { _ = retained.Close() })
+	return lease
+}
+
+func (lease *storageRecordLease) Close() error {
+	if lease == nil {
+		return nil
+	}
+	lease.mu.Lock()
+	backend := lease.backend
+	lease.backend = nil
+	lease.mu.Unlock()
+	if backend == nil {
+		return nil
+	}
+	runtime.SetFinalizer(lease, nil)
+	return backend.close()
+}
+
+func (lease *storageRecordLease) Valid() bool {
+	if lease == nil {
+		return false
+	}
+	lease.mu.Lock()
+	defer lease.mu.Unlock()
+	return lease.backend != nil
+}
+
+func (lease *storageRecordLease) incarnation() recordIncarnation {
+	if lease == nil {
+		return recordIncarnation{}
+	}
+	lease.mu.Lock()
+	defer lease.mu.Unlock()
+	if lease.backend == nil {
+		return recordIncarnation{}
+	}
+	return lease.record
+}
+
+func (lease *storageRecordLease) Matches(other *storageRecordLease) bool {
+	if lease == nil || other == nil {
+		return false
+	}
+	left := lease.incarnation()
+	right := other.incarnation()
+	return left != (recordIncarnation{}) && left == right
+}
+
 // storageTestHooks is deliberately package-private. No external construction
 // path can weaken validation or inject filesystem behavior.
 type storageTestHooks struct {
@@ -94,7 +183,9 @@ type storageDirectoryBackend interface {
 	close() error
 	openDir([]string, bool) (storageDirectoryBackend, error)
 	readFile(string, int64) ([]byte, error)
+	readFileLease(string, int64) ([]byte, storageRecordBackend, storageMetadata, error)
 	writeFileAtomic(string, []byte) error
+	writeFileAtomicOutcome(string, []byte) (storageWriteResult, error)
 	writeFileAtomicNoReplace(string, []byte) error
 	removeFile(string) error
 	renameFile(string, storageDirectoryBackend, string) (storageRenameResult, error)
@@ -174,16 +265,25 @@ func (directory *storageDir) openDir(components []string, create bool) (*storage
 }
 
 func (directory *storageDir) readFile(name string, maximumBytes int64) ([]byte, error) {
+	data, lease, err := directory.readFileLease(name, maximumBytes)
+	if lease != nil {
+		err = errors.Join(err, lease.Close())
+	}
+	return data, err
+}
+
+func (directory *storageDir) readFileLease(name string, maximumBytes int64) ([]byte, *storageRecordLease, error) {
 	if directory == nil || directory.backend == nil {
-		return nil, errStorageClosed
+		return nil, nil, errStorageClosed
 	}
 	if err := validateStorageName(name); err != nil {
-		return nil, err
+		return nil, nil, err
 	}
 	if maximumBytes <= 0 {
-		return nil, errors.New("productmetrics: read size limit must be positive")
+		return nil, nil, errors.New("productmetrics: read size limit must be positive")
 	}
-	return directory.backend.readFile(name, maximumBytes)
+	data, backend, metadata, err := directory.backend.readFileLease(name, maximumBytes)
+	return data, newStorageRecordLease(backend, metadata), err
 }
 
 func (directory *storageDir) writeFileAtomic(name string, data []byte) error {
@@ -194,6 +294,16 @@ func (directory *storageDir) writeFileAtomic(name string, data []byte) error {
 		return err
 	}
 	return directory.backend.writeFileAtomic(name, data)
+}
+
+func (directory *storageDir) writeFileAtomicOutcome(name string, data []byte) (storageWriteResult, error) {
+	if directory == nil || directory.backend == nil {
+		return storageWriteResult{state: storageWriteNotApplied}, errStorageClosed
+	}
+	if err := validateMutableStorageName(name); err != nil {
+		return storageWriteResult{state: storageWriteNotApplied}, err
+	}
+	return directory.backend.writeFileAtomicOutcome(name, data)
 }
 
 func (directory *storageDir) writeFileAtomicNoReplace(name string, data []byte) error {

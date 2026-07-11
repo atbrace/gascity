@@ -39,9 +39,10 @@ var allowedNonMetadata = map[string]string{
 	"gc.healthz.v1":            "workspace healthz workflow contract (internal/workspacesvc)",
 	"gc.worker.conformance.v1": "worker conformance report schema version (internal/worker/workertest)",
 
-	// Cobra command annotations (CLI doc-gen plumbing, not bead metadata).
-	"gc.docgen.skip":     "cobra annotation: skip CLI doc generation",
-	"gc.json.schema_dir": "cobra annotation: JSON schema output dir",
+	// Cobra command-tree annotations (not bead metadata).
+	"gc.docgen.skip":          "cobra annotation: skip CLI doc generation",
+	"gc.json.schema_dir":      "cobra annotation: JSON schema output dir",
+	"gc.productmetrics.class": "cobra annotation: closed product-metrics command classification",
 
 	// Generated shell-completion filenames, not metadata keys.
 	"gc.bash": "shell completion filename (cmd/gc/cmd_shell.go)",

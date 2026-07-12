@@ -434,14 +434,18 @@ external network.
 ## Slice S6 — Uploader transactions and linearizable opt-out
 
 Join state, spool, and transport under the fixed lock order. Implement uploader
-claim/send/apply/restore, pause invalidation/purge, greater-epoch resume, and
-`DisableAndPurge` with the full cleanup-token handshake.
+claim/start/wait/apply/restore, pause invalidation/purge, greater-epoch resume,
+and `DisableAndPurge` with the full cleanup-token handshake.
 
 Primary files:
 
 - `internal/productmetrics/uploader.go`
 - `internal/productmetrics/control.go`
+- `internal/productmetrics/spool.go`
+- `internal/productmetrics/storage.go`
+- `internal/productmetrics/storage_unix.go`
 - concurrency/crash integration tests inside the package
+- focused Unix spool and storage hostile-filesystem tests
 
 TDD sequence and acceptance:
 
@@ -449,9 +453,14 @@ TDD sequence and acceptance:
   already-disabled, durable-disable failure, quiescence timeout, cleanup
   retry, concurrent state change, corrupt-safe recovery, and unsafe-root
   failure.
-- No exit-zero path bypasses `uploader.lock`; success is established while
-  holding uploader then state locks with disabled durable, ID/generation
-  absent, queue/inflight empty and synced, quota reset, and cleanup clear.
+- No exit-zero path bypasses `uploader.lock`; `off` opens one exact mutable root
+  descriptor before its initial state observation, derives every disable or
+  pending-cleanup authority through that descriptor, and retains it across
+  disable, uploader quiescence, cleanup, and final proof. A component
+  replacement therefore cannot redirect either the barrier or a peer-successor
+  proof to another root. Success is established while holding uploader then
+  state locks with disabled durable, ID/generation absent, queue/inflight empty
+  and synced, quota reset, and cleanup clear.
 - Each cleanup call performs bounded work. Durable disable happens first; an
   oversized or corrupt tree spends the one S4 root-global budget and returns
   nonzero cleanup-pending until repeated `off` calls finish; entropy failure
@@ -459,6 +468,63 @@ TDD sequence and acceptance:
 - Repeated `off` converges with a multi-gigabyte sparse poison file followed by
   valid/later entries while respecting the global entry/directory/read/name
   limits.
+- Hostile-root RED tests drive every production root atomic writer through the
+  strict two-state local marker protocol: durable zero-byte, non-authorizing
+  INTENT; matching empty 0600 root temp created with `O_EXCL`; then durable
+  BOUND before any payload byte. BOUND is exactly `32+N` bytes, where
+  `N <= 128` is the basename byte length: `[0:8]` is ASCII `GCPMRTJ1`, `[8]`
+  is state `0x02`, `[9]` is `uint8(N)`, `[10:16]` is zero, `[16:24]` and
+  `[24:32]` are the big-endian nonzero uint64 device and inode, and `[32:]` is
+  the exact canonical basename. Exact length/magic/state/reserved/identity/name
+  equality and the 160-byte total cap are blocking. This is a local-storage
+  codec only; request, response, event wire, and server behavior do not change.
+- Crash tests cover marker/journal/root sync, temp creation, BOUND durability,
+  payload, rename, root sync, and marker retirement. A crash after empty temp
+  creation but before valid durable BOUND preserves the mapped root entry,
+  exposes conservative manual cleanup pending, and proves that it contains no
+  sensitive bytes. Marker/journal/temp type, ownership, link count,
+  same-device relationship, and exact enumerated/opened/named incarnation are
+  revalidated at every authority boundary.
+- Cleanup reserves and charges the 161-byte maximum-plus-one marker-read
+  envelope to the original shared read meter. It processes at most 64 entries
+  and performs a separately entry/name-charged 65th iterator read as the
+  overflow sentinel; a present 65th entry cannot be mistaken for EOF.
+  Only exact BOUND device/inode authority may unlink its mapped temp.
+  INTENT-with-live-temp, malformed, mismatched, replaced, cross-device, or
+  over-budget evidence never mutates the mapped root and cannot certify clean.
+  Unjournaled lookalikes and arbitrary residue are likewise preserved without
+  descent.
+- Root clean-name policy follows implemented ownership. S6 explicitly treats
+  future `status.toml` and `spawn-throttle` files as unknown preserved residue;
+  S8 and S7 may add each name only with its landed handler and exact cleanup/
+  proof tests.
+- Main and peer-successor success run the same bounded, namespace-read-only
+  settled-journal/root proof. After that proof, the peer path reloads and
+  identity-leases the exact expected clean-disabled successor; the main path
+  likewise revalidates its exact final record after the final-config journal
+  proof. Any field, namespace, generation, or incarnation change is
+  `state-changed-concurrently`. The final state write and proof consume the
+  original sweep meter.
+- Split sender tests prove request initiation occurs in `Start` under the final
+  state lock, `Wait` runs outside state while `uploader.lock` remains held, and
+  disable and send are linearly ordered at that start boundary. After a start,
+  settlement uses a fixed 12-second `context.Background()`-derived context,
+  independent of caller cancellation, while the HTTP attempt keeps its
+  five-second deadline and `off` keeps its 12-second uploader wait.
+- Sender errors always restore a current claim, including cancellation and
+  deadline failures. A restore destination collision first identity-leases and
+  byte-proves both same-device copies, then atomically exchanges the exact
+  claimed inflight inode into the canonical queue name. Only a durably synced
+  exchange may authorize identity-bound deletion of the displaced destination
+  now named in inflight; unsupported, not-applied, ambiguous, or sync-pending
+  exchange preserves both authorities and fails conservatively. Every ordinary
+  root-descendant open and event-file read rejects a parent-device mismatch
+  before work below that boundary; the metrics root alone may differ from its
+  lexical `GC_HOME` parent.
+- Every greater-epoch resume reacquires uploader then state locks and reproves
+  the clean spool tree, zero quota, and settled root journal, including a visible
+  pause-cleanup successor left by a failed post-transition proof; uncertainty
+  cannot create a new generation.
 - Once durable disable lands, stale enqueue permits, upload permits, responses,
   activation, and pre-disable `on` transitions cannot revive or send data.
 - A valid 410 persists the pause barrier before purge; purge failure leaves

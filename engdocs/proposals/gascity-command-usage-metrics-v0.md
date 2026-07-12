@@ -439,7 +439,7 @@ Successful opt-out text should be explicit:
 | Already disabled and clean | 0 | Still performs the full quiescence/recheck handshake, then prints already-disabled; no ID, queue, or inflight files remain. |
 | Full success | 0 | `disabled` is durable, queue/inflight are empty, ID is absent, no uploader can still send. |
 | Durable-disable failure | nonzero | Previous state remains; stderr names `disable-write-failed`; retry guidance printed. |
-| Cleanup incomplete after durable disable | nonzero | State remains `disabled-cleanup-pending`; stderr names the incomplete phase. A later `off` retries cleanup; `status` only reports it. |
+| Cleanup incomplete after durable disable | nonzero | State remains `disabled-cleanup-pending`; stderr names the incomplete phase. A later `off` retries bounded automatic cleanup; ambiguous non-authorizing INTENT-plus-temp residue instead gets explicit same-UID manual-cleanup guidance. `status` only reports it. |
 | Uploader quiescence timeout | nonzero | State remains `disabled-cleanup-pending`; no new enqueue/upload may start; stderr names `uploader-quiescence-timeout`. |
 | Concurrent control conflict | nonzero | `on`, activation, or final `off` verification lost its generation/CAS race; stderr names `state-changed-concurrently` and never claims success. |
 | Corrupt but safely writable state | 0 after full barrier | `off` replaces it with a fresh disabled schema, purges, and reports recovery; corrupt input is never treated as enabled. |
@@ -463,6 +463,7 @@ State lives only under the effective Gas City home:
 <GC_HOME>/product-usage/
   config.toml
   quota.toml
+  .pm-root-temp-journal/<root-temp-basename>  # local INTENT/BOUND record
   queue/<spool-generation>/
   inflight/<spool-generation>/
   state.lock
@@ -923,6 +924,33 @@ The adapter contract is:
 
 - create temp files with mode 0600 in owner-private directories;
 - write, fsync, close, atomic rename, and fsync the parent directory;
+- use a strict two-state journal for every root-level atomic temp. Under
+  retained descriptors, first create an owner-only, single-link regular marker
+  with `O_EXCL`; its `INTENT` representation is exactly zero bytes and grants
+  no deletion authority. Fsync the marker, sync the fixed owner-private
+  `.pm-root-temp-journal`, and root-sync a newly linked journal before creating
+  the matching empty 0600 root temp with `O_EXCL`. Capture the temp's nonzero
+  device and inode without writing payload bytes;
+- before writing any payload byte, durably transition that exact marker to the
+  one closed `BOUND` representation. It is exactly `32+N` bytes, where
+  `N <= 128` is the basename byte length: bytes `[0:8]` are ASCII `GCPMRTJ1`;
+  byte `[8]` is `0x02`; byte `[9]` is `uint8(N)`; bytes `[10:16]` are zero;
+  bytes `[16:24]` and `[24:32]` are respectively the device and inode as
+  big-endian unsigned 64-bit integers; and bytes `[32:]` are the exact
+  canonical root-temp basename. Total length is at most 160 bytes. Parsing
+  requires exact length, magic, state, zero reserved bytes, nonzero identity
+  fields, canonical basename, and basename equality with the marker and temp;
+- at every applicable authority boundary—before temp creation, before `BOUND`
+  becomes authoritative, before payload write, and before cleanup mutation—
+  revalidate the retained root and journal, the named marker incarnation, and,
+  once created, the named temp incarnation. Root, journal, marker, and temp
+  must remain private, same-device objects, and the temp's exact device/inode
+  must equal `BOUND`. Replacement, mismatch, or a cross-device object fails
+  closed. After payload write, fsync, target rename, and root sync are durable,
+  marker-retirement failure does not downgrade the installed target; it leaves
+  conservative journal cleanup for a later bounded sweep. This INTENT/BOUND
+  codec is local disk state only and changes neither the metrics HTTP wire
+  format nor the server contract;
 - open and retain validated parent directory descriptors before writing;
 - read, rename, and remove with fd-relative no-follow semantics and reject
   non-regular files;
@@ -931,7 +959,17 @@ The adapter contract is:
   component replacement; unsupported platforms use the fail-closed stub;
 - bootstrap/open the metrics root and every descendant with no-follow,
   owner/type/link-count checks rather than validating once and reopening by
-  path;
+  path. Every ordinary descendant and event-file open also checks the retained
+  parent-device relationship before opening or reading below the boundary;
+  only the metrics root may differ from its lexical `GC_HOME` parent;
+- treat the retained metrics root as the destructive-cleanup filesystem
+  boundary: before opening any enumerated descendant for cleanup, revalidate
+  its exact device/inode/type and require the child's device to match its
+  retained parent. Preserve a cross-device child without opening, renaming, or
+  unlinking it, and fail the clean-tree proof. The metrics root itself may be
+  on a different device from its lexical `GC_HOME` parent. Same-device bind
+  mounts remain inside the same-UID local trust boundary unless a portable
+  mount-ID or no-cross-mount primitive is added;
 - expose injectable failures for lock, write, fsync, rename, parent sync,
   enumerate, claim, delete, restore, entropy, and timeout tests.
 
@@ -972,6 +1010,51 @@ The adapter contract is:
   everywhere when any dimension is exhausted. `off` invalidates consent first and
   returns nonzero cleanup-pending until repeated `off` calls finish an
   adversarially large tree; it never trades bounded work for a false success.
+- Root-journal draining and final root enumeration spend that same cleanup
+  meter. A marker basename has the exact atomic-writer form
+  `.pm-tmp-<canonical-lower-hex-pid>-<canonical-lower-hex-sequence>`; both
+  components are positive, have no leading zero, and exactly round-trip their
+  lowercase encoding. A marker read is capped and charged to the shared read
+  budget by reserving the 161-byte maximum-plus-one envelope before the read;
+  the 160-byte maximum plus one overflow byte is sufficient to classify exact,
+  truncated, and oversized records without a second unmetered read. One pass
+  handles at most 64 marker entries and then performs an
+  explicitly entry/name-charged 65th `Next` as an overflow sentinel; only EOF
+  at that sentinel proves the bounded namespace complete.
+- Only a strict `BOUND` record authorizes deletion of its matching root temp.
+  Cleanup revalidates the journal's named incarnation after enumeration, the
+  marker's enumerated/opened/named incarnation and same-device relationship,
+  and the temp's effective-UID ownership, owner-only mode, single-link regular
+  type, root-device membership, canonical name, and exact recorded nonzero
+  device/inode immediately before unlink. It never reads the temp, including
+  sparse contents. Temp unlink plus root sync—or root sync followed by
+  rechecked absence—must finish before exact marker unlink plus journal sync.
+  The same checks apply in the mutating drain and the read-only main/peer clean
+  proofs.
+- Zero-byte `INTENT` is deliberately non-authorizing. If its mapped temp is
+  absent, synced/rechecked absence can settle or retire the non-sensitive
+  marker. If the temp exists, cleanup preserves both and reports manual
+  cleanup pending. A crash after `O_EXCL` temp creation but before durable
+  `BOUND` can therefore require same-UID manual removal, but the temp is
+  guaranteed empty because no sensitive payload byte may be written before
+  `BOUND`. Malformed, overlong, noncanonical, mismatched, replaced, or
+  cross-device marker evidence never authorizes deletion of a mapped root
+  entry and cannot certify cleanup. A valid `BOUND` marker whose temp absence
+  is durably synced and rechecked is non-sensitive settled crash evidence and
+  may remain if exact marker retirement fails.
+- Outside declared root names and the journal-derived authority above, every
+  entry—including an unjournaled canonical-looking `.pm-tmp-*` file—is
+  preserved and never descended into. Its presence or exhaustion before a
+  complete scan leaves cleanup pending rather than broadening deletion
+  authority. Repeated `off` is convergence-guaranteed for journaled temps and
+  metrics-owned spool/control trees, not for an adversarial population of
+  preserved unknown root entries or an ambiguous INTENT-plus-temp crash. The
+  root-clean allowlist is ownership-driven, not a reservation of future names:
+  `status.toml` and `spawn-throttle` remain preserved unknown residue until
+  their S8 and S7 handlers respectively exist and add exact cleanup/proof
+  semantics. Stage 1a is unshipped, so no published artifact predates this
+  INTENT/temp/BOUND-before-payload protocol; if that release assertion changes,
+  a separate migration design is required.
 - Never log event bodies or file contents.
 
 Foreground enqueue targets 20 ms. The 50 ms number is a decision budget, not a
@@ -992,7 +1075,7 @@ Spool transitions are normative:
 | reserve -> temp -> queue | `state.lock` | durably reserve quota, then event write+rename+parent sync | a crash may leave safe over-reservation; orphan temps are deleted on a bounded sweep. |
 | queue -> inflight | `uploader.lock`, then `state.lock` | verify current state/ID/spool generation and bounded oldest-first rename claim | pre-existing current-generation inflight files are restored before new claims; non-current generations are cleanup-only. |
 | inflight -> delete | same uploader owns claim | delete only after a complete typed durable acknowledgement, sync directory, then decrement quota | missing file is success; a crash before quota update safely overcounts. |
-| inflight -> queue | same uploader owns claim | restore on retryable response or timeout | restored files keep original mtime/order key. |
+| inflight -> queue | same uploader owns claim | restore on retryable response or timeout | restored files keep original mtime/order key. For an exact destination collision, identity-leased, byte-exact, parent-device proof precedes an atomic exchange that installs the claimed inflight inode at the canonical queue name. Only a durably synced exchange may authorize identity-bound deletion of the displaced destination now named in inflight; unsupported, not-applied, ambiguous, or sync-pending exchange preserves both authorities and returns a conservative settlement error. |
 | queue/inflight -> opt-out purge | `uploader.lock` then `state.lock` | spend one root-global cleanup budget streaming across generations and sync affected directories | idempotent; the cleanup epoch remains pending until all deletion and quota reset are durable. |
 | queue/inflight -> pause purge | same uploader, then `state.lock` CAS | after a valid signed envelope, invalidate active generation and purge epochs at or below the signed pause epoch | stale responses cannot touch a newer state; a later approved epoch creates a fresh generation. |
 
@@ -1010,16 +1093,33 @@ The uploader:
 
 1. acquires the single-uploader lock;
 2. under state lock, rechecks the exact state generation, ID, spool generation,
-   release/metrics epoch, and claims a same-release bounded batch;
-3. rechecks the same permit immediately before sending, then sends with a
-   five-second total deadline;
-4. under state lock, applies the response only if the batch permit still
-   matches; otherwise the now-disabled/non-current files are cleanup-only;
-5. rechecks consent before every next batch.
+   release/metrics epoch, and claims a same-release bounded batch, then releases
+   state while it prepares the already-claimed bytes;
+3. reacquires state in uploader-then-state order for the final permit check and
+   calls the sender's split `Start` phase while that exact state lock is still
+   held. `Start` must synchronously cross the one request-initiation boundary;
+   it cannot merely schedule a later un-ordered send. The HTTP attempt keeps
+   its existing five-second total deadline. A failed start sends nothing and
+   restores the claim under the same ordering;
+4. releases state and runs the sender's `Wait` phase outside `state.lock` while
+   retaining `uploader.lock`. Thus state readers are not blocked on network,
+   while `off` still cannot pass the uploader barrier before the attempt and
+   its local settlement finish;
+5. after `Wait` returns, creates a fixed 12-second settlement context from
+   `context.Background()`, independent of caller cancellation, and reacquires
+   state in uploader-then-state order. A still-current permit applies the typed
+   response: exact acknowledgement deletes, and every sender error—including
+   cancellation or deadline—restores. If the permit is stale, the
+   disabled/non-current claim is cleanup-only. The claim cannot be abandoned
+   merely because the initiating caller's context ended after `Start`;
+6. rechecks consent before every next batch.
 
 `gc metrics off`:
 
-1. under `state.lock`, atomically commits preference `disabled`, increments
+1. opens one exact mutable metrics-root descriptor before its initial state
+   observation, derives any pending-cleanup token through that descriptor, and
+   retains the root through step 4. Under that same root's `state.lock`,
+   atomically commits preference `disabled`, increments
    `state_generation` and monotonic `cleanup_epoch`, removes the ID and active
    spool generation, and sets `cleanup_kind=disable`. The committed
    (`state_generation`, `cleanup_epoch`) tuple is the cleanup owner and requires
@@ -1031,7 +1131,9 @@ The uploader:
    a new event, but can never block durable disable or signed pause. A corrupt
    config in a verified owner-private, safely writable root is replaced by a
    fresh disabled record; an unsafe or unwritable root remains fail-closed and
-   returns nonzero;
+   returns nonzero. A path-component replacement after the descriptor is
+   retained cannot redirect `off` to another root's uploader lock, cleanup
+   tree, pending owner, or predictable peer-successor record;
 2. releases `state.lock` and tries to acquire `uploader.lock` for up to 12
    seconds, exceeding the cooperative child budget while still treating a
    stuck filesystem operation conservatively;
@@ -1041,19 +1143,34 @@ The uploader:
    affected directories, and stops globally when that budget is exhausted.
    It returns cleanup-pending for the next explicit `off`; only once the whole
    tree is empty does it reset quota and
-   verifies preference disabled, ID/spool generation absent, and directories
-   empty while both locks remain held. It then atomically commits clean
+   verify preference disabled, ID/spool generation absent, directories
+   empty, the root-temp journal boundedly proven settled, and no unexpected or
+   cross-device residue while both locks remain held. Malformed, unsafe,
+   live-temp, cross-device, replaced, traversal-error, or budget-exhausted
+   journal state is cleanup-pending. Unexpected and
+   cross-device entries are never deleted by this cleanup; they return nonzero
+   cleanup-pending with disable durable and the cleanup owner retained. It then
+   atomically commits clean
    disabled (`cleanup_kind=none`). If another `off` already reached
-   that exact clean-disabled postcondition, verification is also success. Any
-   other generation/state is `state-changed-concurrently`, never silent
+   that exact clean-disabled postcondition, it is only a candidate peer
+   successor: `off` performs the same read-only bounded journal/root proof and
+   then reloads and identity-leases the exact expected clean-disabled state
+   after that proof. The main completion path likewise reloads the exact final
+   state after its final-config journal proof, with that write and proof charged
+   to the original sweep meter. Any peer/main field, namespace, generation, or
+   record-incarnation mismatch is `state-changed-concurrently`, never silent
    success;
 4. releases `state.lock` and then `uploader.lock` and returns the result already
    established under both locks.
 
-A request accepted before or while `off` waited cannot be prevented or deleted
-by this command; it remains subject to published retention or a separate
-targeted-deletion request. After successful `off`, no old local event may be
-sent. If the
+A request whose `Start` phase acquires the final state lock before `off`'s
+disable transition is ordered before opt-out and may still be accepted; this
+command cannot revoke it from the server, so it remains subject to published
+retention or a separate targeted-deletion request. If durable disable wins the
+state-lock order, final permit revalidation prevents `Start` entirely. In
+either order, `off` cannot report success until `Wait` and bounded local
+settlement release `uploader.lock`. After successful `off`, no old local event
+may be sent. If the
 uploader lock cannot be proven free within the bounded wait, `off` exits
 nonzero with durable `disabled-cleanup-pending` state; future enqueues,
 uploader starts, automatic activation, and `on` remain blocked. A later
@@ -1083,8 +1200,12 @@ pause-cleanup barrier before it can resume; read-only `status` never does so and
 ordinary paused invocations do not spawn a network uploader.
 
 Greater-epoch resumption is a CAS transition, not a version-string side effect.
-Only if preference remains enabled, the required notice is current, local pause
-cleanup is complete, and the compiled manifest epoch is strictly greater does
+It always reacquires `uploader.lock` then `state.lock` and boundedly reproves the
+clean spool tree, zero quota, and root-temp journal before creating a new spool
+generation, including when a prior pause-cleanup call made its successor visible
+but its final proof failed. Only if preference remains enabled, the required
+notice is current, local pause cleanup and that proof are complete, and the
+compiled manifest epoch is strictly greater does
 the process retain the ID, increment state generation, and create a fresh spool
 generation. The invocation performing that transition has no recording permit;
 collection begins with the following eligible invocation. Same/older epochs
@@ -1178,6 +1299,19 @@ Before sending, the batch builder requires canonical lowercase UUID text,
 filename/body event-ID equality, and uniqueness across files. A mismatch or
 second local file with the same ID is poison/cleanup-only and never enters a
 request, making acknowledgement set equality unambiguous.
+
+Restoring a claim is equally identity-bound. If its original queue name is
+already occupied, name equality or matching event ID alone is insufficient:
+the implementation leases and revalidates the claimed inflight source and the
+existing queue destination, and both must contain the exact canonical bytes of
+the immutable claimed event before an atomic exchange installs the claimed
+source inode at the queue name. Only after that exchange and both parent syncs
+are durable may the displaced destination, now named in inflight, be deleted by
+its retained identity. A replacement, read uncertainty, unsupported exchange,
+ambiguous outcome, sync uncertainty, or byte mismatch preserves both retained
+authorities and returns a conservative settlement error; restore never uses a
+replacing rename or deletes the claimed source based only on mutable
+destination bytes.
 
 Destructive `410` additionally requires this closed signed envelope:
 
@@ -1330,10 +1464,36 @@ requires a new notice and ID rotation.
   reconciliation and cleanup,
   generation isolation, claim/restore, typed-ack/delete crash replay, and
   event dedupe.
+- Root-temporary codec goldens prove zero-byte INTENT and the exact
+  `GCPMRTJ1`/`0x02`/length/reserved/big-endian-dev/big-endian-ino/basename
+  BOUND bytes through the 160-byte limit. Truncation, a 161st byte, bad magic
+  or state, nonzero reserved bytes, zero identity, noncanonical or unequal
+  names, and recorded-identity mismatch are non-authorizing and read through
+  the shared maximum-plus-one budget.
+- Root-temporary crash tests cover marker file/journal/root sync ordering,
+  `O_EXCL` allocation collisions, every INTENT/temp/BOUND/payload/rename/root-
+  sync point, and target-installed marker retirement including the final clean
+  state. A crash after empty-temp creation and before durable BOUND leaves no
+  payload bytes, is never auto-deleted, and reports manual cleanup pending.
+- Journal drain/proof tests cover exactly 64 markers plus the charged 65th
+  overflow sentinel, multi-pass shared-meter exhaustion, temp unlink/absence
+  replay, marker unlink replay, identical read-only main/peer settled-journal
+  proof, and final exact peer-successor state revalidation. Journal, marker,
+  and temp device/incarnation replacement, cross-device evidence, malformed or
+  INTENT evidence with a live temp, unjournaled canonical lookalikes, arbitrary
+  root entries, and pre-handler `status.toml`/`spawn-throttle` residue are
+  preserved without mapped-root mutation or descent and cannot certify clean.
+- Cross-device cleanup tests cover queue, inflight, control, generation, and
+  nested descendants, prove no open/enumeration/mutation below the boundary,
+  cover direct post-sweep generation reopens and event-file reads, and
+  separately allow a metrics root mounted on a different device from its
+  lexical parent.
 - Response policy covers empty/partial/generic 409 acknowledgements, exact ID
   set equality, duplicate JSON keys, all redirects, direct proxy policy,
   compression disabled, cookie/global-client isolation, HTTPS limits/deadlines,
-  catch-all restore, and valid/invalid/replayed signed 410 envelopes.
+  catch-all restore, source-authoritative atomic-exchange collision restore,
+  unsupported/replaced/post-exchange/sync-pending uncertainty, and
+  valid/invalid/replayed signed 410 envelopes.
 - Spawn attempt-ID races, clock rollback/future timestamp normalization,
   recursion guard, cooperative runtime budget, minimal environment, process
   reaping, Linux/Darwin detachment, and fail-closed unsupported-platform stubs.
@@ -1344,12 +1504,18 @@ requires a new notice and ID rotation.
   disabled is durable, queue/inflight are empty and directory-synced, ID/spool
   generation are absent, cleanup is clear, and no later send occurs. Timeout
   is nonzero and leaves cleanup pending.
+- Instrument the split sender and prove request `Start` crosses its final
+  permit boundary under `state.lock`, `Wait` runs outside state while retaining
+  `uploader.lock`, disable winning the state-lock order prevents start, and a
+  started request wins before disable. Caller cancellation after start cannot
+  bypass the independent 12-second settlement context: exact acknowledgements
+  still delete and every sender error still restores when the permit remains
+  current.
 - Race concurrent first-run/`on`/two `off` calls/signed pause/greater-epoch
   resume and assert the generation/CAS winner rules, shared disable cleanup
-  epoch,
-  final verification under both locks, stale-response rejection, failed-pause
-  purge persistence, and that notice/resume transition invocations never
-  record.
+  epoch, main and peer-successor final exact-record revalidation after the
+  shared read-only proof, stale-response rejection, failed-pause purge
+  persistence, and that notice/resume transition invocations never record.
 - Snapshot the entire metrics root before/after `status` and prove the command
   is read-only in clean, corrupt, and cleanup-pending states.
 

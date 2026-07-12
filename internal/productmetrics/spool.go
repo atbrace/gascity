@@ -11,6 +11,7 @@ import (
 	"os"
 	"runtime"
 	"sort"
+	"strconv"
 	"strings"
 	"sync"
 	"syscall"
@@ -29,28 +30,36 @@ const (
 	maximumCleanupNameBytes         = uint64(1024 * 1024)
 	maximumFilesystemName           = uint64(255)
 	spoolTraversalDirectoryEnvelope = uint64(2)
-	spoolFixedDirectoryReserve      = uint64(1)
-	spoolFileDescriptorHeadroom     = uint64(4)
-	spoolFallbackDirectoryLimit     = uint64(32)
-	// Two traversal envelopes let a bounded pass reach one nested child and
-	// mutate it; the fixed slot preserves fail-closed control work.
-	spoolMinimumDirectoryProgress = spoolFixedDirectoryReserve + 2*spoolTraversalDirectoryEnvelope
-	// Bound every named operation in one fixed workflow conservatively: four
-	// name operations per possible temp attempt, 32 per relocation candidate,
-	// and 64 for control/quota/cursor/replay/retirement/cleanup bookkeeping.
-	// This is intentionally larger than today's exact call count so a storage
-	// implementation detail cannot silently escape the shared cap.
-	spoolFixedEntryEnvelope = uint64(4*maximumStorageTempAttempts + 32*maximumRelocationSlots + 64)
+	// Reserve the post-traversal worst case: quota staging, post-quota journal
+	// proof, final config write, journal replay, and mutation-free proof.
+	spoolFixedDirectoryReserve  = uint64(5)
+	spoolFileDescriptorHeadroom = uint64(4)
+	spoolFallbackDirectoryLimit = uint64(32)
+	// Three traversal envelopes cover the fixed root journal plus enough
+	// ordinary descent to reach one nested child and mutate it. The remaining
+	// reserve preserves post-traversal control and proof work.
+	spoolMinimumDirectoryProgress = spoolFixedDirectoryReserve + 3*spoolTraversalDirectoryEnvelope
+	// A root temp collision currently needs at most eight named operations:
+	// journal open/revalidation, marker create/revalidation, temp create, and
+	// marker inspect/revalidation/unlink. Reserve nine per possible attempt so
+	// one additional operation cannot silently escape the shared cap, plus
+	// 32 per relocation candidate and 64 for control/quota/cursor bookkeeping.
+	spoolFixedEntryEnvelope = uint64(9*maximumStorageTempAttempts + 32*maximumRelocationSlots + 64 + 1)
 	spoolFixedNameEnvelope  = spoolFixedEntryEnvelope * maximumStorageNameBytes
 	// The relocation envelope covers quota read + conflict replay + quota
 	// stage, followed by the control and root-fallback cursor read/stage pairs.
 	// Writes share the same byte dimension as reads so neither direction can
 	// escape the cap.
-	spoolFixedReadEnvelope = uint64(3*maximumQuotaBytes + 4*maximumRelocationBytes + 4)
+	spoolFixedReadEnvelope = uint64(3*maximumQuotaBytes+4*maximumRelocationBytes+4) +
+		3*maximumStorageTempAttempts*rootTempJournalMarkerReadLimit
 
 	defaultRecordDecisionBudget = 50 * time.Millisecond
 	canonicalHourLayout         = "2006-01-02T15:04:05Z"
 )
+
+var errUnrecognizedMetricsRootEntry = errors.New("productmetrics: metrics root contains an unrecognized entry")
+
+var errUnsettledRootTempJournal = errors.New("productmetrics: root temporary-file journal is not settled")
 
 // RecordResult is the deliberately small outcome of a best-effort recording
 // attempt. Metrics failures never surface as command failures.
@@ -329,6 +338,8 @@ type spoolWorkMeter struct {
 	fixedDirectoryPermits   uint64
 	cleanupDirectoryPermits uint64
 	fixedEnvelopeClaimed    bool
+	rootTempJournalMarkers  uint64
+	rootTempJournalSentinel bool
 }
 
 func newSpoolWorkMeter(budget spoolWorkBudget) *spoolWorkMeter {
@@ -381,6 +392,28 @@ func (meter *spoolWorkMeter) chargeFixedDirectory() bool {
 	return true
 }
 
+// chargeFixedTraversalDirectory reserves the two physical opens used to
+// retain a directory and create its independent iterator. Both consume the
+// same root-global directory cap.
+func (meter *spoolWorkMeter) chargeFixedTraversalDirectory() bool {
+	if meter == nil {
+		return false
+	}
+	if !meter.physicalDirectories {
+		return meter.chargeDirectory()
+	}
+	if meter.fixedDirectoryPermits > 0 {
+		return true
+	}
+	if meter.usage.directories > meter.budget.maxDirectories ||
+		spoolTraversalDirectoryEnvelope > meter.budget.maxDirectories-meter.usage.directories {
+		meter.exhausted = true
+		return false
+	}
+	meter.fixedDirectoryPermits += spoolTraversalDirectoryEnvelope
+	return true
+}
+
 func (meter *spoolWorkMeter) chargeCleanupDirectory() bool {
 	if meter != nil && meter.physicalDirectories {
 		ordinaryLimit := meter.ordinaryDirectoryLimit()
@@ -396,10 +429,21 @@ func (meter *spoolWorkMeter) chargeCleanupDirectory() bool {
 }
 
 func (meter *spoolWorkMeter) ordinaryDirectoryLimit() uint64 {
-	if meter == nil || meter.budget.maxDirectories <= spoolFixedDirectoryReserve {
+	if meter == nil {
 		return 0
 	}
-	return meter.budget.maxDirectories - spoolFixedDirectoryReserve
+	reserve := spoolFixedDirectoryReserve
+	// Explicit tiny budgets remain progress-capable: leave one traversal
+	// envelope for priority cleanup and reserve only the remainder. Such a
+	// pass cannot certify final success, but it can make bounded progress.
+	if meter.budget.maxDirectories < reserve+spoolTraversalDirectoryEnvelope {
+		if meter.budget.maxDirectories <= spoolTraversalDirectoryEnvelope {
+			reserve = 0
+		} else {
+			reserve = meter.budget.maxDirectories - spoolTraversalDirectoryEnvelope
+		}
+	}
+	return meter.budget.maxDirectories - reserve
 }
 
 func (meter *spoolWorkMeter) beforePhysicalDirectoryOpen(string) error {
@@ -552,6 +596,44 @@ func (meter *spoolWorkMeter) chargeFixedRead(bytes uint64) bool {
 	return true
 }
 
+func (meter *spoolWorkMeter) acceptRootTempJournalMarker() bool {
+	if meter == nil || meter.rootTempJournalMarkers >= maximumStorageTempAttempts {
+		if meter != nil {
+			meter.exhausted = true
+		}
+		return false
+	}
+	meter.rootTempJournalMarkers++
+	return true
+}
+
+func (meter *spoolWorkMeter) reserveRootTempJournalSentinel(fixed bool) bool {
+	if meter == nil {
+		return false
+	}
+	if meter.rootTempJournalSentinel {
+		return true
+	}
+	if fixed && meter.physicalDirectories {
+		if !meter.claimFixedWorkEnvelope() {
+			return false
+		}
+		meter.rootTempJournalSentinel = true
+		return true
+	}
+	entryLimit := meter.ordinaryEntryLimit()
+	nameLimit := meter.ordinaryNameLimit()
+	if meter.exhausted || meter.usage.entries >= entryLimit || meter.usage.nameBytes > nameLimit ||
+		maximumStorageNameBytes > nameLimit-meter.usage.nameBytes {
+		meter.exhausted = true
+		return false
+	}
+	meter.usage.entries++
+	meter.usage.nameBytes += maximumStorageNameBytes
+	meter.rootTempJournalSentinel = true
+	return true
+}
+
 func (meter *spoolWorkMeter) ordinaryEntryLimit() uint64 {
 	if meter == nil || !meter.physicalDirectories {
 		if meter == nil {
@@ -638,6 +720,7 @@ type spoolRecord struct {
 	name             string
 	event            Event
 	bytes            uint64
+	incarnation      recordIncarnation
 	mtimeSeconds     int64
 	mtimeNanoseconds int64
 }
@@ -680,6 +763,8 @@ func (claim spoolClaim) events() []Event {
 type spoolSweepResult struct {
 	complete      bool
 	usage         spoolWorkUsage
+	eventEntries  uint64
+	meter         *spoolWorkMeter
 	quota         spoolQuota
 	removedEvents uint64
 	removedBytes  uint64
@@ -707,6 +792,8 @@ type spoolSweepState struct {
 	retainedRetiredControl     *storageDir
 	failClosedArmed            bool
 	durableQuotaMarker         bool
+	journalSettled             bool
+	journalFixedDirectory      bool
 }
 
 // reconcileSpool is a caller-held-state.lock primitive. It may lower durable
@@ -725,13 +812,63 @@ func purgeSpool(root *storageRoot, budget spoolWorkBudget) (spoolSweepResult, er
 	return state.finish()
 }
 
+// purgeSpoolWithinBudget retries mutation-only purge passes with one shared
+// meter until a mutation-free pass proves the exact root clean. The aggregate
+// invocation never replenishes any cleanup-work dimension between passes.
+func purgeSpoolWithinBudget(root *storageRoot, budget spoolWorkBudget) (spoolSweepResult, error) {
+	budget = constrainSpoolDirectoryBudget(root, budget)
+	meter := newSpoolWorkMeter(budget)
+	aggregate := spoolSweepResult{}
+	for {
+		beforeUsage := meter.usage
+		beforeEventEntries := meter.eventEntries
+		state := runSpoolSweepWithMeter(root, spoolPolicy{}, time.Time{}, meter, true)
+		result, err := state.finish()
+		aggregate.complete = result.complete
+		aggregate.usage = result.usage
+		aggregate.eventEntries = result.eventEntries
+		aggregate.meter = result.meter
+		aggregate.quota = result.quota
+		aggregate.removedEvents = saturatingAddUint64(aggregate.removedEvents, result.removedEvents)
+		aggregate.removedBytes = saturatingAddUint64(aggregate.removedBytes, result.removedBytes)
+		if err != nil || result.complete || meter.exhausted || !state.mutated {
+			return aggregate, err
+		}
+		if meter.usage == beforeUsage && meter.eventEntries == beforeEventEntries {
+			return aggregate, nil
+		}
+		if meter.usage.entries >= meter.budget.maxEntries ||
+			meter.usage.directories >= meter.budget.maxDirectories ||
+			meter.usage.readBytes >= meter.budget.maxReadBytes ||
+			meter.usage.nameBytes >= meter.budget.maxNameBytes ||
+			meter.eventEntries >= maximumEnumerationEvents {
+			return aggregate, nil
+		}
+		if meter.fixedDirectoryPermits != 0 || meter.cleanupDirectoryPermits != 0 {
+			return aggregate, errors.New("productmetrics: cleanup pass left directory permits outstanding")
+		}
+		meter.fixedEnvelopeClaimed = false
+	}
+}
+
+func saturatingAddUint64(left, right uint64) uint64 {
+	if math.MaxUint64-left < right {
+		return math.MaxUint64
+	}
+	return left + right
+}
+
 func runSpoolSweep(root *storageRoot, policy spoolPolicy, now time.Time, budget spoolWorkBudget, purgeAll bool) *spoolSweepState {
 	budget = constrainSpoolDirectoryBudget(root, budget)
+	return runSpoolSweepWithMeter(root, policy, now, newSpoolWorkMeter(budget), purgeAll)
+}
+
+func runSpoolSweepWithMeter(root *storageRoot, policy spoolPolicy, now time.Time, meter *spoolWorkMeter, purgeAll bool) *spoolSweepState {
 	state := &spoolSweepState{
 		root: root, policy: policy, now: now.UTC().Truncate(time.Hour), purgeAll: purgeAll,
-		meter: newSpoolWorkMeter(budget), seen: make(map[string]struct{}), pruneDirs: make(map[string]*storageDir),
+		meter: meter, seen: make(map[string]struct{}), pruneDirs: make(map[string]*storageDir),
 	}
-	if root == nil || root.storageDir == nil || root.backend == nil {
+	if root == nil || root.storageDir == nil || root.backend == nil || meter == nil {
 		state.operation = errStorageClosed
 		return state
 	}
@@ -750,6 +887,16 @@ func runSpoolSweep(root *storageRoot, policy spoolPolicy, now time.Time, budget 
 	state.cleanupDualControlPriority()
 	if state.mutated || state.operation != nil || state.meter.exhausted {
 		return state
+	}
+	if state.purgeAll {
+		// Journal authority is name-addressed and must not be starved behind a
+		// deep or over-budget event tree. Drain/prove it before ordinary descent.
+		state.journalFixedDirectory = true
+		state.cleanupRootTempJournal()
+		state.journalFixedDirectory = false
+		if state.mutated || state.operation != nil || state.meter.exhausted {
+			return state
+		}
 	}
 	for _, tree := range []string{queueDirectoryName, inflightDirectoryName} {
 		if state.meter.exhausted {
@@ -772,8 +919,462 @@ func runSpoolSweep(root *storageRoot, policy spoolPolicy, now time.Time, budget 
 	if !state.mutated && state.operation == nil && state.meter.traversalError == nil && !state.meter.exhausted {
 		state.cleanupFallbackCursor()
 	}
+	if state.purgeAll && state.journalSettled && !state.mutated && state.operation == nil && state.meter.traversalError == nil && !state.meter.exhausted {
+		state.cleanupUnexpectedRootEntries()
+	}
 	state.traversed = !state.meter.exhausted && state.meter.traversalError == nil && state.operation == nil
 	return state
+}
+
+// cleanupUnexpectedRootEntries preserves every unrecognized root child and
+// makes exact cleanup incomplete. Unjournaled canonical staging names are
+// unrecognized too; only the root-temp journal can authorize their removal.
+// The scan never opens or recurses into an unrecognized directory.
+func (state *spoolSweepState) cleanupUnexpectedRootEntries() {
+	if !state.meter.chargeDirectory() {
+		return
+	}
+	// Recover any prior unlink whose root-directory sync acknowledgement was
+	// lost before treating a fresh enumeration as an absence proof.
+	if err := state.root.syncDirectory(); err != nil {
+		state.operation = errors.Join(state.operation, err)
+		return
+	}
+	iterator, err := state.root.iterateEntries()
+	if err != nil {
+		state.operation = errors.Join(state.operation, err)
+		return
+	}
+	unrecognized := false
+	defer func() {
+		state.operation = errors.Join(state.operation, iterator.Close())
+		if unrecognized {
+			state.operation = errors.Join(state.operation, errUnrecognizedMetricsRootEntry)
+		}
+	}()
+	for {
+		entry, ok := state.meter.next(iterator)
+		if !ok {
+			return
+		}
+		if knownProductMetricsRootEntry(entry.name) {
+			continue
+		}
+		if entry.name == rootTempJournalDirectoryName && state.journalSettled {
+			continue
+		}
+		unrecognized = true
+	}
+}
+
+func (state *spoolSweepState) cleanupRootTempJournal() {
+	if state == nil || state.root == nil || state.meter == nil ||
+		!state.chargeRootTempJournalName(rootTempJournalDirectoryName) {
+		return
+	}
+	entry, err := state.root.lookupEntry(rootTempJournalDirectoryName)
+	if errors.Is(err, fs.ErrNotExist) {
+		// A missing directory can be the visible side of an unlink whose root
+		// sync acknowledgement was lost. Recover the root and recheck the name
+		// before treating absence as durable.
+		if syncErr := state.root.syncDirectory(); syncErr != nil {
+			state.operation = errors.Join(state.operation, syncErr)
+			return
+		}
+		if !state.chargeRootTempJournalName(rootTempJournalDirectoryName) {
+			return
+		}
+		if _, recheckErr := state.root.lookupEntry(rootTempJournalDirectoryName); errors.Is(recheckErr, fs.ErrNotExist) {
+			state.journalSettled = true
+		} else {
+			state.operation = errors.Join(state.operation, recheckErr, errUnsettledRootTempJournal)
+		}
+		return
+	}
+	if err != nil {
+		state.operation = errors.Join(state.operation, err)
+		return
+	}
+	var directoryCharged bool
+	if state.journalFixedDirectory {
+		directoryCharged = state.meter.chargeFixedTraversalDirectory()
+	} else {
+		directoryCharged = state.meter.chargeDirectory()
+	}
+	if entry.metadata.kind != storageEntryDirectory {
+		state.operation = errors.Join(state.operation, errUnsettledRootTempJournal)
+		return
+	}
+	if !directoryCharged {
+		return
+	}
+	journal, err := state.root.openEnumeratedCleanupDirectory(entry)
+	if err != nil {
+		state.operation = errors.Join(state.operation, err)
+		return
+	}
+	defer func() { state.operation = errors.Join(state.operation, journal.Close()) }()
+	if journal.cleanupOnly() {
+		state.operation = errors.Join(state.operation, errUnsettledRootTempJournal)
+		return
+	}
+	// Recover both sides of either uncertainty window before trusting marker or
+	// root-temp absence: marker unlink -> journal sync, temp unlink -> root sync.
+	if err := journal.syncDirectory(); err != nil {
+		state.operation = errors.Join(state.operation, err)
+		return
+	}
+	if err := state.root.syncDirectory(); err != nil {
+		state.operation = errors.Join(state.operation, err)
+		return
+	}
+	iterator, err := journal.iterateEntries()
+	if err != nil {
+		state.operation = errors.Join(state.operation, err)
+		return
+	}
+	defer func() {
+		if iterator != nil {
+			state.operation = errors.Join(state.operation, iterator.Close())
+		}
+	}()
+	if !state.meter.reserveRootTempJournalSentinel(state.journalFixedDirectory) {
+		return
+	}
+	marker, ok := state.nextRootTempJournalMarker(iterator)
+	if !ok {
+		closeErr := iterator.Close()
+		iterator = nil
+		state.operation = errors.Join(state.operation, closeErr)
+		if state.mutated || state.meter.exhausted || state.meter.traversalError != nil || state.operation != nil {
+			return
+		}
+		if !state.chargeRootTempJournalName(rootTempJournalDirectoryName) {
+			return
+		}
+		named, lookupErr := state.root.lookupEntry(rootTempJournalDirectoryName)
+		if lookupErr != nil || !samePrivateJournalDirectoryEntry(entry, named) {
+			state.operation = errors.Join(state.operation, lookupErr, errUnsettledRootTempJournal)
+			return
+		}
+		state.journalSettled = true
+		return
+	}
+	loadedMarker, markerErr := loadRootTempJournalMarker(state.meter, journal, entry, marker, state.journalFixedDirectory)
+	if markerErr != nil {
+		state.operation = errors.Join(state.operation, markerErr, errUnsettledRootTempJournal)
+		return
+	}
+	markerLease := loadedMarker.lease
+	loadedMarker.lease = nil
+	expectedMarker := markerLease.incarnation()
+	expectedEvidence := loadedMarker.evidence
+	closeMarkerLease := func() {
+		if markerLease != nil {
+			state.operation = errors.Join(state.operation, markerLease.Close())
+			markerLease = nil
+		}
+	}
+	if !state.chargeRootTempJournalName(marker.name) {
+		closeMarkerLease()
+		return
+	}
+	temp, lookupErr := state.root.lookupEntry(marker.name)
+	switch {
+	case errors.Is(lookupErr, fs.ErrNotExist):
+		if !state.chargeRootTempJournalName(marker.name) {
+			closeMarkerLease()
+			return
+		}
+		if absenceErr := state.root.confirmEntryAbsent(marker.name); absenceErr != nil {
+			state.operation = errors.Join(state.operation, absenceErr, errUnsettledRootTempJournal)
+			closeMarkerLease()
+			return
+		}
+	case lookupErr != nil:
+		state.operation = errors.Join(state.operation, lookupErr)
+		closeMarkerLease()
+		return
+	case loadedMarker.evidence.state != rootTempJournalMarkerBound ||
+		!boundRootTempJournalMarkerMatches(loadedMarker, temp):
+		state.operation = errors.Join(state.operation, errUnsettledRootTempJournal)
+		closeMarkerLease()
+		return
+	default:
+		if authorityErr := state.revalidateRootTempJournalMarkerAuthority(entry, journal, marker, markerLease); authorityErr != nil {
+			state.operation = errors.Join(state.operation, authorityErr, errUnsettledRootTempJournal)
+			closeMarkerLease()
+			return
+		}
+		state.deleteJournaledRootTemp(temp, loadedMarker.evidence.temp, func() error {
+			return state.revalidateRootTempJournalMarkerEvidence(
+				entry, journal, marker, expectedMarker, expectedEvidence,
+			)
+		})
+		if state.operation != nil || state.meter.exhausted {
+			closeMarkerLease()
+			return
+		}
+	}
+	if authorityErr := state.revalidateRootTempJournalMarkerAuthority(entry, journal, marker, markerLease); authorityErr != nil {
+		state.operation = errors.Join(state.operation, authorityErr, errUnsettledRootTempJournal)
+		closeMarkerLease()
+		return
+	}
+	if err := journal.removeFileMatchingLeaseGuarded(marker.name, markerLease, func() error {
+		return state.revalidateRootTempJournalMarkerRetirement(
+			entry, journal, marker, expectedMarker, expectedEvidence,
+		)
+	}); err != nil {
+		state.operation = errors.Join(state.operation, err)
+		closeMarkerLease()
+		return
+	}
+	closeMarkerLease()
+	state.mutated = true
+}
+
+type loadedRootTempJournalMarker struct {
+	entry    storageEntry
+	evidence rootTempJournalMarkerEvidence
+	lease    *storageRecordLease
+}
+
+func loadRootTempJournalMarker(
+	meter *spoolWorkMeter,
+	journal *storageDir,
+	journalEntry storageEntry,
+	marker storageEntry,
+	fixed bool,
+) (loadedRootTempJournalMarker, error) {
+	loaded := loadedRootTempJournalMarker{entry: marker}
+	if meter == nil || journal == nil || !canonicalStorageTempName(marker.name) ||
+		marker.metadata.kind != storageEntryRegular || marker.metadata.uid != uint32(os.Geteuid()) ||
+		!marker.metadata.ownerOnly || marker.metadata.nlink != 1 || marker.metadata.dev != journalEntry.metadata.dev {
+		return loaded, errUnsettledRootTempJournal
+	}
+	reservation := uint64(rootTempJournalMarkerReadLimit)
+	if fixed {
+		if !meter.chargeFixedRead(reservation) {
+			return loaded, errUnsettledRootTempJournal
+		}
+	} else if !meter.chargeRead(reservation) {
+		return loaded, errUnsettledRootTempJournal
+	}
+	data, physicalReadBytes, lease, err := journal.readFileMeasured(marker.name, maximumRootTempJournalMarkerBytes)
+	if !fixed {
+		meter.refundRead(reservation, physicalReadBytes)
+	}
+	if err != nil || lease == nil {
+		if lease != nil {
+			err = errors.Join(err, lease.Close())
+		}
+		return loaded, errors.Join(err, errUnsettledRootTempJournal)
+	}
+	incarnation := lease.incarnation()
+	if incarnation.dev != marker.metadata.dev || incarnation.ino != marker.metadata.ino {
+		return loaded, errors.Join(lease.Close(), errUnsettledRootTempJournal)
+	}
+	evidence, err := decodeRootTempJournalMarker(marker.name, data)
+	if err != nil {
+		return loaded, errors.Join(err, lease.Close(), errUnsettledRootTempJournal)
+	}
+	if evidence.state == rootTempJournalMarkerBound && evidence.temp.dev != marker.metadata.dev {
+		return loaded, errors.Join(lease.Close(), errUnsettledRootTempJournal)
+	}
+	loaded.evidence = evidence
+	loaded.lease = lease
+	return loaded, nil
+}
+
+func boundRootTempJournalMarkerMatches(marker loadedRootTempJournalMarker, temp storageEntry) bool {
+	return marker.evidence.state == rootTempJournalMarkerBound && removableStorageTempEntry(temp) &&
+		marker.entry.metadata.dev == temp.metadata.dev &&
+		marker.evidence.temp == (recordIncarnation{dev: temp.metadata.dev, ino: temp.metadata.ino})
+}
+
+func (state *spoolSweepState) revalidateRootTempJournalMarkerAuthority(
+	journalEntry storageEntry,
+	journal *storageDir,
+	marker storageEntry,
+	lease *storageRecordLease,
+) error {
+	if state == nil || state.root == nil || journal == nil || lease == nil {
+		return errUnsettledRootTempJournal
+	}
+	if !state.chargeRootTempJournalName(rootTempJournalDirectoryName) {
+		return errUnsettledRootTempJournal
+	}
+	namedJournal, err := state.root.lookupEntry(rootTempJournalDirectoryName)
+	if err != nil || !samePrivateJournalDirectoryEntry(journalEntry, namedJournal) {
+		return errors.Join(err, errUnsettledRootTempJournal)
+	}
+	if !state.chargeRootTempJournalName(marker.name) {
+		return errUnsettledRootTempJournal
+	}
+	namedMarker, err := journal.lookupEntry(marker.name)
+	if err != nil || !sameRootTempJournalMarkerIdentity(marker, namedMarker, lease, journalEntry.metadata.dev) {
+		return errors.Join(err, errUnsettledRootTempJournal)
+	}
+	return nil
+}
+
+func sameRootTempJournalMarkerIdentity(enumerated, named storageEntry, lease *storageRecordLease, journalDevice uint64) bool {
+	if lease == nil {
+		return false
+	}
+	incarnation := lease.incarnation()
+	return named.name == enumerated.name && named.metadata.dev == enumerated.metadata.dev &&
+		named.metadata.ino == enumerated.metadata.ino && named.metadata.dev == journalDevice &&
+		named.metadata.kind == storageEntryRegular && named.metadata.uid == uint32(os.Geteuid()) &&
+		named.metadata.ownerOnly && named.metadata.nlink == 1 &&
+		incarnation == (recordIncarnation{dev: named.metadata.dev, ino: named.metadata.ino})
+}
+
+func (state *spoolSweepState) revalidateRootTempJournalMarkerEvidence(
+	journalEntry storageEntry,
+	journal *storageDir,
+	marker storageEntry,
+	expectedMarker recordIncarnation,
+	expectedEvidence rootTempJournalMarkerEvidence,
+) error {
+	if state == nil || state.root == nil || journal == nil || expectedMarker == (recordIncarnation{}) {
+		return errUnsettledRootTempJournal
+	}
+	if !state.chargeRootTempJournalName(rootTempJournalDirectoryName) {
+		return errUnsettledRootTempJournal
+	}
+	namedJournal, err := state.root.lookupEntry(rootTempJournalDirectoryName)
+	if err != nil || !samePrivateJournalDirectoryEntry(journalEntry, namedJournal) {
+		return errors.Join(err, errUnsettledRootTempJournal)
+	}
+	loaded, err := loadRootTempJournalMarker(state.meter, journal, journalEntry, marker, state.journalFixedDirectory)
+	if err != nil || loaded.lease == nil {
+		return errors.Join(err, errUnsettledRootTempJournal)
+	}
+	lease := loaded.lease
+	if loaded.evidence != expectedEvidence || lease.incarnation() != expectedMarker {
+		return errors.Join(lease.Close(), errUnsettledRootTempJournal)
+	}
+	if !state.chargeRootTempJournalName(marker.name) {
+		return errors.Join(lease.Close(), errUnsettledRootTempJournal)
+	}
+	namedMarker, lookupErr := journal.lookupEntry(marker.name)
+	if lookupErr != nil || !sameRootTempJournalMarkerIdentity(marker, namedMarker, lease, journalEntry.metadata.dev) {
+		return errors.Join(lookupErr, lease.Close(), errUnsettledRootTempJournal)
+	}
+	return lease.Close()
+}
+
+func (state *spoolSweepState) revalidateRootTempJournalMarkerRetirement(
+	journalEntry storageEntry,
+	journal *storageDir,
+	marker storageEntry,
+	expectedMarker recordIncarnation,
+	expectedEvidence rootTempJournalMarkerEvidence,
+) error {
+	if !state.chargeRootTempJournalName(marker.name) {
+		return errUnsettledRootTempJournal
+	}
+	if err := state.root.confirmEntryAbsent(marker.name); err != nil {
+		return errors.Join(err, errUnsettledRootTempJournal)
+	}
+	if err := state.revalidateRootTempJournalMarkerEvidence(
+		journalEntry, journal, marker, expectedMarker, expectedEvidence,
+	); err != nil {
+		return err
+	}
+	if !state.chargeRootTempJournalName(marker.name) {
+		return errUnsettledRootTempJournal
+	}
+	return state.root.confirmEntryAbsent(marker.name)
+}
+
+func (state *spoolSweepState) chargeRootTempJournalName(name string) bool {
+	if state == nil || state.meter == nil {
+		return false
+	}
+	if state.journalFixedDirectory {
+		return state.meter.chargeFixedEntry(name)
+	}
+	return state.meter.chargeNamedEntry(name)
+}
+
+func (state *spoolSweepState) nextRootTempJournalMarker(iterator *storageIterator) (storageEntry, bool) {
+	if state == nil || state.meter == nil || iterator == nil {
+		return storageEntry{}, false
+	}
+	if !state.journalFixedDirectory {
+		entry, ok := state.meter.next(iterator)
+		if !ok {
+			return storageEntry{}, false
+		}
+		if !state.meter.acceptRootTempJournalMarker() {
+			return storageEntry{}, false
+		}
+		return entry, true
+	}
+	entry, err := iterator.Next()
+	if errors.Is(err, io.EOF) {
+		return storageEntry{}, false
+	}
+	if err != nil {
+		state.meter.traversalError = errors.Join(state.meter.traversalError, err)
+		return storageEntry{}, false
+	}
+	if !state.meter.chargeFixedEntry(entry.name) || !state.meter.acceptRootTempJournalMarker() {
+		return storageEntry{}, false
+	}
+	return entry, true
+}
+
+func samePrivateJournalDirectoryEntry(opened, named storageEntry) bool {
+	return opened.name == rootTempJournalDirectoryName && named.name == opened.name &&
+		named.metadata.dev == opened.metadata.dev && named.metadata.ino == opened.metadata.ino &&
+		named.metadata.kind == storageEntryDirectory && named.metadata.nlink > 0 &&
+		named.metadata.uid == uint32(os.Geteuid()) && named.metadata.ownerOnly
+}
+
+func removableStorageTempEntry(entry storageEntry) bool {
+	return canonicalStorageTempName(entry.name) && entry.metadata.kind == storageEntryRegular &&
+		entry.metadata.uid == uint32(os.Geteuid()) && entry.metadata.ownerOnly && entry.metadata.nlink == 1
+}
+
+func canonicalStorageTempName(name string) bool {
+	remainder, ok := strings.CutPrefix(name, ".pm-tmp-")
+	if !ok {
+		return false
+	}
+	pid, sequence, ok := strings.Cut(remainder, "-")
+	return ok && !strings.Contains(sequence, "-") &&
+		canonicalNonzeroLowerHex(pid) && canonicalNonzeroLowerHex(sequence)
+}
+
+func canonicalNonzeroLowerHex(value string) bool {
+	if value == "" || len(value) > 16 || value[0] == '0' {
+		return false
+	}
+	for index := range len(value) {
+		character := value[index]
+		if (character < '0' || character > '9') && (character < 'a' || character > 'f') {
+			return false
+		}
+	}
+	parsed, err := strconv.ParseUint(value, 16, 64)
+	return err == nil && parsed != 0 && strconv.FormatUint(parsed, 16) == value
+}
+
+func knownProductMetricsRootEntry(name string) bool {
+	if isStorageLockName(name) {
+		return true
+	}
+	switch name {
+	case configFileName, quotaFileName, queueDirectoryName, inflightDirectoryName,
+		spoolControlDirectoryName, retiredControlDirectoryName, fallbackRelocationCursorName:
+		return true
+	default:
+		return false
+	}
 }
 
 func constrainSpoolDirectoryBudget(root *storageRoot, budget spoolWorkBudget) spoolWorkBudget {
@@ -1041,6 +1642,10 @@ func (state *spoolSweepState) ensureDurableQuotaMarker() bool {
 		state.operation = errors.Join(state.operation, err, encodeErr, errors.New("productmetrics: cleanup budget cannot write fail-closed quota marker"))
 		return false
 	}
+	if !state.meter.chargeFixedDirectory() {
+		state.operation = errors.Join(state.operation, errors.New("productmetrics: cleanup budget cannot open root quota journal"))
+		return false
+	}
 	if persistErr := persistSpoolQuotaDirect(state.root, markers); persistErr != nil {
 		state.operation = errors.Join(state.operation, err, persistErr)
 		return false
@@ -1202,6 +1807,10 @@ func (state *spoolSweepState) walkTree(treeName string) {
 	}
 	tree, err := state.root.openEnumeratedCleanupDirectory(entry)
 	if err != nil {
+		if errors.Is(err, syscall.EXDEV) {
+			state.operation = errors.Join(state.operation, err)
+			return
+		}
 		state.operation = errors.Join(state.operation, directoryDescriptorExhaustion(err))
 		if !state.meter.chargeEventEntry() {
 			return
@@ -1259,6 +1868,10 @@ func (state *spoolSweepState) walkTree(treeName string) {
 		}
 		generation, openErr := openEnumeratedStorageDirectory(tree, entry)
 		if openErr != nil {
+			if errors.Is(openErr, syscall.EXDEV) {
+				state.operation = errors.Join(state.operation, openErr)
+				return
+			}
 			state.operation = errors.Join(state.operation, directoryDescriptorExhaustion(openErr))
 			// The declared layout permits only generation directories here.
 			state.meter.refundLogicalDirectoryCharge()
@@ -1328,6 +1941,9 @@ func (state *spoolSweepState) purgeDirectory(directory, quarantineRoot *storageD
 		if openErr == nil {
 			state.purgeDirectory(child, quarantineRoot, eventTree)
 			state.operation = errors.Join(state.operation, child.Close())
+			if errors.Is(state.operation, syscall.EXDEV) {
+				return
+			}
 			if !state.meter.exhausted {
 				if !state.ensureFailClosedControl() {
 					return
@@ -1339,6 +1955,10 @@ func (state *spoolSweepState) purgeDirectory(directory, quarantineRoot *storageD
 				}
 			}
 			continue
+		}
+		if errors.Is(openErr, syscall.EXDEV) {
+			state.operation = errors.Join(state.operation, openErr)
+			return
 		}
 		state.operation = errors.Join(state.operation, directoryDescriptorExhaustion(openErr))
 		state.meter.refundLogicalDirectoryCharge()
@@ -1895,6 +2515,9 @@ func (state *spoolSweepState) reserveFallbackRelocationBlock() (fallbackRelocati
 	if !state.meter.chargeFixedRead(uint64(len(data))) {
 		return fallbackRelocationReservation{}, errors.New("productmetrics: cleanup budget cannot write fallback relocation cursor")
 	}
+	if !state.meter.chargeFixedDirectory() {
+		return fallbackRelocationReservation{}, errors.New("productmetrics: cleanup budget cannot open fallback cursor journal")
+	}
 	result, writeErr := state.root.writeFileAtomicOutcome(fallbackRelocationCursorName, data)
 	if result.state != storageWriteNotApplied {
 		state.mutated = true
@@ -2130,6 +2753,9 @@ func (state *spoolSweepState) scanCurrentGeneration(treeName, generationName str
 		if openErr == nil {
 			state.purgeDirectory(child, quarantineRoot, true)
 			state.operation = errors.Join(state.operation, child.Close())
+			if errors.Is(state.operation, syscall.EXDEV) {
+				return
+			}
 			if !state.meter.exhausted {
 				if !state.ensureFailClosedControl() {
 					return
@@ -2142,6 +2768,10 @@ func (state *spoolSweepState) scanCurrentGeneration(treeName, generationName str
 			}
 			continue
 		}
+		if errors.Is(openErr, syscall.EXDEV) {
+			state.operation = errors.Join(state.operation, openErr)
+			return
+		}
 		state.operation = errors.Join(state.operation, directoryDescriptorExhaustion(openErr))
 		state.meter.refundLogicalDirectoryCharge()
 		if !state.meter.chargeEventEntry() {
@@ -2152,7 +2782,7 @@ func (state *spoolSweepState) scanCurrentGeneration(treeName, generationName str
 }
 
 func directoryDescriptorExhaustion(err error) error {
-	if errors.Is(err, syscall.EMFILE) || errors.Is(err, syscall.ENFILE) {
+	if errors.Is(err, syscall.EMFILE) || errors.Is(err, syscall.ENFILE) || errors.Is(err, syscall.EXDEV) {
 		return err
 	}
 	return nil
@@ -2175,6 +2805,11 @@ func (state *spoolSweepState) scanCurrentLeaf(treeName, generationName string, d
 	}
 	state.meter.refundRead(readReservation, physicalReadBytes)
 	if err != nil {
+		if errors.Is(err, syscall.EXDEV) {
+			state.operation = errors.Join(state.operation, err)
+			state.addConservativeEntry(entry)
+			return
+		}
 		state.deleteLeaf(directory, entry, true)
 		return
 	}
@@ -2195,7 +2830,8 @@ func (state *spoolSweepState) scanCurrentLeaf(treeName, generationName string, d
 	}
 	record := spoolRecord{
 		tree: treeName, generation: generationName, name: entry.name, event: event,
-		bytes: uint64(len(data)), mtimeSeconds: entry.metadata.mtimeSeconds, mtimeNanoseconds: entry.metadata.mtimeNanoseconds,
+		bytes: uint64(len(data)), incarnation: recordIncarnation{dev: entry.metadata.dev, ino: entry.metadata.ino},
+		mtimeSeconds: entry.metadata.mtimeSeconds, mtimeNanoseconds: entry.metadata.mtimeNanoseconds,
 	}
 	if _, duplicate := state.seen[event.EventID]; duplicate {
 		existing := -1
@@ -2286,6 +2922,29 @@ func (state *spoolSweepState) deleteLeaf(directory *storageDir, entry storageEnt
 			state.noteRemoved(entry.metadata.size)
 		}
 	}
+}
+
+func (state *spoolSweepState) deleteJournaledRootTemp(
+	entry storageEntry,
+	expected recordIncarnation,
+	guard func() error,
+) {
+	if state == nil || state.root == nil || state.root.backend == nil {
+		return
+	}
+	// A strict durable binding to this exact incarnation is the deletion
+	// authority for the root temp.
+	// Root staging files carry no event quota, so replay must not create an
+	// event fail-closed control namespace merely to retire crash residue.
+	if expected == (recordIncarnation{}) || expected != (recordIncarnation{dev: entry.metadata.dev, ino: entry.metadata.ino}) {
+		state.operation = errors.Join(state.operation, errUnsettledRootTempJournal)
+		return
+	}
+	if err := state.root.backend.removeFileMatchingGuarded(entry.name, expected, guard); err != nil && !errors.Is(err, fs.ErrNotExist) {
+		state.operation = errors.Join(state.operation, err)
+		return
+	}
+	state.mutated = true
 }
 
 func (state *spoolSweepState) noteRemoved(size int64) {
@@ -2415,12 +3074,190 @@ func (state *spoolSweepState) finish() (spoolSweepResult, error) {
 		persistErr = errors.Join(persistErr, state.retainedControl.Close())
 		state.retainedControl = nil
 	}
+	if state.purgeAll && complete && persistErr == nil {
+		// Quota persistence mutates the control/root namespace after the clean
+		// traversal. Re-prove the persistent root journal with the same meter
+		// before certifying the combined result.
+		state.journalSettled = false
+		state.journalFixedDirectory = true
+		state.cleanupRootTempJournal()
+		complete = state.journalSettled && !state.mutated && !state.meter.exhausted &&
+			state.meter.traversalError == nil && state.operation == nil
+	}
 	result := spoolSweepResult{
-		complete: complete && persistErr == nil, usage: state.meter.usage, quota: target,
+		complete: complete && persistErr == nil, usage: state.meter.usage, eventEntries: state.meter.eventEntries,
+		meter: state.meter, quota: target,
 		removedEvents: state.removedEvents, removedBytes: state.removedBytes,
 	}
 	err := errors.Join(state.meter.traversalError, state.operation, persistErr)
 	return result, err
+}
+
+func proveRootTempJournalReadOnlyWithMeter(root *storageRoot, meter *spoolWorkMeter, fixedDirectory bool) (returnErr error) {
+	if root == nil || root.storageDir == nil || root.backend == nil || meter == nil {
+		return errStorageClosed
+	}
+	restore := root.installDirectoryOpenHooks(meter.beforePhysicalDirectoryOpen, meter.afterPhysicalDirectoryOpen)
+	defer restore()
+	chargeName := meter.chargeNamedEntry
+	if fixedDirectory {
+		chargeName = meter.chargeFixedEntry
+	}
+	if !chargeName(rootTempJournalDirectoryName) {
+		return errUnsettledRootTempJournal
+	}
+	entry, err := root.lookupEntry(rootTempJournalDirectoryName)
+	if errors.Is(err, fs.ErrNotExist) {
+		if syncErr := root.syncDirectory(); syncErr != nil {
+			return syncErr
+		}
+		if !chargeName(rootTempJournalDirectoryName) {
+			return errUnsettledRootTempJournal
+		}
+		if _, recheckErr := root.lookupEntry(rootTempJournalDirectoryName); errors.Is(recheckErr, fs.ErrNotExist) {
+			return nil
+		} else if recheckErr != nil {
+			return recheckErr
+		}
+		return errUnsettledRootTempJournal
+	}
+	if err != nil {
+		return err
+	}
+	var directoryCharged bool
+	if fixedDirectory {
+		directoryCharged = meter.chargeFixedTraversalDirectory()
+	} else {
+		directoryCharged = meter.chargeDirectory()
+	}
+	if entry.metadata.kind != storageEntryDirectory || !directoryCharged {
+		return errUnsettledRootTempJournal
+	}
+	journal, err := root.openEnumeratedCleanupDirectory(entry)
+	if err != nil {
+		return err
+	}
+	defer func() { returnErr = errors.Join(returnErr, journal.Close()) }()
+	if journal.cleanupOnly() {
+		return errUnsettledRootTempJournal
+	}
+	if err := journal.syncDirectory(); err != nil {
+		return err
+	}
+	if err := root.syncDirectory(); err != nil {
+		return err
+	}
+	iterator, err := journal.iterateEntries()
+	if err != nil {
+		return err
+	}
+	defer func() {
+		if iterator != nil {
+			returnErr = errors.Join(returnErr, iterator.Close())
+		}
+	}()
+	if !meter.reserveRootTempJournalSentinel(fixedDirectory) {
+		return errUnsettledRootTempJournal
+	}
+	for {
+		var marker storageEntry
+		var ok bool
+		if fixedDirectory {
+			marker, err = iterator.Next()
+			if errors.Is(err, io.EOF) {
+				break
+			}
+			if err != nil {
+				return err
+			}
+			if !chargeName(marker.name) {
+				return errUnsettledRootTempJournal
+			}
+			if !meter.acceptRootTempJournalMarker() {
+				return errUnsettledRootTempJournal
+			}
+			ok = true
+		} else {
+			marker, ok = meter.next(iterator)
+			if !ok {
+				if meter.traversalError != nil {
+					return meter.traversalError
+				}
+				if meter.exhausted {
+					return errUnsettledRootTempJournal
+				}
+				break
+			}
+			if !meter.acceptRootTempJournalMarker() {
+				return errUnsettledRootTempJournal
+			}
+		}
+		if !ok {
+			return errUnsettledRootTempJournal
+		}
+		loadedMarker, markerErr := loadRootTempJournalMarker(meter, journal, entry, marker, fixedDirectory)
+		if markerErr != nil {
+			return errors.Join(markerErr, errUnsettledRootTempJournal)
+		}
+		markerLease := loadedMarker.lease
+		if !chargeName(marker.name) {
+			_ = markerLease.Close()
+			return errUnsettledRootTempJournal
+		}
+		_, lookupErr := root.lookupEntry(marker.name)
+		if !errors.Is(lookupErr, fs.ErrNotExist) {
+			_ = markerLease.Close()
+			if lookupErr != nil {
+				return lookupErr
+			}
+			return errUnsettledRootTempJournal
+		}
+		if !chargeName(marker.name) {
+			_ = markerLease.Close()
+			return errUnsettledRootTempJournal
+		}
+		if absenceErr := root.confirmEntryAbsent(marker.name); absenceErr != nil {
+			_ = markerLease.Close()
+			return errors.Join(absenceErr, errUnsettledRootTempJournal)
+		}
+		if !chargeName(rootTempJournalDirectoryName) {
+			_ = markerLease.Close()
+			return errUnsettledRootTempJournal
+		}
+		namedJournal, journalErr := root.lookupEntry(rootTempJournalDirectoryName)
+		if journalErr != nil || !samePrivateJournalDirectoryEntry(entry, namedJournal) {
+			_ = markerLease.Close()
+			return errors.Join(journalErr, errUnsettledRootTempJournal)
+		}
+		if !chargeName(marker.name) {
+			_ = markerLease.Close()
+			return errUnsettledRootTempJournal
+		}
+		namedMarker, markerLookupErr := journal.lookupEntry(marker.name)
+		if markerLookupErr != nil || !sameRootTempJournalMarkerIdentity(marker, namedMarker, markerLease, entry.metadata.dev) {
+			_ = markerLease.Close()
+			return errors.Join(markerLookupErr, errUnsettledRootTempJournal)
+		}
+		if closeErr := markerLease.Close(); closeErr != nil {
+			return closeErr
+		}
+	}
+	if closeErr := iterator.Close(); closeErr != nil {
+		iterator = nil
+		return closeErr
+	}
+	iterator = nil
+	if !chargeName(rootTempJournalDirectoryName) {
+		return errUnsettledRootTempJournal
+	}
+	named, lookupErr := root.lookupEntry(rootTempJournalDirectoryName)
+	if lookupErr != nil {
+		return lookupErr
+	}
+	if !samePrivateJournalDirectoryEntry(entry, named) {
+		return errUnsettledRootTempJournal
+	}
+	return nil
 }
 
 func (state *spoolSweepState) persistQuotaFromRetainedControl(quota spoolQuota) error {
@@ -2498,8 +3335,8 @@ func claimSpoolBatch(root *storageRoot, permit RecordingPermit, now time.Time, b
 		result, renameErr := inflight.renameFile(record.name, queue, record.name)
 		if renameErr != nil {
 			if errors.Is(renameErr, errStorageDestinationExists) {
-				if removeErr := inflight.removeFile(record.name); removeErr != nil {
-					return spoolClaim{}, errors.Join(renameErr, removeErr)
+				if duplicateErr := retireExactDuplicateSpoolRecord(inflight, queue, *record); duplicateErr != nil {
+					return spoolClaim{}, errors.Join(renameErr, duplicateErr)
 				}
 				continue
 			}
@@ -2589,7 +3426,7 @@ func restoreSpoolClaim(root *storageRoot, claim spoolClaim) error {
 	var restoreErr error
 	for _, record := range claim.records {
 		if record.generation != claim.generation || record.name != eventFileName(record.event.EventID) ||
-			record.bytes == 0 || record.bytes > maximumEventBytes {
+			record.bytes == 0 || record.bytes > maximumEventBytes || record.incarnation == (recordIncarnation{}) {
 			restoreErr = errors.Join(restoreErr, errors.New("productmetrics: malformed claimed record"))
 			continue
 		}
@@ -2598,8 +3435,8 @@ func restoreSpoolClaim(root *storageRoot, claim spoolClaim) error {
 			continue
 		}
 		if errors.Is(err, errStorageDestinationExists) {
-			err = inflight.removeFile(record.name)
-			if err == nil || errors.Is(err, fs.ErrNotExist) {
+			err = retireExactDuplicateSpoolRecord(inflight, queue, record)
+			if err == nil {
 				continue
 			}
 		}
@@ -2612,6 +3449,88 @@ func restoreSpoolClaim(root *storageRoot, claim spoolClaim) error {
 		restoreErr = errors.Join(restoreErr, err)
 	}
 	return restoreErr
+}
+
+func retireExactDuplicateSpoolRecord(source, destination *storageDir, record spoolRecord) error {
+	if source == nil || destination == nil || record.name != eventFileName(record.event.EventID) ||
+		record.bytes == 0 || record.bytes > maximumEventBytes || record.incarnation == (recordIncarnation{}) {
+		return errors.New("productmetrics: invalid duplicate spool record")
+	}
+	want, err := EncodeEvent(record.event)
+	if err != nil || uint64(len(want)) != record.bytes {
+		return errors.Join(err, errors.New("productmetrics: invalid duplicate spool record bytes"))
+	}
+	destinationData, destinationLease, err := destination.readFileLease(record.name, int64(maximumEventBytes))
+	if err != nil || destinationLease == nil {
+		if destinationLease != nil {
+			err = errors.Join(err, destinationLease.Close())
+		}
+		return errors.Join(err, errors.New("productmetrics: cannot prove duplicate queue destination"))
+	}
+	if !bytes.Equal(destinationData, want) {
+		return errors.Join(destinationLease.Close(), errors.New("productmetrics: queue destination does not match inflight record"))
+	}
+	if err := destination.validateFileMatchingLease(record.name, destinationLease); err != nil {
+		return errors.Join(err, destinationLease.Close(), errors.New("productmetrics: queue destination identity is unsafe"))
+	}
+	sourceData, sourceLease, err := source.readFileLease(record.name, int64(maximumEventBytes))
+	if err != nil || sourceLease == nil {
+		if sourceLease != nil {
+			err = errors.Join(err, sourceLease.Close())
+		}
+		return errors.Join(err, destinationLease.Close(), errors.New("productmetrics: cannot prove duplicate inflight source"))
+	}
+	if !bytes.Equal(sourceData, want) || sourceLease.incarnation() != record.incarnation {
+		return errors.Join(sourceLease.Close(), destinationLease.Close(),
+			errors.New("productmetrics: duplicate spool identities changed before retirement"))
+	}
+	if err := source.validateFileMatchingLease(record.name, sourceLease); err != nil {
+		return errors.Join(err, sourceLease.Close(), destinationLease.Close(),
+			errors.New("productmetrics: duplicate inflight source identity is unsafe"))
+	}
+	if err := destination.validateFileMatchingLease(record.name, destinationLease); err != nil {
+		return errors.Join(err, sourceLease.Close(), destinationLease.Close(),
+			errors.New("productmetrics: duplicate queue destination identity changed before retirement"))
+	}
+	if err := revalidateDuplicateSpoolDestination(destination, record.name, want, destinationLease); err != nil {
+		return errors.Join(err, sourceLease.Close(), destinationLease.Close(),
+			errors.New("productmetrics: duplicate queue destination changed before source-authoritative exchange"))
+	}
+	exchangeResult, exchangeErr := source.exchangeFilesMatchingLeases(
+		record.name, sourceLease, destination, record.name, destinationLease,
+	)
+	if exchangeErr != nil {
+		return errors.Join(exchangeErr, sourceLease.Close(), destinationLease.Close())
+	}
+	if exchangeResult.state != storageRenameAppliedDurable {
+		return errors.Join(sourceLease.Close(), destinationLease.Close(),
+			errors.New("productmetrics: duplicate spool exchange was not durable"))
+	}
+	// The exact claimed source is now authoritative at queue. The old queue
+	// destination is displaced to inflight and may be deleted only after the
+	// two-parent exchange is durable and queue still names the claimed source.
+	removeErr := source.removeFileMatchingLeaseGuarded(record.name, destinationLease, func() error {
+		return revalidateDuplicateSpoolDestination(destination, record.name, want, sourceLease)
+	})
+	return errors.Join(removeErr, sourceLease.Close(), destinationLease.Close())
+}
+
+func revalidateDuplicateSpoolDestination(destination *storageDir, name string, want []byte, expected *storageRecordLease) error {
+	if destination == nil || expected == nil {
+		return errors.New("productmetrics: missing duplicate queue destination authority")
+	}
+	data, current, err := destination.readFileLease(name, int64(maximumEventBytes))
+	if err != nil || current == nil {
+		if current != nil {
+			err = errors.Join(err, current.Close())
+		}
+		return errors.Join(err, errors.New("productmetrics: duplicate queue destination cannot be revalidated"))
+	}
+	defer func() { _ = current.Close() }()
+	if !bytes.Equal(data, want) || !expected.Matches(current) {
+		return errors.New("productmetrics: duplicate queue destination changed before source retirement")
+	}
+	return destination.validateFileMatchingLease(name, current)
 }
 
 func queuedRecordMatches(queue *storageDir, record spoolRecord) bool {
@@ -2648,7 +3567,7 @@ func deleteSpoolClaim(root *storageRoot, claim spoolClaim) error {
 	var deleteErr error
 	for _, record := range claim.records {
 		if record.generation != claim.generation || record.name != eventFileName(record.event.EventID) ||
-			record.bytes == 0 || record.bytes > maximumEventBytes {
+			record.bytes == 0 || record.bytes > maximumEventBytes || record.incarnation == (recordIncarnation{}) {
 			deleteErr = errors.Join(deleteErr, errors.New("productmetrics: malformed claimed record"))
 			continue
 		}
@@ -2720,6 +3639,9 @@ func deleteOneClaimedRecord(root *storageRoot, inflight *storageDir, generation 
 	}
 	if lease == nil {
 		return false, errors.New("productmetrics: claimed event read returned no record lease")
+	}
+	if lease.incarnation() != record.incarnation {
+		return false, errors.Join(errors.New("productmetrics: claimed event incarnation changed before deletion"), closeLease())
 	}
 	removeErr := inflight.removeFileMatchingLease(record.name, lease)
 	closeErr := lease.Close()

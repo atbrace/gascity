@@ -3,6 +3,7 @@
 package productmetrics
 
 import (
+	"bytes"
 	"errors"
 	"fmt"
 	"io"
@@ -524,6 +525,25 @@ func (directory *unixStorageDirectory) openDir(components []string, create bool)
 	currentPath := directory.path
 	for _, component := range components {
 		nextPath := filepath.Join(currentPath, component)
+		parentMetadata, metadataErr := metadataForFD(currentFD, currentPath, directory.hooks)
+		if metadataErr != nil {
+			_ = unix.Close(currentFD)
+			return nil, metadataErr
+		}
+		// Existing descendants are inspected before openat so a mount boundary
+		// is rejected without opening it or doing any work below it. A missing
+		// component may still be created; the opened descriptor and named entry
+		// are independently revalidated against this retained parent afterward.
+		preOpen, metadataErr := metadataAt(currentFD, component, nextPath, directory.hooks)
+		if metadataErr == nil {
+			if err := requireCleanupSameDevice(parentMetadata, preOpen); err != nil {
+				_ = unix.Close(currentFD)
+				return nil, storagePathError("inspect private directory boundary", nextPath, err)
+			}
+		} else if !errors.Is(metadataErr, fs.ErrNotExist) {
+			_ = unix.Close(currentFD)
+			return nil, storagePathError("inspect private directory before open", nextPath, metadataErr)
+		}
 		nextFD, created, openErr := openDirectoryComponent(currentFD, component, create, false, directory.euid, directory.hooks, nextPath)
 		if openErr != nil {
 			_ = unix.Close(currentFD)
@@ -533,7 +553,9 @@ func (directory *unixStorageDirectory) openDir(components []string, create bool)
 		if created {
 			componentHooks.decisionGate = nil
 		}
-		if err := validateAndRevalidatePrivateComponent(currentFD, component, nextFD, nextPath, directory.euid, created, componentHooks); err != nil {
+		if err := validateAndRevalidatePrivateComponent(
+			currentFD, parentMetadata, component, nextFD, nextPath, directory.euid, created, componentHooks,
+		); err != nil {
 			_ = unix.Close(nextFD)
 			_ = unix.Close(currentFD)
 			return nil, err
@@ -582,7 +604,16 @@ func (directory *unixStorageDirectory) openDir(components []string, create bool)
 	}, nil
 }
 
-func validateAndRevalidatePrivateComponent(parentFD int, name string, fd int, path string, euid uint32, exactMode bool, hooks storageTestHooks) error {
+func validateAndRevalidatePrivateComponent(
+	parentFD int,
+	parentMetadata storageMetadata,
+	name string,
+	fd int,
+	path string,
+	euid uint32,
+	exactMode bool,
+	hooks storageTestHooks,
+) error {
 	if err := hooks.canStartStorageWork(); err != nil {
 		return err
 	}
@@ -590,11 +621,33 @@ func validateAndRevalidatePrivateComponent(parentFD int, name string, fd int, pa
 	if err != nil {
 		return err
 	}
+	if err := requireCleanupSameDevice(parentMetadata, metadata); err != nil {
+		return err
+	}
 	if err := validatePrivateDirectory(metadata, path, euid, exactMode); err != nil {
 		return err
 	}
 	hooks.openedComponent(path)
-	return revalidateOpenedDirectory(parentFD, name, fd, path, euid, true, exactMode, hooks)
+	if err := hooks.canStartStorageWork(); err != nil {
+		return err
+	}
+	opened, openedErr := metadataForFD(fd, path, hooks)
+	named, namedErr := metadataAt(parentFD, name, path, hooks)
+	if openedErr != nil {
+		return openedErr
+	}
+	if namedErr != nil {
+		return storagePathError("revalidate directory entry", path, namedErr)
+	}
+	if opened.dev != named.dev || opened.ino != named.ino {
+		return fmt.Errorf("productmetrics: directory entry %q changed after descriptor validation", path)
+	}
+	return errors.Join(
+		requireCleanupSameDevice(parentMetadata, opened),
+		requireCleanupSameDevice(parentMetadata, named),
+		validatePrivateDirectory(opened, path, euid, exactMode),
+		validatePrivateDirectory(named, path, euid, exactMode),
+	)
 }
 
 func (directory *unixStorageDirectory) iterateEntries() (storageIteratorBackend, error) {
@@ -774,6 +827,36 @@ func (directory *unixStorageDirectory) lookupEntry(name string) (storageEntry, e
 	return storageEntry{name: name, nameBytes: len(name), metadata: metadata}, nil
 }
 
+func (directory *unixStorageDirectory) validateFileMatching(name string, expected recordIncarnation) error {
+	if expected == (recordIncarnation{}) {
+		return errors.New("productmetrics: invalid expected record incarnation for validation")
+	}
+	directoryFD, err := directory.duplicateFD()
+	if err != nil {
+		return err
+	}
+	defer closeUnixFD(directoryFD)
+	path := filepath.Join(directory.path, name)
+	entry, err := metadataAt(directoryFD, name, path, directory.hooks)
+	if err != nil {
+		return storagePathError("revalidate leased file", path, err)
+	}
+	parent, err := metadataForFD(directoryFD, directory.path, directory.hooks)
+	if err != nil {
+		return err
+	}
+	if err := requireCleanupSameDevice(parent, entry); err != nil {
+		return err
+	}
+	if err := validatePrivateRegularFile(entry, path, directory.euid, false); err != nil {
+		return err
+	}
+	if entry.dev != expected.dev || entry.ino != expected.ino {
+		return storagePathError("revalidate leased file", path, errStorageEntryChanged)
+	}
+	return nil
+}
+
 func (directory *unixStorageDirectory) openEnumeratedCleanupDirectory(entry storageEntry) (storageDirectoryBackend, error) {
 	if !directory.mutable {
 		return nil, errors.New("productmetrics: read-only storage cannot open a cleanup directory")
@@ -784,6 +867,13 @@ func (directory *unixStorageDirectory) openEnumeratedCleanupDirectory(entry stor
 	}
 	defer closeUnixFD(parentFD)
 	path := filepath.Join(directory.path, entry.name)
+	parent, err := metadataForFD(parentFD, directory.path, directory.hooks)
+	if err != nil {
+		return nil, err
+	}
+	if err := requireCleanupSameDevice(parent, entry.metadata); err != nil {
+		return nil, err
+	}
 	current, missing, err := inspectEnumeratedEntry(parentFD, entry, path, directory.hooks)
 	if err != nil {
 		return nil, err
@@ -793,6 +883,9 @@ func (directory *unixStorageDirectory) openEnumeratedCleanupDirectory(entry stor
 	}
 	if current.mode&unix.S_IFMT != unix.S_IFDIR {
 		return nil, fmt.Errorf("productmetrics: cleanup entry %q is not a directory", path)
+	}
+	if err := requireCleanupSameDevice(parent, current); err != nil {
+		return nil, err
 	}
 	childFD, err := openDirectoryAt(parentFD, entry.name, directory.hooks, path, true)
 	if err != nil {
@@ -804,6 +897,10 @@ func (directory *unixStorageDirectory) openEnumeratedCleanupDirectory(entry stor
 		opened.dev != current.dev || opened.ino != current.ino || named.dev != current.dev || named.ino != current.ino {
 		_ = unix.Close(childFD)
 		return nil, errors.Join(openedErr, namedErr, errors.New("productmetrics: cleanup directory entry changed while opening"))
+	}
+	if err := errors.Join(requireCleanupSameDevice(parent, opened), requireCleanupSameDevice(parent, named)); err != nil {
+		_ = unix.Close(childFD)
+		return nil, err
 	}
 	// A prior cleanup mutation may have applied but lost its parent-sync
 	// acknowledgement to a crash. Before trusting this exact retained child for
@@ -833,6 +930,13 @@ func wrapStorageSyncError(operation string, err error) error {
 	return fmt.Errorf("productmetrics: %s: %w", operation, err)
 }
 
+func requireCleanupSameDevice(parent, child storageMetadata) error {
+	if parent.dev == child.dev {
+		return nil
+	}
+	return fmt.Errorf("productmetrics: cleanup refuses to cross a filesystem boundary: %w", unix.EXDEV)
+}
+
 func (directory *unixStorageDirectory) readFile(name string, maximumBytes int64) ([]byte, error) {
 	data, lease, _, err := directory.readFileLease(name, maximumBytes)
 	if lease != nil {
@@ -858,6 +962,20 @@ func (directory *unixStorageDirectory) readFileLeaseWithHooks(name string, maxim
 	}
 	defer closeUnixFD(directoryFD)
 	path := filepath.Join(directory.path, name)
+	parentMetadata, err := metadataForFD(directoryFD, directory.path, hooks)
+	if err != nil {
+		return nil, nil, storageMetadata{}, err
+	}
+	preOpen, err := metadataAt(directoryFD, name, path, hooks)
+	if err != nil {
+		return nil, nil, storageMetadata{}, storagePathError("inspect file before open", path, err)
+	}
+	if err := errors.Join(
+		requireCleanupSameDevice(parentMetadata, preOpen),
+		validatePrivateRegularFile(preOpen, path, directory.euid, false),
+	); err != nil {
+		return nil, nil, storageMetadata{}, err
+	}
 	fileFD, err := openFileAtGated(directoryFD, name, unixFileReadFlags, 0, hooks)
 	if err != nil {
 		return nil, nil, storageMetadata{}, storagePathError("open file", path, err)
@@ -925,8 +1043,15 @@ func openDirectoryAt(directoryFD int, name string, hooks storageTestHooks, path 
 
 //nolint:unparam // Metadata result preserves the shared validator contract used by stable lock callers.
 func validateOpenedRegularFile(directoryFD int, name string, fileFD int, path string, euid uint32, exactMode bool, hooks storageTestHooks) (storageMetadata, error) {
+	parent, err := metadataForFD(directoryFD, filepath.Dir(path), hooks)
+	if err != nil {
+		return storageMetadata{}, err
+	}
 	metadata, err := metadataForFD(fileFD, path, hooks)
 	if err != nil {
+		return storageMetadata{}, err
+	}
+	if err := requireCleanupSameDevice(parent, metadata); err != nil {
 		return storageMetadata{}, err
 	}
 	if err := validatePrivateRegularFile(metadata, path, euid, exactMode); err != nil {
@@ -938,6 +1063,9 @@ func validateOpenedRegularFile(directoryFD int, name string, fileFD int, path st
 	}
 	if named.dev != metadata.dev || named.ino != metadata.ino {
 		return storageMetadata{}, fmt.Errorf("productmetrics: file entry %q changed after descriptor validation", path)
+	}
+	if err := requireCleanupSameDevice(parent, named); err != nil {
+		return storageMetadata{}, err
 	}
 	if err := validatePrivateRegularFile(named, path, euid, exactMode); err != nil {
 		return storageMetadata{}, err
@@ -949,8 +1077,15 @@ func validateOpenedRegularFileGated(directoryFD int, name string, fileFD int, pa
 	if err := hooks.canStartStorageWork(); err != nil {
 		return storageMetadata{}, err
 	}
+	parent, err := metadataForFD(directoryFD, filepath.Dir(path), hooks)
+	if err != nil {
+		return storageMetadata{}, err
+	}
 	metadata, err := metadataForFD(fileFD, path, hooks)
 	if err != nil {
+		return storageMetadata{}, err
+	}
+	if err := requireCleanupSameDevice(parent, metadata); err != nil {
 		return storageMetadata{}, err
 	}
 	if err := validatePrivateRegularFile(metadata, path, euid, exactMode); err != nil {
@@ -965,6 +1100,9 @@ func validateOpenedRegularFileGated(directoryFD int, name string, fileFD int, pa
 	}
 	if named.dev != metadata.dev || named.ino != metadata.ino {
 		return storageMetadata{}, fmt.Errorf("productmetrics: file entry %q changed after descriptor validation", path)
+	}
+	if err := requireCleanupSameDevice(parent, named); err != nil {
+		return storageMetadata{}, err
 	}
 	if err := validatePrivateRegularFile(named, path, euid, exactMode); err != nil {
 		return storageMetadata{}, err
@@ -1028,6 +1166,332 @@ func (directory *unixStorageDirectory) writeFileAtomicNoReplace(name string, dat
 	return err
 }
 
+type rootTempJournalMarker struct {
+	root     *unixStorageDirectory
+	journal  *unixStorageDirectory
+	name     string
+	metadata storageMetadata
+	expected []byte
+}
+
+func (directory *unixStorageDirectory) openRootTempJournal() (*unixStorageDirectory, error) {
+	backend, err := directory.openDir([]string{rootTempJournalDirectoryName}, true)
+	if err != nil {
+		return nil, err
+	}
+	journal, ok := backend.(*unixStorageDirectory)
+	if !ok {
+		_ = backend.close()
+		return nil, errors.New("productmetrics: incompatible root-temp journal directory")
+	}
+	rootFD, rootErr := directory.duplicateFD()
+	journalFD, journalErr := journal.duplicateFD()
+	if rootErr != nil || journalErr != nil {
+		if rootFD >= 0 {
+			_ = unix.Close(rootFD)
+		}
+		if journalFD >= 0 {
+			_ = unix.Close(journalFD)
+		}
+		_ = journal.close()
+		return nil, errors.Join(rootErr, journalErr)
+	}
+	rootMetadata, rootMetadataErr := metadataForFD(rootFD, directory.path, directory.hooks)
+	journalMetadata, journalMetadataErr := metadataForFD(journalFD, journal.path, directory.hooks)
+	_ = unix.Close(rootFD)
+	_ = unix.Close(journalFD)
+	if rootMetadataErr != nil || journalMetadataErr != nil {
+		_ = journal.close()
+		return nil, errors.Join(rootMetadataErr, journalMetadataErr)
+	}
+	if err := requireCleanupSameDevice(rootMetadata, journalMetadata); err != nil {
+		_ = journal.close()
+		return nil, err
+	}
+	return journal, nil
+}
+
+func createRootTempJournalMarker(root, journal *unixStorageDirectory, name string) (*rootTempJournalMarker, error) {
+	if root == nil || journal == nil || !root.rootDirectory {
+		return nil, errStorageClosed
+	}
+	journalFD, err := journal.duplicateFD()
+	if err != nil {
+		return nil, err
+	}
+	defer closeUnixFD(journalFD)
+	path := filepath.Join(journal.path, name)
+	journal.hooks.preparingMutation(storageStepMarkerCreate, path)
+	if err := journal.hooks.canStartStorageWork(); err != nil {
+		return nil, err
+	}
+	if err := journal.hooks.run(storageStepMarkerCreate); err != nil {
+		return nil, err
+	}
+	markerFD, err := openFileAt(journalFD, name, unixFileWriteFlags|unix.O_CREAT|unix.O_EXCL, 0o600)
+	if err != nil {
+		return nil, err
+	}
+	closeMarker := true
+	defer func() {
+		if closeMarker {
+			_ = unix.Close(markerFD)
+		}
+	}()
+	if err := unix.Fchmod(markerFD, 0o600); err != nil {
+		return nil, fmt.Errorf("productmetrics: set root-temp marker mode: %w", err)
+	}
+	metadata, err := validateOpenedRegularFile(journalFD, name, markerFD, path, journal.euid, true, journal.hooks)
+	if err != nil {
+		return nil, err
+	}
+	if err := syncFileFD(markerFD, journal.hooks); err != nil {
+		return nil, fmt.Errorf("productmetrics: sync root-temp marker: %w", err)
+	}
+	if err := unix.Close(markerFD); err != nil {
+		closeMarker = false
+		return nil, fmt.Errorf("productmetrics: close root-temp marker: %w", err)
+	}
+	closeMarker = false
+	if err := syncDirectoryFD(journalFD, journal.hooks); err != nil {
+		return nil, fmt.Errorf("productmetrics: sync root-temp journal: %w", err)
+	}
+	marker := &rootTempJournalMarker{root: root, journal: journal, name: name, metadata: metadata}
+	if err := marker.revalidateJournal(); err != nil {
+		return nil, err
+	}
+	return marker, nil
+}
+
+func (marker *rootTempJournalMarker) revalidateJournal() error {
+	if marker == nil || marker.root == nil || marker.journal == nil {
+		return errStorageClosed
+	}
+	rootFD, rootErr := marker.root.duplicateFD()
+	journalFD, journalErr := marker.journal.duplicateFD()
+	if rootErr != nil || journalErr != nil {
+		if rootFD >= 0 {
+			_ = unix.Close(rootFD)
+		}
+		if journalFD >= 0 {
+			_ = unix.Close(journalFD)
+		}
+		return errors.Join(rootErr, journalErr)
+	}
+	defer closeUnixFD(rootFD)
+	defer closeUnixFD(journalFD)
+	opened, openedErr := metadataForFD(journalFD, marker.journal.path, marker.journal.hooks)
+	named, namedErr := metadataAt(rootFD, rootTempJournalDirectoryName, marker.journal.path, marker.root.hooks)
+	if openedErr != nil || namedErr != nil {
+		return errors.Join(openedErr, namedErr)
+	}
+	if err := errors.Join(
+		validatePrivateDirectory(opened, marker.journal.path, marker.root.euid, false),
+		validatePrivateDirectory(named, marker.journal.path, marker.root.euid, false),
+		requireCleanupSameDevice(named, opened),
+	); err != nil {
+		return err
+	}
+	if opened.dev != named.dev || opened.ino != named.ino {
+		return fmt.Errorf("%w: root temporary-file journal changed after marker durability", errStorageEntryChanged)
+	}
+	markerPath := filepath.Join(marker.journal.path, marker.name)
+	namedMarker, markerErr := metadataAt(journalFD, marker.name, markerPath, marker.journal.hooks)
+	if markerErr != nil {
+		return markerErr
+	}
+	if err := errors.Join(
+		validatePrivateRegularFile(namedMarker, markerPath, marker.root.euid, false),
+		requireCleanupSameDevice(opened, namedMarker),
+	); err != nil {
+		return err
+	}
+	if namedMarker.dev != marker.metadata.dev || namedMarker.ino != marker.metadata.ino {
+		return fmt.Errorf("%w: root temporary-file marker changed after durability", errStorageEntryChanged)
+	}
+	return nil
+}
+
+func (marker *rootTempJournalMarker) bindTemp(temp storageMetadata) error {
+	if marker == nil || marker.root == nil || marker.journal == nil {
+		return errStorageClosed
+	}
+	if err := marker.revalidateJournal(); err != nil {
+		return err
+	}
+	binding, err := encodeBoundRootTempJournalMarker(marker.name, recordIncarnation{dev: temp.dev, ino: temp.ino})
+	if err != nil {
+		return err
+	}
+	journalFD, err := marker.journal.duplicateFD()
+	if err != nil {
+		return err
+	}
+	defer closeUnixFD(journalFD)
+	path := filepath.Join(marker.journal.path, marker.name)
+	markerFD, err := openFileAtGated(journalFD, marker.name, unixFileWriteFlags, 0, marker.journal.hooks)
+	if err != nil {
+		return storagePathError("open root temporary-file marker for binding", path, err)
+	}
+	closeMarker := true
+	defer func() {
+		if closeMarker {
+			_ = unix.Close(markerFD)
+		}
+	}()
+	opened, err := validateOpenedRegularFileGated(journalFD, marker.name, markerFD, path, marker.journal.euid, true, marker.journal.hooks)
+	if err != nil {
+		return err
+	}
+	if opened.dev != marker.metadata.dev || opened.ino != marker.metadata.ino || opened.size != 0 ||
+		opened.dev != temp.dev {
+		return fmt.Errorf("%w: root temporary-file intent changed before binding", errStorageEntryChanged)
+	}
+	bindingHooks := marker.journal.hooks.markerBindingHooks()
+	if err := writeAllFDGuarded(markerFD, binding, bindingHooks, func() error {
+		return marker.revalidateIntent(temp)
+	}); err != nil {
+		return fmt.Errorf("productmetrics: bind root temporary-file marker: %w", err)
+	}
+	marker.expected = append([]byte(nil), binding...)
+	if err := syncFileFD(markerFD, bindingHooks); err != nil {
+		return fmt.Errorf("productmetrics: sync bound root temporary-file marker: %w", err)
+	}
+	if err := unix.Close(markerFD); err != nil {
+		closeMarker = false
+		return fmt.Errorf("productmetrics: close bound root temporary-file marker: %w", err)
+	}
+	closeMarker = false
+	if err := syncDirectoryFD(journalFD, marker.journal.hooks); err != nil {
+		return fmt.Errorf("productmetrics: sync bound root temporary-file journal: %w", err)
+	}
+	return marker.revalidateBound(temp)
+}
+
+func (marker *rootTempJournalMarker) revalidateBound(temp storageMetadata) error {
+	if marker == nil || marker.root == nil || marker.journal == nil {
+		return errStorageClosed
+	}
+	evidence, err := marker.revalidateExpectedMarker()
+	if err != nil || evidence.state != rootTempJournalMarkerBound ||
+		evidence.temp != (recordIncarnation{dev: temp.dev, ino: temp.ino}) || marker.metadata.dev != temp.dev {
+		return errors.Join(err, errStorageEntryChanged)
+	}
+	if err := marker.revalidateTemp(temp); err != nil {
+		return err
+	}
+	second, err := marker.revalidateExpectedMarker()
+	if err != nil || second != evidence {
+		return errors.Join(err, errStorageEntryChanged)
+	}
+	return marker.revalidateTemp(temp)
+}
+
+func (marker *rootTempJournalMarker) revalidateIntent(temp storageMetadata) error {
+	evidence, err := marker.revalidateExpectedMarker()
+	if err != nil || evidence.state != rootTempJournalMarkerIntent || marker.metadata.dev != temp.dev {
+		return errors.Join(err, errStorageEntryChanged)
+	}
+	if err := marker.revalidateTemp(temp); err != nil {
+		return err
+	}
+	second, err := marker.revalidateExpectedMarker()
+	if err != nil || second != evidence {
+		return errors.Join(err, errStorageEntryChanged)
+	}
+	return marker.revalidateTemp(temp)
+}
+
+func (marker *rootTempJournalMarker) revalidateExpectedMarker() (rootTempJournalMarkerEvidence, error) {
+	if marker == nil || marker.root == nil || marker.journal == nil {
+		return rootTempJournalMarkerEvidence{}, errStorageClosed
+	}
+	if err := marker.revalidateJournal(); err != nil {
+		return rootTempJournalMarkerEvidence{}, err
+	}
+	data, backend, metadata, err := marker.journal.readFileLease(marker.name, maximumRootTempJournalMarkerBytes)
+	if backend != nil {
+		defer func() { _ = backend.close() }()
+	}
+	if err != nil || metadata.dev != marker.metadata.dev || metadata.ino != marker.metadata.ino ||
+		!bytes.Equal(data, marker.expected) {
+		return rootTempJournalMarkerEvidence{}, errors.Join(err, errStorageEntryChanged)
+	}
+	evidence, err := decodeRootTempJournalMarker(marker.name, data)
+	if err != nil {
+		return rootTempJournalMarkerEvidence{}, errors.Join(err, errStorageEntryChanged)
+	}
+	if err := marker.revalidateJournal(); err != nil {
+		return rootTempJournalMarkerEvidence{}, err
+	}
+	return evidence, nil
+}
+
+func (marker *rootTempJournalMarker) revalidateTemp(temp storageMetadata) error {
+	rootFD, err := marker.root.duplicateFD()
+	if err != nil {
+		return err
+	}
+	defer closeUnixFD(rootFD)
+	tempPath := filepath.Join(marker.root.path, marker.name)
+	namedTemp, err := metadataAt(rootFD, marker.name, tempPath, marker.root.hooks)
+	if err != nil {
+		return err
+	}
+	rootMetadata, rootErr := metadataForFD(rootFD, marker.root.path, marker.root.hooks)
+	if err := errors.Join(
+		rootErr,
+		validatePrivateRegularFile(namedTemp, tempPath, marker.root.euid, true),
+		requireCleanupSameDevice(rootMetadata, namedTemp),
+	); err != nil {
+		return err
+	}
+	if !sameStorageIdentity(namedTemp, temp) {
+		return fmt.Errorf("%w: root temporary file changed after binding", errStorageEntryChanged)
+	}
+	return nil
+}
+
+func (marker *rootTempJournalMarker) close() error {
+	if marker == nil || marker.journal == nil {
+		return nil
+	}
+	journal := marker.journal
+	marker.journal = nil
+	return journal.close()
+}
+
+func (marker *rootTempJournalMarker) remove() error {
+	if marker == nil || marker.journal == nil {
+		return errStorageClosed
+	}
+	if _, err := marker.revalidateExpectedMarker(); err != nil {
+		return err
+	}
+	expected := recordIncarnation{dev: marker.metadata.dev, ino: marker.metadata.ino}
+	return marker.journal.removeFileMatchingGuarded(marker.name, expected, func() error {
+		return marker.revalidateRetirement()
+	})
+}
+
+func (marker *rootTempJournalMarker) revalidateRetirement() error {
+	evidence, err := marker.revalidateExpectedMarker()
+	if err != nil {
+		return err
+	}
+	if evidence.state != rootTempJournalMarkerBound {
+		return nil
+	}
+	if err := marker.root.confirmEntryAbsent(marker.name); err != nil {
+		return err
+	}
+	second, err := marker.revalidateExpectedMarker()
+	if err != nil || second != evidence {
+		return errors.Join(err, errStorageEntryChanged)
+	}
+	return marker.root.confirmEntryAbsent(marker.name)
+}
+
 func (directory *unixStorageDirectory) writeFileAtomically(name string, data []byte, noReplace bool) (result storageWriteResult, returnErr error) {
 	result.state = storageWriteNotApplied
 	if !directory.mutable {
@@ -1053,25 +1517,59 @@ func (directory *unixStorageDirectory) writeFileAtomically(name string, data []b
 		}
 	}
 
-	tempName, tempFD, err := createPrivateTempFile(directoryFD, directory.path, directory.euid, directory.hooks)
+	tempName, tempFD, tempCreationMetadata, marker, err := directory.createAtomicWriteTemp(directoryFD)
 	if err != nil {
 		return result, err
 	}
 	tempExists := true
+	installMayHaveApplied := false
 	defer func() {
 		if tempFD >= 0 {
 			returnErr = errors.Join(returnErr, unix.Close(tempFD))
 		}
-		if tempExists {
-			if err := unix.Unlinkat(directoryFD, tempName, 0); err == nil {
-				returnErr = errors.Join(returnErr, syncDirectoryFD(directoryFD, directory.hooks))
-			} else if !errors.Is(err, fs.ErrNotExist) {
-				returnErr = errors.Join(returnErr, fmt.Errorf("productmetrics: remove temporary file: %w", err))
+		if marker == nil {
+			if tempExists {
+				if err := unix.Unlinkat(directoryFD, tempName, 0); err == nil {
+					returnErr = errors.Join(returnErr, syncDirectoryFD(directoryFD, directory.hooks))
+				} else if !errors.Is(err, fs.ErrNotExist) {
+					returnErr = errors.Join(returnErr, fmt.Errorf("productmetrics: remove temporary file: %w", err))
+				}
 			}
+			return
+		}
+		defer func() { _ = marker.close() }()
+		if result.state == storageWriteAppliedDurable {
+			_ = marker.remove()
+			return
+		}
+		if installMayHaveApplied {
+			return
+		}
+		if tempExists {
+			if bindingErr := marker.revalidateBound(tempCreationMetadata); bindingErr != nil {
+				returnErr = errors.Join(returnErr, bindingErr)
+				return
+			}
+			expected := recordIncarnation{dev: tempCreationMetadata.dev, ino: tempCreationMetadata.ino}
+			if cleanupErr := directory.removeFileMatchingGuarded(tempName, expected, func() error {
+				return marker.revalidateBound(tempCreationMetadata)
+			}); cleanupErr != nil {
+				returnErr = errors.Join(returnErr, cleanupErr)
+				return
+			}
+			tempExists = false
+		}
+		if markerErr := marker.remove(); markerErr != nil {
+			returnErr = errors.Join(returnErr, markerErr)
+			return
 		}
 	}()
 
-	if err := writeAllFD(tempFD, data, directory.hooks); err != nil {
+	var payloadGuard func() error
+	if marker != nil {
+		payloadGuard = func() error { return marker.revalidateBound(tempCreationMetadata) }
+	}
+	if err := writeAllFDGuarded(tempFD, data, directory.hooks, payloadGuard); err != nil {
 		return result, fmt.Errorf("productmetrics: write temporary file: %w", err)
 	}
 	if err := syncFileFD(tempFD, directory.hooks); err != nil {
@@ -1086,12 +1584,19 @@ func (directory *unixStorageDirectory) writeFileAtomically(name string, data []b
 	if metadataErr != nil {
 		return result, metadataErr
 	}
+	if marker != nil {
+		if err := marker.revalidateBound(tempMetadata); err != nil {
+			return result, err
+		}
+	}
 	if noReplace {
-		outcome, installErr := renameNoReplaceAt(directoryFD, tempName, tempMetadata, directoryFD, name, directory.hooks)
+		outcome, installErr := renameNoReplaceAtGuarded(directoryFD, tempName, tempMetadata, directoryFD, name,
+			directory.hooks, payloadGuard)
 		if outcome == noReplaceNotApplied {
 			return result, storagePathError("install no-replace file", path, installErr)
 		}
 		result.state = storageWriteAppliedSyncPending
+		installMayHaveApplied = true
 		if outcome == noReplaceApplied {
 			tempExists = false
 		}
@@ -1100,12 +1605,13 @@ func (directory *unixStorageDirectory) writeFileAtomically(name string, data []b
 			return result, storagePathError("install no-replace file", path, err)
 		}
 	} else {
-		outcome, renameErr := renameReplaceAt(directoryFD, tempName, tempMetadata, directoryFD, name,
-			replacedMetadata, replacedPresent, directory.hooks)
+		outcome, renameErr := renameReplaceAtGuarded(directoryFD, tempName, tempMetadata, directoryFD, name,
+			replacedMetadata, replacedPresent, directory.hooks, payloadGuard)
 		if outcome == noReplaceNotApplied {
 			return result, storagePathError("rename temporary file", path, renameErr)
 		}
 		result.state = storageWriteAppliedSyncPending
+		installMayHaveApplied = true
 		if outcome == noReplaceApplied {
 			tempExists = false
 		}
@@ -1118,6 +1624,73 @@ func (directory *unixStorageDirectory) writeFileAtomically(name string, data []b
 	return result, nil
 }
 
+func (directory *unixStorageDirectory) createAtomicWriteTemp(directoryFD int) (string, int, storageMetadata, *rootTempJournalMarker, error) {
+	if !directory.rootDirectory {
+		name, fd, err := createPrivateTempFile(directoryFD, directory.path, directory.euid, directory.hooks)
+		return name, fd, storageMetadata{}, nil, err
+	}
+	journal, err := directory.openRootTempJournal()
+	if err != nil {
+		return "", -1, storageMetadata{}, nil, err
+	}
+	for attempts := 0; attempts < maximumStorageTempAttempts; {
+		if err := directory.hooks.canStartStorageWork(); err != nil {
+			_ = journal.close()
+			return "", -1, storageMetadata{}, nil, err
+		}
+		sequence := storageTempSequence.Add(1)
+		if sequence == 0 {
+			continue
+		}
+		attempts++
+		name := fmt.Sprintf(".pm-tmp-%x-%x", os.Getpid(), sequence)
+		marker, markerErr := createRootTempJournalMarker(directory, journal, name)
+		if errors.Is(markerErr, unix.EEXIST) {
+			continue
+		}
+		if markerErr != nil {
+			_ = journal.close()
+			return "", -1, storageMetadata{}, nil, markerErr
+		}
+		directory.hooks.creatingTempFile(filepath.Join(directory.path, name))
+		if bindingErr := marker.revalidateJournal(); bindingErr != nil {
+			removeErr := marker.remove()
+			closeErr := marker.close()
+			return "", -1, storageMetadata{}, nil, errors.Join(bindingErr, removeErr, closeErr)
+		}
+		fd, metadata, createErr := createPrivateTempFileNamed(directoryFD, directory.path, directory.euid, directory.hooks, name)
+		if errors.Is(createErr, unix.EEXIST) {
+			removeErr := marker.remove()
+			closeErr := marker.close()
+			if removeErr != nil || closeErr != nil {
+				return "", -1, storageMetadata{}, nil, errors.Join(createErr, removeErr, closeErr)
+			}
+			journal, err = directory.openRootTempJournal()
+			if err != nil {
+				return "", -1, storageMetadata{}, nil, err
+			}
+			continue
+		}
+		if createErr != nil {
+			_ = marker.close()
+			return "", -1, storageMetadata{}, nil, createErr
+		}
+		if syncErr := syncDirectoryFD(directoryFD, directory.hooks); syncErr != nil {
+			closeErr := unix.Close(fd)
+			markerCloseErr := marker.close()
+			return "", -1, storageMetadata{}, nil, errors.Join(syncErr, closeErr, markerCloseErr)
+		}
+		if bindErr := marker.bindTemp(metadata); bindErr != nil {
+			closeErr := unix.Close(fd)
+			markerCloseErr := marker.close()
+			return "", -1, storageMetadata{}, nil, errors.Join(bindErr, closeErr, markerCloseErr)
+		}
+		return name, fd, metadata, marker, nil
+	}
+	_ = journal.close()
+	return "", -1, storageMetadata{}, nil, errors.New("productmetrics: could not allocate a private temporary file")
+}
+
 type noReplaceOutcome uint8
 
 const (
@@ -1127,42 +1700,73 @@ const (
 )
 
 func createPrivateTempFile(directoryFD int, directoryPath string, euid uint32, hooks storageTestHooks) (string, int, error) {
-	for attempts := 0; attempts < maximumStorageTempAttempts; attempts++ {
+	for attempts := 0; attempts < maximumStorageTempAttempts; {
 		if err := hooks.canStartStorageWork(); err != nil {
 			return "", -1, err
 		}
 		sequence := storageTempSequence.Add(1)
+		if sequence == 0 {
+			continue
+		}
+		attempts++
 		name := fmt.Sprintf(".pm-tmp-%x-%x", os.Getpid(), sequence)
 		hooks.creatingTempFile(filepath.Join(directoryPath, name))
-		fd, err := openFileAt(directoryFD, name, unixFileWriteFlags|unix.O_CREAT|unix.O_EXCL, 0o600)
+		fd, _, err := createPrivateTempFileNamed(directoryFD, directoryPath, euid, hooks, name)
 		if errors.Is(err, unix.EEXIST) {
 			continue
 		}
 		if err != nil {
-			return "", -1, storagePathError("create temporary file", filepath.Join(directoryPath, name), err)
-		}
-		if err := unix.Fchmod(fd, 0o600); err != nil {
-			cleanupErr := discardPrivateTemp(directoryFD, name, fd, hooks)
-			return "", -1, errors.Join(fmt.Errorf("productmetrics: set private temporary-file mode: %w", err), cleanupErr)
-		}
-		if _, err := validateOpenedRegularFile(directoryFD, name, fd, filepath.Join(directoryPath, name), euid, true, hooks); err != nil {
-			return "", -1, errors.Join(err, discardPrivateTemp(directoryFD, name, fd, hooks))
+			return "", -1, err
 		}
 		return name, fd, nil
 	}
 	return "", -1, errors.New("productmetrics: could not allocate a private temporary file")
 }
 
-func discardPrivateTemp(directoryFD int, name string, fileFD int, hooks storageTestHooks) error {
+func createPrivateTempFileNamed(directoryFD int, directoryPath string, euid uint32, hooks storageTestHooks, name string) (int, storageMetadata, error) {
+	path := filepath.Join(directoryPath, name)
+	fd, err := openFileAt(directoryFD, name, unixFileWriteFlags|unix.O_CREAT|unix.O_EXCL, 0o600)
+	if err != nil {
+		return -1, storageMetadata{}, storagePathError("create temporary file", path, err)
+	}
+	if err := unix.Fchmod(fd, 0o600); err != nil {
+		cleanupErr := discardPrivateTemp(directoryFD, directoryPath, name, fd, hooks)
+		return -1, storageMetadata{}, errors.Join(fmt.Errorf("productmetrics: set private temporary-file mode: %w", err), cleanupErr)
+	}
+	metadata, err := validateOpenedRegularFile(directoryFD, name, fd, path, euid, true, hooks)
+	if err != nil {
+		return -1, storageMetadata{}, errors.Join(err, discardPrivateTemp(directoryFD, directoryPath, name, fd, hooks))
+	}
+	return fd, metadata, nil
+}
+
+func discardPrivateTemp(directoryFD int, directoryPath, name string, fileFD int, hooks storageTestHooks) error {
+	path := filepath.Join(directoryPath, name)
+	opened, openedErr := metadataForFD(fileFD, path, storageTestHooks{})
+	if openedErr != nil {
+		return errors.Join(openedErr, unix.Close(fileFD))
+	}
+	named, namedErr := metadataAt(directoryFD, name, path, storageTestHooks{})
+	if namedErr != nil || !sameStorageIdentity(opened, named) {
+		return errors.Join(namedErr, errStorageEntryChanged, unix.Close(fileFD))
+	}
+	hooks.preparingMutation(storageStepDelete, path)
+	if err := hooks.canStartStorageWork(); err != nil {
+		return errors.Join(err, unix.Close(fileFD))
+	}
+	unlinkErr := unlinkAt(directoryFD, name, opened, path, 0, storageStepDelete, hooks)
 	closeErr := unix.Close(fileFD)
-	unlinkErr := unix.Unlinkat(directoryFD, name, 0)
-	if unlinkErr != nil && !errors.Is(unlinkErr, fs.ErrNotExist) {
+	if unlinkErr != nil {
 		return errors.Join(closeErr, fmt.Errorf("productmetrics: remove rejected temporary file: %w", unlinkErr))
 	}
 	return errors.Join(closeErr, syncDirectoryFD(directoryFD, hooks))
 }
 
 func writeAllFD(fd int, data []byte, hooks storageTestHooks) error {
+	return writeAllFDGuarded(fd, data, hooks, nil)
+}
+
+func writeAllFDGuarded(fd int, data []byte, hooks storageTestHooks, guard func() error) error {
 	for {
 		if err := hooks.run(storageStepWrite); err != nil {
 			if errors.Is(err, unix.EINTR) {
@@ -1171,6 +1775,11 @@ func writeAllFD(fd int, data []byte, hooks storageTestHooks) error {
 			return err
 		}
 		break
+	}
+	if guard != nil {
+		if err := guard(); err != nil {
+			return err
+		}
 	}
 	for len(data) > 0 {
 		written, err := unix.Write(fd, data)
@@ -1241,20 +1850,24 @@ func inspectReplaceTarget(directoryFD int, name, path string, euid uint32, hooks
 }
 
 func (directory *unixStorageDirectory) removeFile(name string) error {
-	return directory.removeFileWithHooks(name, directory.hooks, recordIncarnation{})
+	return directory.removeFileWithHooks(name, directory.hooks, recordIncarnation{}, nil)
 }
 
 func (directory *unixStorageDirectory) removeFileClockFree(name string) error {
 	hooks := directory.hooks
 	hooks.decisionGate = nil
-	return directory.removeFileWithHooks(name, hooks, recordIncarnation{})
+	return directory.removeFileWithHooks(name, hooks, recordIncarnation{}, nil)
 }
 
 func (directory *unixStorageDirectory) removeFileMatching(name string, expected recordIncarnation) error {
+	return directory.removeFileMatchingGuarded(name, expected, nil)
+}
+
+func (directory *unixStorageDirectory) removeFileMatchingGuarded(name string, expected recordIncarnation, guard func() error) error {
 	if expected == (recordIncarnation{}) {
 		return errors.New("productmetrics: invalid expected record incarnation for deletion")
 	}
-	return directory.removeFileWithHooks(name, directory.hooks, expected)
+	return directory.removeFileWithHooks(name, directory.hooks, expected, guard)
 }
 
 func (directory *unixStorageDirectory) confirmEntryAbsent(name string) error {
@@ -1283,7 +1896,12 @@ func (directory *unixStorageDirectory) confirmEntryAbsent(name string) error {
 	return nil
 }
 
-func (directory *unixStorageDirectory) removeFileWithHooks(name string, hooks storageTestHooks, expected recordIncarnation) error {
+func (directory *unixStorageDirectory) removeFileWithHooks(
+	name string,
+	hooks storageTestHooks,
+	expected recordIncarnation,
+	guard func() error,
+) error {
 	if !directory.mutable {
 		return errors.New("productmetrics: read-only storage cannot delete")
 	}
@@ -1305,6 +1923,13 @@ func (directory *unixStorageDirectory) removeFileWithHooks(name string, hooks st
 	}
 	if err != nil {
 		return storagePathError("inspect file for deletion", path, err)
+	}
+	parent, err := metadataForFD(directoryFD, directory.path, hooks)
+	if err != nil {
+		return err
+	}
+	if err := requireCleanupSameDevice(parent, metadata); err != nil {
+		return err
 	}
 	if err := validatePrivateRegularFile(metadata, path, directory.euid, false); err != nil {
 		return err
@@ -1330,10 +1955,28 @@ func (directory *unixStorageDirectory) removeFileWithHooks(name string, hooks st
 	if !sameStorageIdentity(current, metadata) {
 		return storagePathError("revalidate file before deletion", path, errStorageEntryChanged)
 	}
+	if err := requireCleanupSameDevice(parent, current); err != nil {
+		return err
+	}
 	if err := validatePrivateRegularFile(current, path, directory.euid, false); err != nil {
 		return err
 	}
 	if err := hooks.canStartStorageWork(); err != nil {
+		return err
+	}
+	if guard != nil {
+		if err := guard(); err != nil {
+			return err
+		}
+	}
+	final, err := metadataAt(directoryFD, name, path, storageTestHooks{})
+	if err != nil || !sameStorageIdentity(final, current) {
+		return storagePathError("final revalidate file before deletion", path, errors.Join(err, errStorageEntryChanged))
+	}
+	if err := requireCleanupSameDevice(parent, final); err != nil {
+		return err
+	}
+	if err := validatePrivateRegularFile(final, path, directory.euid, false); err != nil {
 		return err
 	}
 	if err := unix.Unlinkat(directoryFD, name, 0); err != nil {
@@ -1364,6 +2007,13 @@ func (directory *unixStorageDirectory) unlinkEnumeratedEntry(entry storageEntry)
 	}
 	if missing {
 		return syncMissingEntryParent(directoryFD, directory.hooks)
+	}
+	parent, err := metadataForFD(directoryFD, directory.path, directory.hooks)
+	if err != nil {
+		return err
+	}
+	if err := requireCleanupSameDevice(parent, current); err != nil {
+		return err
 	}
 	if current.mode&unix.S_IFMT == unix.S_IFDIR {
 		return fmt.Errorf("%w: %q", errStorageEntryIsDirectory, path)
@@ -1411,6 +2061,13 @@ func (directory *unixStorageDirectory) removeEnumeratedDirectoryWithPolicy(entry
 	}
 	if missing {
 		return syncMissingEntryParent(directoryFD, directory.hooks)
+	}
+	parent, err := metadataForFD(directoryFD, directory.path, directory.hooks)
+	if err != nil {
+		return err
+	}
+	if err := requireCleanupSameDevice(parent, current); err != nil {
+		return err
 	}
 	if requirePrivate {
 		if err := validatePrivateDirectory(current, path, directory.euid, false); err != nil {
@@ -1651,6 +2308,9 @@ func (directory *unixStorageDirectory) renameEnumeratedEntry(entry storageEntry,
 	if sourceMetadataErr != nil || targetMetadataErr != nil {
 		return notApplied, errors.Join(sourceMetadataErr, targetMetadataErr)
 	}
+	if err := requireCleanupSameDevice(sourceDirectoryMetadata, current); err != nil {
+		return notApplied, err
+	}
 	outcome, renameErr := renameNoReplaceAt(sourceFD, entry.name, current, targetFD, targetName, directory.hooks)
 	if outcome == noReplaceNotApplied {
 		if errors.Is(renameErr, errStorageDestinationExists) {
@@ -1688,6 +2348,33 @@ func syncOneWayRenameParents(
 		return fmt.Errorf("%s: %w", sourceOperation, err)
 	}
 	return nil
+}
+
+func (directory *unixStorageDirectory) exchangeFilesMatching(
+	sourceName string,
+	expectedSource recordIncarnation,
+	targetBackend storageDirectoryBackend,
+	targetName string,
+	expectedTarget recordIncarnation,
+) (storageRenameResult, error) {
+	notApplied := storageRenameResult{state: storageRenameNotApplied}
+	target, ok := targetBackend.(*unixStorageDirectory)
+	if !ok {
+		return notApplied, errors.New("productmetrics: incompatible exact file-exchange target")
+	}
+	source, err := directory.lookupEntry(sourceName)
+	if err != nil {
+		return notApplied, err
+	}
+	targetEntry, err := target.lookupEntry(targetName)
+	if err != nil {
+		return notApplied, err
+	}
+	if (recordIncarnation{dev: source.metadata.dev, ino: source.metadata.ino}) != expectedSource ||
+		(recordIncarnation{dev: targetEntry.metadata.dev, ino: targetEntry.metadata.ino}) != expectedTarget {
+		return notApplied, errStorageEntryChanged
+	}
+	return directory.exchangeEnumeratedEntries(source, target, targetEntry)
 }
 
 func (directory *unixStorageDirectory) exchangeEnumeratedEntries(source storageEntry, targetBackend storageDirectoryBackend, targetEntry storageEntry) (storageRenameResult, error) {
@@ -1745,10 +2432,25 @@ func (directory *unixStorageDirectory) exchangeEnumeratedEntries(source storageE
 	if sourceParentErr != nil || targetParentErr != nil {
 		return notApplied, errors.Join(sourceParentErr, targetParentErr)
 	}
+	if err := errors.Join(
+		requireCleanupSameDevice(sourceParent, currentSource),
+		requireCleanupSameDevice(targetParent, currentTarget),
+		validateExchangeRegularEntry(currentSource, sourcePath, directory.euid),
+		validateExchangeRegularEntry(currentTarget, targetPath, target.euid),
+	); err != nil {
+		return notApplied, err
+	}
+	if sourceParent.dev != targetParent.dev {
+		return notApplied, fmt.Errorf("productmetrics: entry exchange refuses different parent filesystems: %w", unix.EXDEV)
+	}
 	applied := false
 	var exchangeOutcomeErr error
 	for attempts := 0; attempts < 8; attempts++ {
-		exchangeApplied, exchangeErr := exchangeAt(sourceFD, source, sourcePath, targetFD, targetEntry, targetPath, directory.hooks)
+		exchangeApplied, exchangeErr := exchangeAt(
+			sourceFD, source, sourcePath, sourceParent, directory.euid,
+			targetFD, targetEntry, targetPath, targetParent, target.euid,
+			directory.hooks,
+		)
 		if exchangeApplied {
 			postState, inspectErr := inspectExchangePostState(sourceFD, source, sourcePath, targetFD, targetEntry, targetPath)
 			if inspectErr != nil || postState != exchangePostSwapped {
@@ -1802,6 +2504,13 @@ func (directory *unixStorageDirectory) exchangeEnumeratedEntries(source storageE
 		return pending, err
 	}
 	return storageRenameResult{state: storageRenameAppliedDurable}, nil
+}
+
+func validateExchangeRegularEntry(metadata storageMetadata, path string, euid uint32) error {
+	if metadata.mode&unix.S_IFMT != unix.S_IFREG {
+		return nil
+	}
+	return validatePrivateRegularFile(metadata, path, euid, false)
 }
 
 type exchangePostState uint8
@@ -1858,6 +2567,12 @@ func requireAbsentEntry(directoryFD int, name, path string, hooks storageTestHoo
 func renameReplaceAt(sourceFD int, sourceName string, source storageMetadata, targetFD int, targetName string,
 	targetBefore storageMetadata, targetPresent bool, hooks storageTestHooks,
 ) (noReplaceOutcome, error) {
+	return renameReplaceAtGuarded(sourceFD, sourceName, source, targetFD, targetName, targetBefore, targetPresent, hooks, nil)
+}
+
+func renameReplaceAtGuarded(sourceFD int, sourceName string, source storageMetadata, targetFD int, targetName string,
+	targetBefore storageMetadata, targetPresent bool, hooks storageTestHooks, guard func() error,
+) (noReplaceOutcome, error) {
 	for {
 		if err := hooks.canStartStorageWork(); err != nil {
 			return noReplaceNotApplied, err
@@ -1872,6 +2587,9 @@ func renameReplaceAt(sourceFD int, sourceName string, source storageMetadata, ta
 			return noReplaceNotApplied, err
 		}
 		err := hooks.run(storageStepRename)
+		if err == nil && guard != nil {
+			err = guard()
+		}
 		if err == nil {
 			err = unix.Renameat(sourceFD, sourceName, targetFD, targetName)
 		}
@@ -1915,6 +2633,12 @@ func inspectReplaceRenamePostState(sourceFD int, sourceName string, source stora
 }
 
 func renameNoReplaceAt(sourceFD int, sourceName string, source storageMetadata, targetFD int, targetName string, hooks storageTestHooks) (noReplaceOutcome, error) {
+	return renameNoReplaceAtGuarded(sourceFD, sourceName, source, targetFD, targetName, hooks, nil)
+}
+
+func renameNoReplaceAtGuarded(sourceFD int, sourceName string, source storageMetadata, targetFD int, targetName string,
+	hooks storageTestHooks, guard func() error,
+) (noReplaceOutcome, error) {
 	for {
 		hooks.preparingMutation(storageStepRename, sourceName)
 		if err := hooks.canStartStorageWork(); err != nil {
@@ -1924,7 +2648,12 @@ func renameNoReplaceAt(sourceFD int, sourceName string, source storageMetadata, 
 		if err == nil {
 			if err = validateNoReplaceRenamePreState(sourceFD, sourceName, source, targetFD, targetName); err == nil {
 				if err = hooks.canStartStorageWork(); err == nil {
-					err = platformRenameNoReplaceAt(sourceFD, sourceName, targetFD, targetName)
+					if guard != nil {
+						err = guard()
+					}
+					if err == nil {
+						err = platformRenameNoReplaceAt(sourceFD, sourceName, targetFD, targetName)
+					}
 				}
 			}
 		}
@@ -2001,7 +2730,19 @@ func sameStorageIdentity(left, right storageMetadata) bool {
 	return left.dev == right.dev && left.ino == right.ino
 }
 
-func exchangeAt(sourceFD int, source storageEntry, sourcePath string, targetFD int, target storageEntry, targetPath string, hooks storageTestHooks) (bool, error) {
+func exchangeAt(
+	sourceFD int,
+	source storageEntry,
+	sourcePath string,
+	sourceParent storageMetadata,
+	sourceEUID uint32,
+	targetFD int,
+	target storageEntry,
+	targetPath string,
+	targetParent storageMetadata,
+	targetEUID uint32,
+	hooks storageTestHooks,
+) (bool, error) {
 	if hooks.beforeExchange != nil {
 		if err := hooks.beforeExchange(); err != nil {
 			return false, fmt.Errorf("productmetrics: injected pre-exchange failure: %w", err)
@@ -2014,6 +2755,18 @@ func exchangeAt(sourceFD int, source storageEntry, sourcePath string, targetFD i
 	if inspectErr != nil || preState != exchangePostUnchanged {
 		return false, errors.Join(inspectErr, errStorageEntryChanged,
 			errors.New("productmetrics: entry exchange endpoints changed before mutation"))
+	}
+	currentSource, sourceErr := metadataAt(sourceFD, source.name, sourcePath, storageTestHooks{})
+	currentTarget, targetErr := metadataAt(targetFD, target.name, targetPath, storageTestHooks{})
+	if err := errors.Join(
+		sourceErr,
+		targetErr,
+		requireCleanupSameDevice(sourceParent, currentSource),
+		requireCleanupSameDevice(targetParent, currentTarget),
+		validateExchangeRegularEntry(currentSource, sourcePath, sourceEUID),
+		validateExchangeRegularEntry(currentTarget, targetPath, targetEUID),
+	); err != nil {
+		return false, err
 	}
 	if err := platformExchangeAt(sourceFD, source.name, targetFD, target.name); err != nil {
 		return false, fmt.Errorf("productmetrics: atomic directory exchange: %w", err)

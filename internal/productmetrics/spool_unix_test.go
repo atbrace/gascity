@@ -18,6 +18,8 @@ import (
 	"runtime"
 	"strings"
 	"sync"
+	"sync/atomic"
+	"syscall"
 	"testing"
 	"time"
 
@@ -905,6 +907,584 @@ func TestClaimRestoreDeletePreservesOldestOrderAndQuotaDurability(t *testing.T) 
 	}
 }
 
+func TestRestoreSpoolClaimMismatchedDestinationCollisionPreservesBothFiles(t *testing.T) {
+	home, _, permit := newRecordServiceFixture(t, testEventIDThree)
+	root := mustOpenMutableRoot(t, home)
+	defer func() { _ = root.Close() }()
+	event := testSpoolEvent(testEventIDOne, permit.releaseVersion, testRecordHour, CommandHelp)
+	data := writeSpoolEventFixture(t, root, queueDirectoryName, testSpoolGeneration, event)
+	wantQuota := spoolQuota{Events: 1, Bytes: uint64(len(data))}
+	if err := persistSpoolQuota(root, wantQuota); err != nil {
+		t.Fatal(err)
+	}
+	claim, err := claimSpoolBatch(root, permit, testRecordHour, defaultSpoolWorkBudget())
+	if err != nil || len(claim.records) != 1 {
+		t.Fatalf("claim collision fixture = records:%d err:%v", len(claim.records), err)
+	}
+	queuePath := filepath.Join(home.Root(), queueDirectoryName, testSpoolGeneration, eventFileName(event.EventID))
+	inflightPath := filepath.Join(home.Root(), inflightDirectoryName, testSpoolGeneration, eventFileName(event.EventID))
+	blocker := []byte("different queue occupant")
+	if err := os.WriteFile(queuePath, blocker, 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	restoreErr := restoreSpoolClaim(root, claim)
+	if restoreErr == nil {
+		t.Fatal("mismatched restore collision was treated as an exact duplicate")
+	}
+	if got, err := os.ReadFile(inflightPath); err != nil || !bytes.Equal(got, data) {
+		t.Fatalf("mismatched restore collision changed inflight claim: data=%q err=%v", got, err)
+	}
+	if got, err := os.ReadFile(queuePath); err != nil || !bytes.Equal(got, blocker) {
+		t.Fatalf("mismatched restore collision changed queue blocker: data=%q err=%v", got, err)
+	}
+	if got := readQuotaFromRoot(t, root); got != wantQuota {
+		t.Fatalf("mismatched restore collision changed quota: got=%+v want=%+v", got, wantQuota)
+	}
+}
+
+func TestRestoreSpoolClaimExactDestinationCollisionRetiresOnlyInflightDuplicate(t *testing.T) {
+	home, _, permit := newRecordServiceFixture(t, testEventIDThree)
+	root := mustOpenMutableRoot(t, home)
+	defer func() { _ = root.Close() }()
+	event := testSpoolEvent(testEventIDOne, permit.releaseVersion, testRecordHour, CommandHelp)
+	data := writeSpoolEventFixture(t, root, queueDirectoryName, testSpoolGeneration, event)
+	wantQuota := spoolQuota{Events: 1, Bytes: uint64(len(data))}
+	if err := persistSpoolQuota(root, wantQuota); err != nil {
+		t.Fatal(err)
+	}
+	claim, err := claimSpoolBatch(root, permit, testRecordHour, defaultSpoolWorkBudget())
+	if err != nil || len(claim.records) != 1 {
+		t.Fatalf("claim exact-collision fixture = records:%d err:%v", len(claim.records), err)
+	}
+	queuePath := filepath.Join(home.Root(), queueDirectoryName, testSpoolGeneration, eventFileName(event.EventID))
+	inflightPath := filepath.Join(home.Root(), inflightDirectoryName, testSpoolGeneration, eventFileName(event.EventID))
+	if err := os.WriteFile(queuePath, data, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := restoreSpoolClaim(root, claim); err != nil {
+		t.Fatalf("restore exact duplicate: %v", err)
+	}
+	if got, err := os.ReadFile(queuePath); err != nil || !bytes.Equal(got, data) {
+		t.Fatalf("exact restore collision changed queue copy: data=%q err=%v", got, err)
+	}
+	if _, err := os.Lstat(inflightPath); !errors.Is(err, fs.ErrNotExist) {
+		t.Fatalf("exact restore collision retained inflight duplicate: %v", err)
+	}
+	if got := readQuotaFromRoot(t, root); got != wantQuota {
+		t.Fatalf("exact restore collision changed quota: got=%+v want=%+v", got, wantQuota)
+	}
+}
+
+func TestRestoreSpoolClaimExactCollisionInstallsClaimedSourceBeforeRetiringDestination(t *testing.T) {
+	home, _, permit := newRecordServiceFixture(t, testEventIDThree)
+	name := eventFileName(testEventIDOne)
+	queuePath := filepath.Join(home.Root(), queueDirectoryName, testSpoolGeneration, name)
+	inflightPath := filepath.Join(home.Root(), inflightDirectoryName, testSpoolGeneration, name)
+	var armed atomic.Bool
+	queueCompletedReads := 0
+	rewritten := false
+	var rewriteErr error
+	var replacement []byte
+	root, err := openStorageRootMutableWithHooks(home, storageTestHooks{
+		afterRead: func(path string, _, read int, readErr error) {
+			if !armed.Load() || path != queuePath || read != 0 || readErr != nil {
+				return
+			}
+			queueCompletedReads++
+			if queueCompletedReads != 2 || rewritten {
+				return
+			}
+			rewritten = true
+			rewriteErr = os.WriteFile(queuePath, replacement, 0o600)
+		},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = root.Close() }()
+	event := testSpoolEvent(testEventIDOne, permit.releaseVersion, testRecordHour, CommandHelp)
+	data := writeSpoolEventFixture(t, root, queueDirectoryName, testSpoolGeneration, event)
+	replacement = bytes.Repeat([]byte{'x'}, len(data))
+	wantQuota := spoolQuota{Events: 1, Bytes: uint64(len(data))}
+	if err := persistSpoolQuota(root, wantQuota); err != nil {
+		t.Fatal(err)
+	}
+	claim, err := claimSpoolBatch(root, permit, testRecordHour, defaultSpoolWorkBudget())
+	if err != nil || len(claim.records) != 1 {
+		t.Fatalf("claim exact-collision rewrite fixture = records:%d err:%v", len(claim.records), err)
+	}
+	if err := os.WriteFile(queuePath, data, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	armed.Store(true)
+
+	restoreErr := restoreSpoolClaim(root, claim)
+	if restoreErr != nil || rewriteErr != nil || !rewritten {
+		t.Fatalf("restore with destination rewrite = restored:%v rewritten:%v rewriteErr:%v", restoreErr, rewritten, rewriteErr)
+	}
+	queueData, queueErr := os.ReadFile(queuePath)
+	var queueStat unix.Stat_t
+	statErr := unix.Lstat(queuePath, &queueStat)
+	if queueErr != nil || statErr != nil || !bytes.Equal(queueData, data) ||
+		(recordIncarnation{dev: unixStatDevice(queueStat), ino: unixStatInode(queueStat)}) != claim.records[0].incarnation {
+		t.Fatalf("restored queue lacks claimed source authority: data=%q readErr=%v statErr=%v incarnation=%+v want=%+v",
+			queueData, queueErr, statErr,
+			recordIncarnation{dev: unixStatDevice(queueStat), ino: unixStatInode(queueStat)}, claim.records[0].incarnation)
+	}
+	if _, err := os.Lstat(inflightPath); !errors.Is(err, fs.ErrNotExist) {
+		t.Fatalf("durable source-authoritative restore retained displaced destination: %v", err)
+	}
+	if got := readQuotaFromRoot(t, root); got != wantQuota {
+		t.Fatalf("source-authoritative restore changed quota: got=%+v want=%+v", got, wantQuota)
+	}
+}
+
+func TestRestoreSpoolClaimExchangeUncertaintyPreservesBothAuthoritiesAndQuota(t *testing.T) {
+	for _, test := range []struct {
+		name           string
+		replace        string
+		beforeErr      error
+		postErr        error
+		failParentSync bool
+		wantSwapped    bool
+	}{
+		{name: "unsupported", beforeErr: unix.ENOSYS},
+		{name: "not-applied", beforeErr: unix.EIO},
+		{name: "source-identity-replacement", replace: "source"},
+		{name: "destination-identity-replacement", replace: "destination"},
+		{name: "post-exchange-failure", postErr: unix.EIO, wantSwapped: true},
+		{name: "parent-sync-pending", failParentSync: true, wantSwapped: true},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			home, _, permit := newRecordServiceFixture(t, testEventIDThree)
+			name := eventFileName(testEventIDOne)
+			queuePath := filepath.Join(home.Root(), queueDirectoryName, testSpoolGeneration, name)
+			inflightPath := filepath.Join(home.Root(), inflightDirectoryName, testSpoolGeneration, name)
+			var armed atomic.Bool
+			injected := false
+			exchangeApplied := false
+			var injectErr error
+			hooks := storageTestHooks{
+				beforeExchange: func() error {
+					if !armed.Load() {
+						return nil
+					}
+					injected = true
+					if test.replace == "" {
+						return test.beforeErr
+					}
+					path := inflightPath
+					if test.replace == "destination" {
+						path = queuePath
+					}
+					if err := os.Rename(path, path+".displaced"); err != nil {
+						injectErr = err
+						return err
+					}
+					injectErr = os.WriteFile(path, []byte("replacement"), 0o600)
+					return injectErr
+				},
+				afterExchange: func() error {
+					if !armed.Load() {
+						return nil
+					}
+					injected = true
+					exchangeApplied = true
+					return test.postErr
+				},
+				beforeStep: func(step storageStep) error {
+					if armed.Load() && exchangeApplied && test.failParentSync && step == storageStepDirectorySync {
+						injected = true
+						return unix.EIO
+					}
+					return nil
+				},
+			}
+			root, err := openStorageRootMutableWithHooks(home, hooks)
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer func() { _ = root.Close() }()
+			event := testSpoolEvent(testEventIDOne, permit.releaseVersion, testRecordHour, CommandHelp)
+			data := writeSpoolEventFixture(t, root, queueDirectoryName, testSpoolGeneration, event)
+			wantQuota := spoolQuota{Events: 1, Bytes: uint64(len(data))}
+			if err := persistSpoolQuota(root, wantQuota); err != nil {
+				t.Fatal(err)
+			}
+			claim, err := claimSpoolBatch(root, permit, testRecordHour, defaultSpoolWorkBudget())
+			if err != nil || len(claim.records) != 1 {
+				t.Fatalf("claim exchange-uncertainty fixture = records:%d err:%v", len(claim.records), err)
+			}
+			if err := os.WriteFile(queuePath, data, 0o600); err != nil {
+				t.Fatal(err)
+			}
+			var destinationStat unix.Stat_t
+			if err := unix.Lstat(queuePath, &destinationStat); err != nil {
+				t.Fatal(err)
+			}
+			destination := recordIncarnation{dev: unixStatDevice(destinationStat), ino: unixStatInode(destinationStat)}
+			armed.Store(true)
+
+			restoreErr := restoreSpoolClaim(root, claim)
+			if restoreErr == nil || !injected || injectErr != nil {
+				t.Fatalf("uncertain exchange = err:%v injected:%v injectErr:%v", restoreErr, injected, injectErr)
+			}
+			if got := readQuotaFromRoot(t, root); got != wantQuota {
+				t.Fatalf("uncertain exchange changed quota: got=%+v want=%+v", got, wantQuota)
+			}
+
+			found := make(map[recordIncarnation]string)
+			for _, path := range []string{queuePath, inflightPath, queuePath + ".displaced", inflightPath + ".displaced"} {
+				var stat unix.Stat_t
+				if err := unix.Lstat(path, &stat); err != nil {
+					if errors.Is(err, fs.ErrNotExist) {
+						continue
+					}
+					t.Fatal(err)
+				}
+				found[recordIncarnation{dev: unixStatDevice(stat), ino: unixStatInode(stat)}] = path
+			}
+			if found[claim.records[0].incarnation] == "" || found[destination] == "" {
+				t.Fatalf("uncertain exchange lost authority: found=%v source=%+v destination=%+v",
+					found, claim.records[0].incarnation, destination)
+			}
+			if test.wantSwapped {
+				var queueStat, inflightStat unix.Stat_t
+				queueErr := unix.Lstat(queuePath, &queueStat)
+				inflightErr := unix.Lstat(inflightPath, &inflightStat)
+				if queueErr != nil || inflightErr != nil ||
+					(recordIncarnation{dev: unixStatDevice(queueStat), ino: unixStatInode(queueStat)}) != claim.records[0].incarnation ||
+					(recordIncarnation{dev: unixStatDevice(inflightStat), ino: unixStatInode(inflightStat)}) != destination {
+					t.Fatalf("post-application evidence = queue:%+v/%v inflight:%+v/%v", queueStat, queueErr, inflightStat, inflightErr)
+				}
+			}
+		})
+	}
+}
+
+func TestRestoreSpoolClaimDestinationChangeAtDeleteBoundaryPreservesInflightSource(t *testing.T) {
+	for _, test := range []struct {
+		name   string
+		change func(string) error
+	}{
+		{name: "unlink", change: os.Remove},
+		{name: "truncate", change: func(path string) error { return os.WriteFile(path, []byte("changed"), 0o600) }},
+		{name: "replace", change: func(path string) error {
+			if err := os.Rename(path, path+".displaced"); err != nil {
+				return err
+			}
+			return os.WriteFile(path, []byte("replacement"), 0o600)
+		}},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			home, _, permit := newRecordServiceFixture(t, testEventIDThree)
+			name := eventFileName(testEventIDOne)
+			queuePath := filepath.Join(home.Root(), queueDirectoryName, testSpoolGeneration, name)
+			inflightPath := filepath.Join(home.Root(), inflightDirectoryName, testSpoolGeneration, name)
+			var armed atomic.Bool
+			var changed atomic.Bool
+			var changeErr error
+			root, err := openStorageRootMutableWithHooks(home, storageTestHooks{
+				beforeMutation: func(step storageStep, path string) {
+					if step != storageStepDelete || path != inflightPath || !armed.Load() ||
+						!changed.CompareAndSwap(false, true) {
+						return
+					}
+					changeErr = test.change(queuePath)
+				},
+			})
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer func() { _ = root.Close() }()
+			event := testSpoolEvent(testEventIDOne, permit.releaseVersion, testRecordHour, CommandHelp)
+			data := writeSpoolEventFixture(t, root, queueDirectoryName, testSpoolGeneration, event)
+			if err := persistSpoolQuota(root, spoolQuota{Events: 1, Bytes: uint64(len(data))}); err != nil {
+				t.Fatal(err)
+			}
+			claim, err := claimSpoolBatch(root, permit, testRecordHour, defaultSpoolWorkBudget())
+			if err != nil || len(claim.records) != 1 {
+				t.Fatalf("claim destination-change fixture = records:%d err:%v", len(claim.records), err)
+			}
+			if err := os.WriteFile(queuePath, data, 0o600); err != nil {
+				t.Fatal(err)
+			}
+			armed.Store(true)
+			restoreErr := restoreSpoolClaim(root, claim)
+			if changeErr != nil || !changed.Load() {
+				t.Fatalf("destination change = changed:%v err:%v", changed.Load(), changeErr)
+			}
+			if restoreErr == nil {
+				t.Fatal("destination change at source-delete boundary authorized retirement")
+			}
+			if got, err := os.ReadFile(inflightPath); err != nil || !bytes.Equal(got, data) {
+				t.Fatalf("destination change removed inflight source: data=%q err=%v", got, err)
+			}
+		})
+	}
+}
+
+func TestRestoreSpoolClaimCrossDeviceDestinationNeverAuthorizesInflightDeletion(t *testing.T) {
+	home, _, permit := newRecordServiceFixture(t, testEventIDThree)
+	name := eventFileName(testEventIDOne)
+	queuePath := filepath.Join(home.Root(), queueDirectoryName, testSpoolGeneration, name)
+	inflightPath := filepath.Join(home.Root(), inflightDirectoryName, testSpoolGeneration, name)
+	var armed atomic.Bool
+	root, err := openStorageRootMutableWithHooks(home, storageTestHooks{
+		metadata: func(path string, metadata storageMetadata) storageMetadata {
+			if armed.Load() && path == queuePath {
+				metadata.dev ^= 1 << 63
+			}
+			return metadata
+		},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = root.Close() }()
+	event := testSpoolEvent(testEventIDOne, permit.releaseVersion, testRecordHour, CommandHelp)
+	data := writeSpoolEventFixture(t, root, queueDirectoryName, testSpoolGeneration, event)
+	if err := persistSpoolQuota(root, spoolQuota{Events: 1, Bytes: uint64(len(data))}); err != nil {
+		t.Fatal(err)
+	}
+	claim, err := claimSpoolBatch(root, permit, testRecordHour, defaultSpoolWorkBudget())
+	if err != nil || len(claim.records) != 1 {
+		t.Fatalf("claim cross-device fixture = records:%d err:%v", len(claim.records), err)
+	}
+	if err := os.WriteFile(queuePath, data, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	armed.Store(true)
+	restoreErr := restoreSpoolClaim(root, claim)
+	if restoreErr == nil || !errors.Is(restoreErr, syscall.EXDEV) {
+		t.Fatalf("cross-device destination restore error = %v, want EXDEV", restoreErr)
+	}
+	if got, err := os.ReadFile(inflightPath); err != nil || !bytes.Equal(got, data) {
+		t.Fatalf("cross-device destination removed inflight source: data=%q err=%v", got, err)
+	}
+}
+
+func TestClaimSpoolBatchRejectsCrossDeviceGenerationAtDirectPostSweepReopen(t *testing.T) {
+	home, _, permit := newRecordServiceFixture(t, testEventIDThree)
+	plainRoot := mustOpenMutableRoot(t, home)
+	event := testSpoolEvent(testEventIDOne, permit.releaseVersion, testRecordHour, CommandHelp)
+	data := writeSpoolEventFixture(t, plainRoot, queueDirectoryName, testSpoolGeneration, event)
+	wantQuota := spoolQuota{Events: 1, Bytes: uint64(len(data))}
+	if err := persistSpoolQuota(plainRoot, wantQuota); err != nil {
+		t.Fatal(err)
+	}
+	if err := plainRoot.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	name := eventFileName(event.EventID)
+	eventPath := filepath.Join(home.Root(), queueDirectoryName, testSpoolGeneration, name)
+	generationPath := filepath.Dir(eventPath)
+	inflightPath := filepath.Join(home.Root(), inflightDirectoryName, testSpoolGeneration, name)
+	var afterSweep atomic.Bool
+	postSweepGenerationOpens := 0
+	root, err := openStorageRootMutableWithHooks(home, storageTestHooks{
+		afterRead: func(path string, _, read int, readErr error) {
+			if path == eventPath && read == 0 && readErr == nil {
+				afterSweep.Store(true)
+			}
+		},
+		metadata: func(path string, metadata storageMetadata) storageMetadata {
+			if afterSweep.Load() && path == generationPath {
+				metadata.dev ^= 1 << 63
+			}
+			return metadata
+		},
+		beforeDirectoryOpen: func(path string) error {
+			if afterSweep.Load() && path == generationPath {
+				postSweepGenerationOpens++
+			}
+			return nil
+		},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = root.Close() }()
+
+	claim, claimErr := claimSpoolBatch(root, permit, testRecordHour, defaultSpoolWorkBudget())
+	if !afterSweep.Load() || !errors.Is(claimErr, unix.EXDEV) || len(claim.records) != 0 || postSweepGenerationOpens != 0 {
+		t.Fatalf("post-sweep cross-device reopen = armed:%v opens:%d records:%d err:%v",
+			afterSweep.Load(), postSweepGenerationOpens, len(claim.records), claimErr)
+	}
+	if got, err := os.ReadFile(eventPath); err != nil || !bytes.Equal(got, data) {
+		t.Fatalf("post-sweep cross-device reopen changed queue source: data=%q err=%v", got, err)
+	}
+	if _, err := os.Lstat(inflightPath); !errors.Is(err, fs.ErrNotExist) {
+		t.Fatalf("post-sweep cross-device reopen moved source below boundary: %v", err)
+	}
+	if got := readQuotaFromRoot(t, root); got != wantQuota {
+		t.Fatalf("post-sweep cross-device reopen changed quota: got=%+v want=%+v", got, wantQuota)
+	}
+}
+
+func TestSpoolSweepRejectsCrossDeviceEventBeforeOpeningIt(t *testing.T) {
+	for _, tree := range []string{queueDirectoryName, inflightDirectoryName} {
+		t.Run(tree, func(t *testing.T) {
+			home, _, permit := newRecordServiceFixture(t, testEventIDThree)
+			plainRoot := mustOpenMutableRoot(t, home)
+			event := testSpoolEvent(testEventIDOne, permit.releaseVersion, testRecordHour, CommandHelp)
+			data := writeSpoolEventFixture(t, plainRoot, tree, testSpoolGeneration, event)
+			wantQuota := spoolQuota{Events: 1, Bytes: uint64(len(data))}
+			if err := persistSpoolQuota(plainRoot, wantQuota); err != nil {
+				t.Fatal(err)
+			}
+			if err := plainRoot.Close(); err != nil {
+				t.Fatal(err)
+			}
+			eventPath := filepath.Join(home.Root(), tree, testSpoolGeneration, eventFileName(event.EventID))
+			fileOpens := 0
+			root, err := openStorageRootMutableWithHooks(home, storageTestHooks{
+				metadata: func(path string, metadata storageMetadata) storageMetadata {
+					if path == eventPath {
+						metadata.dev ^= 1 << 63
+					}
+					return metadata
+				},
+				afterFileOpen: func(path string) {
+					if path == eventPath {
+						fileOpens++
+					}
+				},
+			})
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer func() { _ = root.Close() }()
+
+			result, sweepErr := reconcileSpool(root, testCurrentSpoolPolicy(), testRecordHour, defaultSpoolWorkBudget())
+			if !errors.Is(sweepErr, unix.EXDEV) || result.complete || fileOpens != 0 {
+				t.Fatalf("cross-device %s event sweep = complete:%v opens:%d err:%v", tree, result.complete, fileOpens, sweepErr)
+			}
+			if got, err := os.ReadFile(eventPath); err != nil || !bytes.Equal(got, data) {
+				t.Fatalf("cross-device %s event changed source: data=%q err=%v", tree, got, err)
+			}
+			if got := readQuotaFromRoot(t, root); got.Events < wantQuota.Events || got.Bytes < wantQuota.Bytes {
+				t.Fatalf("cross-device %s event undercounted quota: got=%+v minimum=%+v", tree, got, wantQuota)
+			}
+		})
+	}
+}
+
+func TestRestoreSpoolClaimByteIdenticalInflightReplacementIsNotOriginalAuthority(t *testing.T) {
+	home, _, permit := newRecordServiceFixture(t, testEventIDThree)
+	root := mustOpenMutableRoot(t, home)
+	defer func() { _ = root.Close() }()
+	event := testSpoolEvent(testEventIDOne, permit.releaseVersion, testRecordHour, CommandHelp)
+	data := writeSpoolEventFixture(t, root, queueDirectoryName, testSpoolGeneration, event)
+	wantQuota := spoolQuota{Events: 1, Bytes: uint64(len(data))}
+	if err := persistSpoolQuota(root, wantQuota); err != nil {
+		t.Fatal(err)
+	}
+	claim, err := claimSpoolBatch(root, permit, testRecordHour, defaultSpoolWorkBudget())
+	if err != nil || len(claim.records) != 1 {
+		t.Fatalf("claim replacement fixture = records:%d err:%v", len(claim.records), err)
+	}
+	queuePath := filepath.Join(home.Root(), queueDirectoryName, testSpoolGeneration, eventFileName(event.EventID))
+	inflightPath := filepath.Join(home.Root(), inflightDirectoryName, testSpoolGeneration, eventFileName(event.EventID))
+	displacedPath := inflightPath + ".displaced"
+	if err := os.Rename(inflightPath, displacedPath); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(inflightPath, data, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(queuePath, data, 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	restoreErr := restoreSpoolClaim(root, claim)
+	if restoreErr == nil {
+		t.Fatal("byte-identical inflight replacement inherited original claim authority")
+	}
+	for _, path := range []string{queuePath, inflightPath, displacedPath} {
+		if got, err := os.ReadFile(path); err != nil || !bytes.Equal(got, data) {
+			t.Fatalf("replacement collision changed %q: data=%q err=%v", path, got, err)
+		}
+	}
+	if got := readQuotaFromRoot(t, root); got != wantQuota {
+		t.Fatalf("replacement collision changed quota: got=%+v want=%+v", got, wantQuota)
+	}
+}
+
+func TestClaimSpoolBatchLateMismatchedRestoreCollisionPreservesInflightSource(t *testing.T) {
+	home, _, permit := newRecordServiceFixture(t, testEventIDThree)
+	plainRoot := mustOpenMutableRoot(t, home)
+	event := testSpoolEvent(testEventIDOne, permit.releaseVersion, testRecordHour, CommandHelp)
+	data := writeSpoolEventFixture(t, plainRoot, inflightDirectoryName, testSpoolGeneration, event)
+	wantQuota := spoolQuota{Events: 1, Bytes: uint64(len(data))}
+	if err := persistSpoolQuota(plainRoot, wantQuota); err != nil {
+		t.Fatal(err)
+	}
+	if err := plainRoot.Close(); err != nil {
+		t.Fatal(err)
+	}
+	name := eventFileName(event.EventID)
+	queuePath := filepath.Join(home.Root(), queueDirectoryName, testSpoolGeneration, name)
+	inflightPath := filepath.Join(home.Root(), inflightDirectoryName, testSpoolGeneration, name)
+	blocker := []byte("late mismatched queue occupant")
+	injected := false
+	var injectErr error
+	root, err := openStorageRootMutableWithHooks(home, storageTestHooks{
+		beforeMutation: func(step storageStep, sourceName string) {
+			if injected || step != storageStepRename || sourceName != name {
+				return
+			}
+			injected = true
+			injectErr = os.WriteFile(queuePath, blocker, 0o600)
+		},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = root.Close() }()
+	claim, claimErr := claimSpoolBatch(root, permit, testRecordHour, defaultSpoolWorkBudget())
+	if injectErr != nil || !injected {
+		t.Fatalf("inject late restore collision: injected=%v err=%v", injected, injectErr)
+	}
+	if claimErr == nil || len(claim.records) != 0 {
+		t.Fatalf("late mismatched restore collision = claim:%+v err:%v", claim, claimErr)
+	}
+	if got, err := os.ReadFile(inflightPath); err != nil || !bytes.Equal(got, data) {
+		t.Fatalf("late collision changed inflight source: data=%q err=%v", got, err)
+	}
+	if got, err := os.ReadFile(queuePath); err != nil || !bytes.Equal(got, blocker) {
+		t.Fatalf("late collision changed queue blocker: data=%q err=%v", got, err)
+	}
+	if got := readQuotaFromRoot(t, root); got != wantQuota {
+		t.Fatalf("late collision changed quota: got=%+v want=%+v", got, wantQuota)
+	}
+}
+
+func TestPrepareSpoolClaimReportsByteCountMismatchWithoutNilWrapArtifact(t *testing.T) {
+	_, _, permit := newRecordServiceFixture(t, testEventIDThree)
+	event := testSpoolEvent(testEventIDOne, permit.releaseVersion, testRecordHour, CommandHelp)
+	data, err := EncodeEvent(event)
+	if err != nil {
+		t.Fatal(err)
+	}
+	claim := spoolClaim{
+		generation: permit.spoolGeneration,
+		records: []spoolRecord{{
+			generation: permit.spoolGeneration,
+			name:       eventFileName(event.EventID),
+			event:      event,
+			bytes:      uint64(len(data) + 1),
+		}},
+	}
+	_, prepareErr := prepareSpoolClaimForUpload(claim, permit)
+	if prepareErr == nil || !strings.Contains(prepareErr.Error(), "byte count mismatch") ||
+		strings.Contains(prepareErr.Error(), "%!w(<nil>)") {
+		t.Fatalf("claimed byte mismatch error = %v", prepareErr)
+	}
+}
+
 func TestReconcileTreatsSecondFileWithSameEventIDAsPoison(t *testing.T) {
 	home, _, _ := newRecordServiceFixture(t, testEventIDThree)
 	root := mustOpenMutableRoot(t, home)
@@ -1203,15 +1783,16 @@ func TestClaimDeleteFinalGateSwapCannotReleaseQuota(t *testing.T) {
 	}
 	deleteErr := deleteSpoolClaim(uncertainRoot, claim)
 	_ = uncertainRoot.Close()
-	_, victimErr := os.Lstat(victimPath)
+	victimData, victimErr := os.ReadFile(victimPath)
 	displacedData, displacedErr := os.ReadFile(displacedPath)
 	gotQuota := readQuotaFixture(t, home)
-	if injectedErr != nil || !deleteStarted || !finalMetadataObserved || !swapped || deleteErr == nil ||
-		errors.Is(deleteErr, fs.ErrNotExist) || gotQuota != wantQuota || postSwapSyncs == 0 ||
-		!errors.Is(victimErr, fs.ErrNotExist) || displacedErr != nil || !bytes.Equal(displacedData, data) {
-		t.Fatalf("final-gate replacement settlement = deleteStarted:%v finalMetadata:%v swapped:%v injected:%v delete:%v quota:%+v syncs:%d victimErr:%v displaced:%q displacedErr:%v",
+	if injectedErr != nil || !deleteStarted || !finalMetadataObserved || !swapped ||
+		!errors.Is(deleteErr, errStorageEntryChanged) || errors.Is(deleteErr, fs.ErrNotExist) ||
+		gotQuota != wantQuota || postSwapSyncs != 0 || victimErr != nil || !bytes.Equal(victimData, data) ||
+		displacedErr != nil || !bytes.Equal(displacedData, data) {
+		t.Fatalf("final-gate replacement settlement = deleteStarted:%v finalMetadata:%v swapped:%v injected:%v delete:%v quota:%+v syncs:%d victim:%q victimErr:%v displaced:%q displacedErr:%v",
 			deleteStarted, finalMetadataObserved, swapped, injectedErr, deleteErr, gotQuota, postSwapSyncs,
-			victimErr, displacedData, displacedErr)
+			victimData, victimErr, displacedData, displacedErr)
 	}
 }
 
@@ -1887,6 +2468,1257 @@ func TestPurgeSpoolUsesOneGlobalBudgetAndConvergesAcrossCalls(t *testing.T) {
 	}
 }
 
+func TestPurgeSpoolWithinBudgetConvergesWithOneAggregateMeter(t *testing.T) {
+	home, _, _ := newRecordServiceFixture(t, testEventIDThree)
+	root := mustOpenMutableRoot(t, home)
+	defer func() { _ = root.Close() }()
+	event := testSpoolEvent(testEventIDOne, "1.0.0", testRecordHour, CommandHelp)
+	data := writeSpoolEventFixture(t, root, queueDirectoryName, testSpoolGeneration, event)
+	quota := spoolQuota{Events: 1, Bytes: uint64(len(data))}
+	if err := persistSpoolQuota(root, quota); err != nil {
+		t.Fatal(err)
+	}
+	rootTemp := filepath.Join(home.Root(), fmt.Sprintf(".pm-tmp-%x-%x", os.Getpid(), uint64(0xa11)))
+	writeJournaledRootTempCrashFixture(t, root, filepath.Base(rootTemp), []byte("identity-bearing temp"), 0)
+
+	budget := defaultSpoolWorkBudget()
+	result, err := purgeSpoolWithinBudget(root, budget)
+	if err != nil || !result.complete {
+		t.Fatalf("aggregate bounded purge = %+v err=%v", result, err)
+	}
+	if result.usage.entries > budget.maxEntries || result.usage.directories > budget.maxDirectories ||
+		result.usage.readBytes > budget.maxReadBytes || result.usage.nameBytes > budget.maxNameBytes ||
+		result.eventEntries > maximumEnumerationEvents {
+		t.Fatalf("aggregate bounded purge exceeded one budget: result=%+v budget=%+v", result, budget)
+	}
+	if result.usage.entries < 2*spoolFixedEntryEnvelope ||
+		result.usage.nameBytes < 2*spoolFixedNameEnvelope ||
+		result.usage.readBytes < 2*spoolFixedReadEnvelope {
+		t.Fatalf("multi-pass purge did not reserve fixed work per pass: %+v", result.usage)
+	}
+	if result.removedEvents != quota.Events || result.removedBytes != quota.Bytes {
+		t.Fatalf("aggregate removal = (%d, %d), want (%d, %d)",
+			result.removedEvents, result.removedBytes, quota.Events, quota.Bytes)
+	}
+	if _, err := os.Lstat(rootTemp); !errors.Is(err, fs.ErrNotExist) {
+		t.Fatalf("aggregate bounded purge left root temp: %v", err)
+	}
+	if got := readQuotaFromRoot(t, root); got != (spoolQuota{}) {
+		t.Fatalf("aggregate bounded purge quota = %+v", got)
+	}
+}
+
+func TestPurgeSpoolWithinBudgetKeepsCumulativeEventCapAcrossPasses(t *testing.T) {
+	home, _, _ := newRecordServiceFixture(t, testEventIDThree)
+	root := mustOpenMutableRoot(t, home)
+	defer func() { _ = root.Close() }()
+	directoryPath := filepath.Join(home.Root(), queueDirectoryName, testSpoolGeneration)
+	if err := os.MkdirAll(directoryPath, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	for index := uint64(0); index < maximumEnumerationEvents+1; index++ {
+		id := fmt.Sprintf("%08x-0000-4000-8000-%012x", index+1, index+1)
+		if err := os.WriteFile(filepath.Join(directoryPath, eventFileName(id)), []byte("x"), 0o600); err != nil {
+			t.Fatal(err)
+		}
+	}
+	quota := spoolQuota{Events: maximumQuotaEventMarker, Bytes: maximumQuotaByteMarker}
+	if err := persistSpoolQuota(root, quota); err != nil {
+		t.Fatal(err)
+	}
+	budget := spoolWorkBudget{
+		maxEntries:     maximumCleanupEntries * 4,
+		maxDirectories: maximumCleanupDirectories,
+		maxReadBytes:   maximumCleanupReadBytes * 4,
+		maxNameBytes:   maximumCleanupNameBytes * 4,
+	}
+	result, err := purgeSpoolWithinBudget(root, budget)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if result.complete || result.eventEntries > maximumEnumerationEvents {
+		t.Fatalf("event-capped aggregate purge = %+v", result)
+	}
+	if result.usage.entries > budget.maxEntries || result.usage.directories > budget.maxDirectories ||
+		result.usage.readBytes > budget.maxReadBytes || result.usage.nameBytes > budget.maxNameBytes {
+		t.Fatalf("event-capped aggregate purge exceeded one budget: result=%+v budget=%+v", result, budget)
+	}
+	entries, readErr := os.ReadDir(directoryPath)
+	if readErr != nil || len(entries) == 0 {
+		t.Fatalf("event-capped purge did not retain unproven work: entries=%d err=%v", len(entries), readErr)
+	}
+}
+
+func TestPurgeSpoolTreatsFutureControlFilesAsUnrecognizedResidue(t *testing.T) {
+	for _, name := range []string{"status.toml", "spawn-throttle"} {
+		t.Run(name, func(t *testing.T) {
+			home := newMetricsTestHome(t)
+			writeStateFixture(t, home, disabledState(7, 2, cleanupDisable))
+			plainRoot := mustOpenMutableRoot(t, home)
+			if err := persistSpoolQuota(plainRoot, spoolQuota{}); err != nil {
+				t.Fatal(err)
+			}
+			if err := plainRoot.Close(); err != nil {
+				t.Fatal(err)
+			}
+			path := filepath.Join(home.Root(), name)
+			if err := os.WriteFile(path, []byte("future owner residue"), 0o644); err != nil {
+				t.Fatal(err)
+			}
+			mutations := 0
+			root, err := openStorageRootMutableWithHooks(home, storageTestHooks{
+				beforeMutation: func(_ storageStep, observed string) {
+					if observed == path {
+						mutations++
+					}
+				},
+			})
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer func() { _ = root.Close() }()
+			result, purgeErr := purgeSpoolWithinBudget(root, defaultSpoolWorkBudget())
+			if purgeErr == nil || result.complete {
+				t.Fatalf("future control residue was certified clean: result=%+v err=%v", result, purgeErr)
+			}
+			if mutations != 0 {
+				t.Fatalf("future control residue received %d mutation attempts", mutations)
+			}
+			if data, err := os.ReadFile(path); err != nil || string(data) != "future owner residue" {
+				t.Fatalf("future control residue changed: data=%q err=%v", data, err)
+			}
+		})
+	}
+}
+
+func TestPurgeSpoolPreservesFutureControlResidueShapesWithoutDescent(t *testing.T) {
+	for _, name := range []string{"status.toml", "spawn-throttle"} {
+		for _, shape := range []string{"regular", "symlink", "cross-device"} {
+			t.Run(name+"/"+shape, func(t *testing.T) {
+				home := newMetricsTestHome(t)
+				writeStateFixture(t, home, disabledState(7, 2, cleanupDisable))
+				plainRoot := mustOpenMutableRoot(t, home)
+				if err := persistSpoolQuota(plainRoot, spoolQuota{}); err != nil {
+					t.Fatal(err)
+				}
+				if err := plainRoot.Close(); err != nil {
+					t.Fatal(err)
+				}
+				path := filepath.Join(home.Root(), name)
+				want := "future owner residue"
+				if shape == "symlink" {
+					target := filepath.Join(t.TempDir(), "sentinel")
+					if err := os.WriteFile(target, []byte(want), 0o600); err != nil {
+						t.Fatal(err)
+					}
+					if err := os.Symlink(target, path); err != nil {
+						t.Fatal(err)
+					}
+				} else if err := os.WriteFile(path, []byte(want), 0o600); err != nil {
+					t.Fatal(err)
+				}
+				mutations := 0
+				opens := 0
+				root, err := openStorageRootMutableWithHooks(home, storageTestHooks{
+					metadata: func(observed string, metadata storageMetadata) storageMetadata {
+						if shape == "cross-device" && observed == path {
+							metadata.dev ^= 1 << 63
+						}
+						return metadata
+					},
+					beforeDirectoryOpen: func(observed string) error {
+						if observed == path {
+							opens++
+						}
+						return nil
+					},
+					beforeMutation: func(_ storageStep, observed string) {
+						if observed == path {
+							mutations++
+						}
+					},
+				})
+				if err != nil {
+					t.Fatal(err)
+				}
+				defer func() { _ = root.Close() }()
+				result, purgeErr := purgeSpoolWithinBudget(root, defaultSpoolWorkBudget())
+				if purgeErr == nil || result.complete || mutations != 0 || opens != 0 {
+					t.Fatalf("future control %s residue = result:%+v mutations:%d opens:%d err:%v",
+						shape, result, mutations, opens, purgeErr)
+				}
+				if data, err := os.ReadFile(path); err != nil || string(data) != want {
+					t.Fatalf("future control %s residue changed: data=%q err=%v", shape, data, err)
+				}
+				if shape == "symlink" {
+					if info, err := os.Lstat(path); err != nil || info.Mode()&os.ModeSymlink == 0 {
+						t.Fatalf("future control symlink was replaced: info=%v err=%v", info, err)
+					}
+				}
+			})
+		}
+	}
+}
+
+func TestRootTempJournalMalformedCanonicalMarkerIsNonAuthorizing(t *testing.T) {
+	home := newMetricsTestHome(t)
+	root := mustOpenMutableRoot(t, home)
+	defer func() { _ = root.Close() }()
+	backend, ok := root.backend.(*unixStorageDirectory)
+	if !ok {
+		t.Fatal("root-temp journal test requires Unix storage")
+	}
+	journal, err := backend.openRootTempJournal()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := journal.close(); err != nil {
+		t.Fatal(err)
+	}
+
+	name := fmt.Sprintf(".pm-tmp-%x-%x", os.Getpid(), uint64(0xa91))
+	markerPath := filepath.Join(home.Root(), rootTempJournalDirectoryName, name)
+	if err := os.WriteFile(markerPath, []byte("malformed non-empty marker"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	tempPath := filepath.Join(home.Root(), name)
+	if err := os.WriteFile(tempPath, []byte("mapped root temp"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	state := &spoolSweepState{
+		root: root, purgeAll: true, meter: newSpoolWorkMeter(defaultSpoolWorkBudget()),
+		seen: make(map[string]struct{}), pruneDirs: make(map[string]*storageDir), failClosedArmed: true,
+	}
+	state.cleanupRootTempJournal()
+	if !errors.Is(state.operation, errUnsettledRootTempJournal) || state.mutated {
+		t.Fatalf("malformed canonical marker authorized mutation: mutated=%v err=%v", state.mutated, state.operation)
+	}
+	if data, err := os.ReadFile(tempPath); err != nil || string(data) != "mapped root temp" {
+		t.Fatalf("malformed canonical marker changed mapped temp: data=%q err=%v", data, err)
+	}
+	if data, err := os.ReadFile(markerPath); err != nil || string(data) != "malformed non-empty marker" {
+		t.Fatalf("malformed canonical marker changed: data=%q err=%v", data, err)
+	}
+}
+
+func TestRootTempJournalCrossDeviceMarkerEvidenceCannotAuthorizeMappedTempMutation(t *testing.T) {
+	home := newMetricsTestHome(t)
+	plainRoot := mustOpenMutableRoot(t, home)
+	name := fmt.Sprintf(".pm-tmp-%x-%x", os.Getpid(), uint64(0xa93))
+	writeJournaledRootTempCrashFixture(t, plainRoot, name, []byte("mapped root temp"), 0)
+	if err := plainRoot.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	tempPath := filepath.Join(home.Root(), name)
+	markerPath := filepath.Join(home.Root(), rootTempJournalDirectoryName, name)
+	tempMutations := 0
+	markerOpens := 0
+	markerReads := 0
+	root, err := openStorageRootMutableWithHooks(home, storageTestHooks{
+		metadata: func(path string, metadata storageMetadata) storageMetadata {
+			if path == markerPath {
+				metadata.dev ^= 1 << 63
+			}
+			return metadata
+		},
+		beforeMutation: func(_ storageStep, path string) {
+			if path == tempPath {
+				tempMutations++
+			}
+		},
+		afterFileOpen: func(path string) {
+			if path == markerPath {
+				markerOpens++
+			}
+		},
+		beforeRead: func(path string) {
+			if path == markerPath {
+				markerReads++
+			}
+		},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = root.Close() }()
+	state := &spoolSweepState{
+		root: root, purgeAll: true, meter: newSpoolWorkMeter(defaultSpoolWorkBudget()),
+		seen: make(map[string]struct{}), pruneDirs: make(map[string]*storageDir), failClosedArmed: true,
+	}
+	state.cleanupRootTempJournal()
+	if !errors.Is(state.operation, errUnsettledRootTempJournal) || state.mutated || tempMutations != 0 ||
+		markerOpens != 0 || markerReads != 0 {
+		t.Fatalf("cross-device marker authorized work: mutated=%v temp-mutations=%d opens=%d reads=%d err=%v",
+			state.mutated, tempMutations, markerOpens, markerReads, state.operation)
+	}
+	if data, err := os.ReadFile(tempPath); err != nil || string(data) != "mapped root temp" {
+		t.Fatalf("cross-device marker changed mapped temp: data=%q err=%v", data, err)
+	}
+	if _, err := os.Lstat(markerPath); err != nil {
+		t.Fatalf("cross-device marker evidence was removed: %v", err)
+	}
+}
+
+func TestRootTempJournalCrossDeviceMappedTempIsRejectedBeforeOpenOrMutation(t *testing.T) {
+	home := newMetricsTestHome(t)
+	plainRoot := mustOpenMutableRoot(t, home)
+	name := fmt.Sprintf(".pm-tmp-%x-%x", os.Getpid(), uint64(0xa98))
+	writeJournaledRootTempCrashFixture(t, plainRoot, name, []byte("bound temp"), 0)
+	if err := plainRoot.Close(); err != nil {
+		t.Fatal(err)
+	}
+	tempPath := filepath.Join(home.Root(), name)
+	markerPath := filepath.Join(home.Root(), rootTempJournalDirectoryName, name)
+	tempOpens := 0
+	tempReads := 0
+	tempMutations := 0
+	root, err := openStorageRootMutableWithHooks(home, storageTestHooks{
+		metadata: func(path string, metadata storageMetadata) storageMetadata {
+			if path == tempPath {
+				metadata.dev ^= 1 << 63
+			}
+			return metadata
+		},
+		afterFileOpen: func(path string) {
+			if path == tempPath {
+				tempOpens++
+			}
+		},
+		beforeRead: func(path string) {
+			if path == tempPath {
+				tempReads++
+			}
+		},
+		beforeMutation: func(_ storageStep, path string) {
+			if path == tempPath {
+				tempMutations++
+			}
+		},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = root.Close() }()
+	state := &spoolSweepState{
+		root: root, purgeAll: true, meter: newSpoolWorkMeter(defaultSpoolWorkBudget()),
+		seen: make(map[string]struct{}), pruneDirs: make(map[string]*storageDir), failClosedArmed: true,
+	}
+	state.cleanupRootTempJournal()
+	if !errors.Is(state.operation, errUnsettledRootTempJournal) || state.mutated ||
+		tempOpens != 0 || tempReads != 0 || tempMutations != 0 {
+		t.Fatalf("cross-device mapped temp work = mutated:%v opens:%d reads:%d mutations:%d err:%v",
+			state.mutated, tempOpens, tempReads, tempMutations, state.operation)
+	}
+	if data, err := os.ReadFile(tempPath); err != nil || string(data) != "bound temp" {
+		t.Fatalf("cross-device mapped temp changed: data=%q err=%v", data, err)
+	}
+	if _, err := os.Lstat(markerPath); err != nil {
+		t.Fatalf("cross-device mapped temp marker removed: %v", err)
+	}
+}
+
+func TestRootTempJournalIntentWithMappedTempRemainsPendingWithoutMutation(t *testing.T) {
+	home := newMetricsTestHome(t)
+	root := mustOpenMutableRoot(t, home)
+	defer func() { _ = root.Close() }()
+	backend, ok := root.backend.(*unixStorageDirectory)
+	if !ok {
+		t.Fatal("root-temp journal test requires Unix storage")
+	}
+	journal, err := backend.openRootTempJournal()
+	if err != nil {
+		t.Fatal(err)
+	}
+	name := fmt.Sprintf(".pm-tmp-%x-%x", os.Getpid(), uint64(0xa94))
+	marker, err := createRootTempJournalMarker(backend, journal, name)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := marker.close(); err != nil {
+		t.Fatal(err)
+	}
+	tempPath := filepath.Join(home.Root(), name)
+	if err := os.WriteFile(tempPath, nil, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	markerPath := filepath.Join(home.Root(), rootTempJournalDirectoryName, name)
+	state := &spoolSweepState{
+		root: root, purgeAll: true, meter: newSpoolWorkMeter(defaultSpoolWorkBudget()),
+		seen: make(map[string]struct{}), pruneDirs: make(map[string]*storageDir), failClosedArmed: true,
+	}
+	state.cleanupRootTempJournal()
+	if !errors.Is(state.operation, errUnsettledRootTempJournal) || state.mutated {
+		t.Fatalf("intent marker authorized mapped-temp mutation: mutated=%v err=%v", state.mutated, state.operation)
+	}
+	for _, path := range []string{tempPath, markerPath} {
+		if _, err := os.Lstat(path); err != nil {
+			t.Fatalf("intent replay removed %q: %v", path, err)
+		}
+	}
+}
+
+func TestRootTempJournalBoundIdentityMismatchPreservesBothFiles(t *testing.T) {
+	home := newMetricsTestHome(t)
+	root := mustOpenMutableRoot(t, home)
+	defer func() { _ = root.Close() }()
+	name := fmt.Sprintf(".pm-tmp-%x-%x", os.Getpid(), uint64(0xa95))
+	writeJournaledRootTempCrashFixture(t, root, name, []byte("original bound temp"), 0)
+	tempPath := filepath.Join(home.Root(), name)
+	displacedPath := tempPath + ".displaced"
+	if err := os.Rename(tempPath, displacedPath); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(tempPath, []byte("replacement temp"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	markerPath := filepath.Join(home.Root(), rootTempJournalDirectoryName, name)
+	state := &spoolSweepState{
+		root: root, purgeAll: true, meter: newSpoolWorkMeter(defaultSpoolWorkBudget()),
+		seen: make(map[string]struct{}), pruneDirs: make(map[string]*storageDir), failClosedArmed: true,
+	}
+	state.cleanupRootTempJournal()
+	if !errors.Is(state.operation, errUnsettledRootTempJournal) || state.mutated {
+		t.Fatalf("mismatched binding authorized mutation: mutated=%v err=%v", state.mutated, state.operation)
+	}
+	for path, want := range map[string]string{
+		tempPath:      "replacement temp",
+		displacedPath: "original bound temp",
+	} {
+		if data, err := os.ReadFile(path); err != nil || string(data) != want {
+			t.Fatalf("mismatched binding changed %q: data=%q err=%v", path, data, err)
+		}
+	}
+	if _, err := os.Lstat(markerPath); err != nil {
+		t.Fatalf("mismatched binding removed marker: %v", err)
+	}
+}
+
+func TestRootTempJournalRevalidatesMarkerAfterDeleteHookBeforeTempUnlink(t *testing.T) {
+	home := newMetricsTestHome(t)
+	plainRoot := mustOpenMutableRoot(t, home)
+	name := fmt.Sprintf(".pm-tmp-%x-%x", os.Getpid(), uint64(0xa97))
+	writeJournaledRootTempCrashFixture(t, plainRoot, name, []byte("bound temp"), 0)
+	if err := plainRoot.Close(); err != nil {
+		t.Fatal(err)
+	}
+	tempPath := filepath.Join(home.Root(), name)
+	markerPath := filepath.Join(home.Root(), rootTempJournalDirectoryName, name)
+	displacedMarker := markerPath + ".displaced"
+	swapped := false
+	var swapErr error
+	root, err := openStorageRootMutableWithHooks(home, storageTestHooks{
+		beforeMutation: func(step storageStep, path string) {
+			if swapped || step != storageStepDelete || path != tempPath {
+				return
+			}
+			swapped = true
+			if err := os.Rename(markerPath, displacedMarker); err != nil {
+				swapErr = err
+				return
+			}
+			swapErr = os.WriteFile(markerPath, nil, 0o600)
+		},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = root.Close() }()
+	state := &spoolSweepState{
+		root: root, purgeAll: true, meter: newSpoolWorkMeter(defaultSpoolWorkBudget()),
+		seen: make(map[string]struct{}), pruneDirs: make(map[string]*storageDir), failClosedArmed: true,
+	}
+	state.cleanupRootTempJournal()
+	if swapErr != nil || !swapped {
+		t.Fatalf("swap marker before temp unlink: swapped=%v err=%v", swapped, swapErr)
+	}
+	if !errors.Is(state.operation, errUnsettledRootTempJournal) || state.mutated {
+		t.Fatalf("post-hook marker replacement authorized temp unlink: mutated=%v err=%v", state.mutated, state.operation)
+	}
+	if data, err := os.ReadFile(tempPath); err != nil || string(data) != "bound temp" {
+		t.Fatalf("post-hook marker replacement changed temp: data=%q err=%v", data, err)
+	}
+	for _, path := range []string{markerPath, displacedMarker} {
+		if _, err := os.Lstat(path); err != nil {
+			t.Fatalf("post-hook marker evidence %q was removed: %v", path, err)
+		}
+	}
+}
+
+func TestRootTempJournalFinalTempIdentityCheckFollowsMarkerGuardRead(t *testing.T) {
+	home := newMetricsTestHome(t)
+	plainRoot := mustOpenMutableRoot(t, home)
+	name := fmt.Sprintf(".pm-tmp-%x-%x", os.Getpid(), uint64(0xa9a))
+	writeJournaledRootTempCrashFixture(t, plainRoot, name, []byte("bound temp"), 0)
+	if err := plainRoot.Close(); err != nil {
+		t.Fatal(err)
+	}
+	tempPath := filepath.Join(home.Root(), name)
+	displacedTemp := tempPath + ".displaced"
+	markerPath := filepath.Join(home.Root(), rootTempJournalDirectoryName, name)
+	armed := false
+	swapped := false
+	var swapErr error
+	root, err := openStorageRootMutableWithHooks(home, storageTestHooks{
+		beforeMutation: func(step storageStep, path string) {
+			if step == storageStepDelete && path == tempPath {
+				armed = true
+			}
+		},
+		beforeRead: func(path string) {
+			if !armed || swapped || path != markerPath {
+				return
+			}
+			swapped = true
+			if err := os.Rename(tempPath, displacedTemp); err != nil {
+				swapErr = err
+				return
+			}
+			swapErr = os.WriteFile(tempPath, []byte("replacement temp"), 0o600)
+		},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = root.Close() }()
+	state := &spoolSweepState{
+		root: root, purgeAll: true, meter: newSpoolWorkMeter(defaultSpoolWorkBudget()),
+		seen: make(map[string]struct{}), pruneDirs: make(map[string]*storageDir), failClosedArmed: true,
+	}
+	state.cleanupRootTempJournal()
+	if swapErr != nil || !swapped {
+		t.Fatalf("swap temp during marker guard read: swapped=%v err=%v", swapped, swapErr)
+	}
+	if state.mutated || state.operation == nil {
+		t.Fatalf("guard-read temp swap authorized unlink: mutated=%v err=%v", state.mutated, state.operation)
+	}
+	for path, want := range map[string]string{tempPath: "replacement temp", displacedTemp: "bound temp"} {
+		if data, err := os.ReadFile(path); err != nil || string(data) != want {
+			t.Fatalf("guard-read temp swap changed %q: data=%q err=%v", path, data, err)
+		}
+	}
+}
+
+func TestRootTempJournalMarkerRetirementRevalidatesContentAfterDeleteHook(t *testing.T) {
+	home := newMetricsTestHome(t)
+	plainRoot := mustOpenMutableRoot(t, home)
+	name := fmt.Sprintf(".pm-tmp-%x-%x", os.Getpid(), uint64(0xa9b))
+	writeJournaledRootTempCrashFixture(t, plainRoot, name, nil, 0)
+	tempPath := filepath.Join(home.Root(), name)
+	if err := os.Remove(tempPath); err != nil {
+		t.Fatal(err)
+	}
+	if err := plainRoot.syncDirectory(); err != nil {
+		t.Fatal(err)
+	}
+	if err := plainRoot.Close(); err != nil {
+		t.Fatal(err)
+	}
+	markerPath := filepath.Join(home.Root(), rootTempJournalDirectoryName, name)
+	truncated := false
+	var truncateErr error
+	root, err := openStorageRootMutableWithHooks(home, storageTestHooks{
+		beforeMutation: func(step storageStep, path string) {
+			if truncated || step != storageStepDelete || path != markerPath {
+				return
+			}
+			truncated = true
+			truncateErr = os.Truncate(markerPath, 0)
+		},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = root.Close() }()
+	state := &spoolSweepState{
+		root: root, purgeAll: true, meter: newSpoolWorkMeter(defaultSpoolWorkBudget()),
+		seen: make(map[string]struct{}), pruneDirs: make(map[string]*storageDir), failClosedArmed: true,
+	}
+	state.cleanupRootTempJournal()
+	if truncateErr != nil || !truncated {
+		t.Fatalf("truncate marker at retirement: truncated=%v err=%v", truncated, truncateErr)
+	}
+	if state.mutated || state.operation == nil {
+		t.Fatalf("truncated marker was retired: mutated=%v err=%v", state.mutated, state.operation)
+	}
+	if data, err := os.ReadFile(markerPath); err != nil || len(data) != 0 {
+		t.Fatalf("truncated marker was not preserved: data=%x err=%v", data, err)
+	}
+}
+
+func TestRootTempJournalMarkerRetirementRequiresDurableTempAbsenceAfterHook(t *testing.T) {
+	home := newMetricsTestHome(t)
+	plainRoot := mustOpenMutableRoot(t, home)
+	name := fmt.Sprintf(".pm-tmp-%x-%x", os.Getpid(), uint64(0xa9c))
+	writeJournaledRootTempCrashFixture(t, plainRoot, name, nil, 0)
+	tempPath := filepath.Join(home.Root(), name)
+	if err := os.Remove(tempPath); err != nil {
+		t.Fatal(err)
+	}
+	if err := plainRoot.syncDirectory(); err != nil {
+		t.Fatal(err)
+	}
+	if err := plainRoot.Close(); err != nil {
+		t.Fatal(err)
+	}
+	markerPath := filepath.Join(home.Root(), rootTempJournalDirectoryName, name)
+	created := false
+	var createErr error
+	root, err := openStorageRootMutableWithHooks(home, storageTestHooks{
+		beforeMutation: func(step storageStep, path string) {
+			if created || step != storageStepDelete || path != markerPath {
+				return
+			}
+			created = true
+			createErr = os.WriteFile(tempPath, []byte("late temp"), 0o600)
+		},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = root.Close() }()
+	state := &spoolSweepState{
+		root: root, purgeAll: true, meter: newSpoolWorkMeter(defaultSpoolWorkBudget()),
+		seen: make(map[string]struct{}), pruneDirs: make(map[string]*storageDir), failClosedArmed: true,
+	}
+	state.cleanupRootTempJournal()
+	if createErr != nil || !created {
+		t.Fatalf("create temp at marker retirement: created=%v err=%v", created, createErr)
+	}
+	if state.mutated || state.operation == nil {
+		t.Fatalf("marker retired over late temp: mutated=%v err=%v", state.mutated, state.operation)
+	}
+	if data, err := os.ReadFile(tempPath); err != nil || string(data) != "late temp" {
+		t.Fatalf("late temp changed: data=%q err=%v", data, err)
+	}
+	if _, err := os.Lstat(markerPath); err != nil {
+		t.Fatalf("marker removed over late temp: %v", err)
+	}
+}
+
+func TestRootTempJournalFixedProofAcceptsExactlyMaximumMarkers(t *testing.T) {
+	for _, count := range []int{maximumStorageTempAttempts, maximumStorageTempAttempts + 1} {
+		t.Run(fmt.Sprintf("markers-%d", count), func(t *testing.T) {
+			home := newMetricsTestHome(t)
+			root := mustOpenMutableRoot(t, home)
+			defer func() { _ = root.Close() }()
+			backend, ok := root.backend.(*unixStorageDirectory)
+			if !ok {
+				t.Fatal("root-temp journal test requires Unix storage")
+			}
+			journal, err := backend.openRootTempJournal()
+			if err != nil {
+				t.Fatal(err)
+			}
+			if err := journal.close(); err != nil {
+				t.Fatal(err)
+			}
+			journalPath := filepath.Join(home.Root(), rootTempJournalDirectoryName)
+			var journalStat unix.Stat_t
+			if err := unix.Stat(journalPath, &journalStat); err != nil {
+				t.Fatal(err)
+			}
+			device := unixStatDevice(journalStat)
+			for index := 0; index < count; index++ {
+				name := fmt.Sprintf(".pm-tmp-%x-%x", os.Getpid(), uint64(0xb00+index))
+				data, err := encodeBoundRootTempJournalMarker(name, recordIncarnation{dev: device, ino: uint64(index + 1)})
+				if err != nil {
+					t.Fatal(err)
+				}
+				if err := os.WriteFile(filepath.Join(journalPath, name), data, 0o600); err != nil {
+					t.Fatal(err)
+				}
+			}
+			meter := newSpoolWorkMeter(defaultSpoolWorkBudget())
+			meter.physicalDirectories = true
+			proofErr := proveRootTempJournalReadOnlyWithMeter(root, meter, true)
+			if count == maximumStorageTempAttempts {
+				if proofErr != nil || meter.exhausted || !meter.rootTempJournalSentinel {
+					t.Fatalf("exact marker bound was rejected: exhausted=%v sentinel=%v err=%v",
+						meter.exhausted, meter.rootTempJournalSentinel, proofErr)
+				}
+				return
+			}
+			if !errors.Is(proofErr, errUnsettledRootTempJournal) || !meter.exhausted {
+				t.Fatalf("overflow marker was accepted: exhausted=%v err=%v", meter.exhausted, proofErr)
+			}
+		})
+	}
+}
+
+func TestPurgeSpoolCapsAggregateRootTempMarkerRetirementAtMaximum(t *testing.T) {
+	home := newMetricsTestHome(t)
+	writeStateFixture(t, home, disabledState(7, 2, cleanupDisable))
+	root := mustOpenMutableRoot(t, home)
+	defer func() { _ = root.Close() }()
+	if err := persistSpoolQuota(root, spoolQuota{}); err != nil {
+		t.Fatal(err)
+	}
+	backend, ok := root.backend.(*unixStorageDirectory)
+	if !ok {
+		t.Fatal("root-temp journal test requires Unix storage")
+	}
+	journal, err := backend.openRootTempJournal()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := journal.close(); err != nil {
+		t.Fatal(err)
+	}
+	journalPath := filepath.Join(home.Root(), rootTempJournalDirectoryName)
+	var journalStat unix.Stat_t
+	if err := unix.Stat(journalPath, &journalStat); err != nil {
+		t.Fatal(err)
+	}
+	device := unixStatDevice(journalStat)
+	for index := 0; index < maximumStorageTempAttempts+1; index++ {
+		name := fmt.Sprintf(".pm-tmp-%x-%x", os.Getpid(), uint64(0xc00+index))
+		data, err := encodeBoundRootTempJournalMarker(name, recordIncarnation{dev: device, ino: uint64(index + 1)})
+		if err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(filepath.Join(journalPath, name), data, 0o600); err != nil {
+			t.Fatal(err)
+		}
+	}
+	budget := spoolWorkBudget{
+		maxEntries: 1_000_000, maxDirectories: 100_000,
+		maxReadBytes: 100_000_000, maxNameBytes: 100_000_000,
+	}
+	result, purgeErr := purgeSpoolWithinBudget(root, budget)
+	if result.complete {
+		t.Fatalf("aggregate purge drained more than %d markers: err=%v", maximumStorageTempAttempts, purgeErr)
+	}
+	entries, err := os.ReadDir(journalPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(entries) != 1 {
+		t.Fatalf("aggregate marker retirement left %d entries, want exactly one overflow sentinel", len(entries))
+	}
+}
+
+func TestRootTempJournalOversizedMarkerChargesOnlyMaximumPlusOnePhysicalBytes(t *testing.T) {
+	home := newMetricsTestHome(t)
+	plainRoot := mustOpenMutableRoot(t, home)
+	backend, ok := plainRoot.backend.(*unixStorageDirectory)
+	if !ok {
+		t.Fatal("root-temp journal test requires Unix storage")
+	}
+	journal, err := backend.openRootTempJournal()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := journal.close(); err != nil {
+		t.Fatal(err)
+	}
+	if err := plainRoot.Close(); err != nil {
+		t.Fatal(err)
+	}
+	name := fmt.Sprintf(".pm-tmp-%x-%x", os.Getpid(), uint64(0xa96))
+	markerPath := filepath.Join(home.Root(), rootTempJournalDirectoryName, name)
+	if err := os.WriteFile(markerPath, bytes.Repeat([]byte{'x'}, maximumRootTempJournalMarkerBytes), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	grew := false
+	physicalReadBytes := 0
+	root, err := openStorageRootMutableWithHooks(home, storageTestHooks{
+		beforeRead: func(path string) {
+			if grew || path != markerPath {
+				return
+			}
+			grew = true
+			file, openErr := os.OpenFile(path, os.O_WRONLY|os.O_APPEND, 0)
+			if openErr != nil {
+				t.Fatal(openErr)
+			}
+			_, writeErr := file.Write([]byte{'x'})
+			closeErr := file.Close()
+			if writeErr != nil || closeErr != nil {
+				t.Fatalf("grow marker: write=%v close=%v", writeErr, closeErr)
+			}
+		},
+		afterRead: func(path string, _, read int, _ error) {
+			if path == markerPath {
+				physicalReadBytes += read
+			}
+		},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = root.Close() }()
+	meter := newSpoolWorkMeter(defaultSpoolWorkBudget())
+	meter.physicalDirectories = true
+	proofErr := proveRootTempJournalReadOnlyWithMeter(root, meter, false)
+	if !errors.Is(proofErr, errUnsettledRootTempJournal) || !grew {
+		t.Fatalf("oversized marker proof = grew:%v err:%v", grew, proofErr)
+	}
+	if physicalReadBytes != rootTempJournalMarkerReadLimit || meter.usage.readBytes != uint64(rootTempJournalMarkerReadLimit) {
+		t.Fatalf("oversized marker read = physical:%d metered:%d want:%d",
+			physicalReadBytes, meter.usage.readBytes, rootTempJournalMarkerReadLimit)
+	}
+	if info, err := os.Lstat(markerPath); err != nil || info.Size() != int64(rootTempJournalMarkerReadLimit) {
+		t.Fatalf("oversized marker changed: info=%v err=%v", info, err)
+	}
+}
+
+func TestRootTempJournalStatKnownOversizedSparseMarkerReadsNoBytes(t *testing.T) {
+	home := newMetricsTestHome(t)
+	plainRoot := mustOpenMutableRoot(t, home)
+	backend, ok := plainRoot.backend.(*unixStorageDirectory)
+	if !ok {
+		t.Fatal("root-temp journal test requires Unix storage")
+	}
+	journal, err := backend.openRootTempJournal()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := journal.close(); err != nil {
+		t.Fatal(err)
+	}
+	if err := plainRoot.Close(); err != nil {
+		t.Fatal(err)
+	}
+	name := fmt.Sprintf(".pm-tmp-%x-%x", os.Getpid(), uint64(0xa99))
+	markerPath := filepath.Join(home.Root(), rootTempJournalDirectoryName, name)
+	file, err := os.OpenFile(markerPath, os.O_WRONLY|os.O_CREATE|os.O_EXCL, 0o600)
+	if err != nil {
+		t.Fatal(err)
+	}
+	truncateErr := file.Truncate(8 << 30)
+	closeErr := file.Close()
+	if truncateErr != nil || closeErr != nil {
+		t.Fatalf("create sparse marker: truncate=%v close=%v", truncateErr, closeErr)
+	}
+	reads := 0
+	physicalReadBytes := 0
+	root, err := openStorageRootMutableWithHooks(home, storageTestHooks{
+		beforeRead: func(path string) {
+			if path == markerPath {
+				reads++
+			}
+		},
+		afterRead: func(path string, _, read int, _ error) {
+			if path == markerPath {
+				physicalReadBytes += read
+			}
+		},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = root.Close() }()
+	meter := newSpoolWorkMeter(defaultSpoolWorkBudget())
+	meter.physicalDirectories = true
+	proofErr := proveRootTempJournalReadOnlyWithMeter(root, meter, false)
+	if !errors.Is(proofErr, errUnsettledRootTempJournal) || reads != 0 || physicalReadBytes != 0 {
+		t.Fatalf("sparse oversized marker proof = reads:%d bytes:%d err:%v", reads, physicalReadBytes, proofErr)
+	}
+	if info, err := os.Lstat(markerPath); err != nil || info.Size() != 8<<30 {
+		t.Fatalf("sparse marker changed: info=%v err=%v", info, err)
+	}
+}
+
+func TestRootTempJournalDoesNotCertifyReplacedNamedDirectory(t *testing.T) {
+	home := newMetricsTestHome(t)
+	journalPath := filepath.Join(home.Root(), rootTempJournalDirectoryName)
+	replacedPath := filepath.Join(home.Root(), ".replaced-root-temp-journal")
+	replacementMarker := filepath.Join(journalPath, fmt.Sprintf(".pm-tmp-%x-%x", os.Getpid(), uint64(0xa92)))
+	swapped := false
+	var swapErr error
+	root, err := openStorageRootMutableWithHooks(home, storageTestHooks{
+		beforeStep: func(step storageStep) error {
+			if step != storageStepEnumerate || swapped {
+				return nil
+			}
+			swapped = true
+			if err := os.Rename(journalPath, replacedPath); err != nil {
+				swapErr = err
+				return nil
+			}
+			if err := os.Mkdir(journalPath, 0o700); err != nil {
+				swapErr = err
+				return nil
+			}
+			swapErr = os.WriteFile(replacementMarker, nil, 0o600)
+			return nil
+		},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = root.Close() }()
+	backend, ok := root.backend.(*unixStorageDirectory)
+	if !ok {
+		t.Fatal("root-temp journal test requires Unix storage")
+	}
+	journal, err := backend.openRootTempJournal()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := journal.close(); err != nil {
+		t.Fatal(err)
+	}
+
+	state := &spoolSweepState{
+		root: root, purgeAll: true, meter: newSpoolWorkMeter(defaultSpoolWorkBudget()),
+		seen: make(map[string]struct{}), pruneDirs: make(map[string]*storageDir), failClosedArmed: true,
+	}
+	state.cleanupRootTempJournal()
+	if swapErr != nil {
+		t.Fatalf("replace named journal fixture: %v", swapErr)
+	}
+	if !swapped {
+		t.Fatal("journal path replacement was not injected")
+	}
+	if state.journalSettled {
+		t.Fatal("unlinked old journal descriptor certified the replacement named journal")
+	}
+	if _, err := os.Lstat(replacementMarker); err != nil {
+		t.Fatalf("replacement journal marker was mutated through stale authority: %v", err)
+	}
+}
+
+func TestPurgeExactRootCleanupDeletesOnlyCanonicalAtomicTempRegularFiles(t *testing.T) {
+	home := newMetricsTestHome(t)
+	plainRoot := mustOpenMutableRoot(t, home)
+	if err := persistSpoolQuota(plainRoot, spoolQuota{}); err != nil {
+		t.Fatal(err)
+	}
+	if err := plainRoot.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	canonicalRegular := filepath.Join(home.Root(), fmt.Sprintf(".pm-tmp-%x-%x", os.Getpid(), uint64(0xabc)))
+	canonicalSparse := filepath.Join(home.Root(), fmt.Sprintf(".pm-tmp-%x-%x", os.Getpid(), uint64(0xabd)))
+	fixtureRoot := mustOpenMutableRoot(t, home)
+	writeJournaledRootTempCrashFixture(t, fixtureRoot, filepath.Base(canonicalRegular),
+		[]byte("installation_id = \""+testInstallationID+"\"\n"), 0)
+	writeJournaledRootTempCrashFixture(t, fixtureRoot, filepath.Base(canonicalSparse), nil, 8<<30)
+	if err := fixtureRoot.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	invalidRegulars := []string{
+		"notes.txt",
+		".pm-tmp-crashed-config",
+		".pm-tmp-01-2",
+		".pm-tmp-1-02",
+		".pm-tmp-1-A",
+		".pm-tmp-0-1",
+		".pm-tmp-1-0",
+		".pm-tmp-1-2-extra",
+		".pm-tmp-10000000000000000-1",
+	}
+	for _, name := range invalidRegulars {
+		if err := os.WriteFile(filepath.Join(home.Root(), name), []byte("user-owned residue"), 0o600); err != nil {
+			t.Fatal(err)
+		}
+	}
+	canonicalLater := filepath.Join(home.Root(), fmt.Sprintf(".pm-tmp-%x-%x", os.Getpid(), uint64(0xac1)))
+	fixtureRoot = mustOpenMutableRoot(t, home)
+	writeJournaledRootTempCrashFixture(t, fixtureRoot, filepath.Base(canonicalLater), []byte("later identity temp"), 0)
+	if err := fixtureRoot.Close(); err != nil {
+		t.Fatal(err)
+	}
+	laxTemp := filepath.Join(home.Root(), fmt.Sprintf(".pm-tmp-%x-%x", os.Getpid(), uint64(0xac2)))
+	if err := os.WriteFile(laxTemp, []byte("lax user file"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Chmod(laxTemp, 0o644); err != nil {
+		t.Fatal(err)
+	}
+	linkedTemp := filepath.Join(home.Root(), fmt.Sprintf(".pm-tmp-%x-%x", os.Getpid(), uint64(0xac3)))
+	linkedAlias := filepath.Join(home.Root(), "hard-link-alias")
+	if err := os.WriteFile(linkedTemp, []byte("linked user file"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Link(linkedTemp, linkedAlias); err != nil {
+		t.Fatal(err)
+	}
+	wrongOwnerTemp := filepath.Join(home.Root(), fmt.Sprintf(".pm-tmp-%x-%x", os.Getpid(), uint64(0xac4)))
+	if err := os.WriteFile(wrongOwnerTemp, []byte("wrong-owner user file"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	directoryTemp := filepath.Join(home.Root(), fmt.Sprintf(".pm-tmp-%x-%x", os.Getpid(), uint64(0xabe)))
+	if err := os.MkdirAll(filepath.Join(directoryTemp, "nested"), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	nestedSparse := filepath.Join(directoryTemp, "nested", "poison")
+	if err := os.WriteFile(nestedSparse, nil, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Truncate(nestedSparse, 8<<30); err != nil {
+		t.Fatal(err)
+	}
+	symlinkTemp := filepath.Join(home.Root(), fmt.Sprintf(".pm-tmp-%x-%x", os.Getpid(), uint64(0xabf)))
+	symlinkTarget := filepath.Join(t.TempDir(), "keep")
+	if err := os.WriteFile(symlinkTarget, []byte("outside"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Symlink(symlinkTarget, symlinkTemp); err != nil {
+		t.Fatal(err)
+	}
+	fifoTemp := filepath.Join(home.Root(), fmt.Sprintf(".pm-tmp-%x-%x", os.Getpid(), uint64(0xac0)))
+	if err := unix.Mkfifo(fifoTemp, 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	var tempReadBytes, poisonDirectoryOpens, nestedMetadataAttempts int
+	root, err := openStorageRootMutableWithHooks(home, storageTestHooks{
+		metadata: func(path string, metadata storageMetadata) storageMetadata {
+			if path == wrongOwnerTemp {
+				metadata.uid++
+			}
+			return metadata
+		},
+		beforeDirectoryOpen: func(path string) error {
+			if path == directoryTemp || strings.HasPrefix(path, directoryTemp+string(os.PathSeparator)) {
+				poisonDirectoryOpens++
+			}
+			return nil
+		},
+		beforeMetadataAttempt: func(path string) error {
+			if strings.HasPrefix(path, directoryTemp+string(os.PathSeparator)) {
+				nestedMetadataAttempts++
+			}
+			return nil
+		},
+		afterRead: func(path string, _ int, read int, _ error) {
+			if path == canonicalRegular || path == canonicalSparse || path == canonicalLater ||
+				path == laxTemp || path == linkedTemp || path == wrongOwnerTemp ||
+				strings.HasPrefix(path, directoryTemp+string(os.PathSeparator)) {
+				tempReadBytes += read
+			}
+		},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = root.Close() }()
+
+	budget := defaultSpoolWorkBudget()
+	result, err := purgeSpoolWithinBudget(root, budget)
+	if err == nil || result.complete {
+		t.Fatalf("unrecognized root residue was certified clean: result=%+v err=%v", result, err)
+	}
+	if result.usage.entries > budget.maxEntries || result.usage.directories > budget.maxDirectories ||
+		result.usage.readBytes > budget.maxReadBytes || result.usage.nameBytes > budget.maxNameBytes {
+		t.Fatalf("root-temp purge exceeded shared budget: result=%+v budget=%+v", result.usage, budget)
+	}
+	if tempReadBytes != 0 {
+		t.Fatalf("root-temp purge physically read %d poison bytes", tempReadBytes)
+	}
+	if poisonDirectoryOpens != 0 || nestedMetadataAttempts != 0 {
+		t.Fatalf("root-temp purge descended into preserved directory: opens=%d nested-metadata=%d",
+			poisonDirectoryOpens, nestedMetadataAttempts)
+	}
+	for _, path := range []string{canonicalRegular, canonicalSparse, canonicalLater} {
+		if _, err := os.Lstat(path); !errors.Is(err, fs.ErrNotExist) {
+			t.Fatalf("canonical regular root temp %q remains: %v", filepath.Base(path), err)
+		}
+	}
+	for _, name := range invalidRegulars {
+		if data, err := os.ReadFile(filepath.Join(home.Root(), name)); err != nil || string(data) != "user-owned residue" {
+			t.Fatalf("unrecognized root file %q changed: data=%q err=%v", name, data, err)
+		}
+	}
+	for path, want := range map[string]string{
+		laxTemp:        "lax user file",
+		linkedTemp:     "linked user file",
+		linkedAlias:    "linked user file",
+		wrongOwnerTemp: "wrong-owner user file",
+	} {
+		if data, err := os.ReadFile(path); err != nil || string(data) != want {
+			t.Fatalf("metadata-invalid root file %q changed: data=%q err=%v", filepath.Base(path), data, err)
+		}
+	}
+	for _, path := range []string{directoryTemp, nestedSparse, symlinkTemp, fifoTemp} {
+		if _, err := os.Lstat(path); err != nil {
+			t.Fatalf("preserved root entry %q is missing: %v", filepath.Base(path), err)
+		}
+	}
+	if data, err := os.ReadFile(symlinkTarget); err != nil || string(data) != "outside" {
+		t.Fatalf("root-temp purge followed symlink: data=%q err=%v", data, err)
+	}
+}
+
+func TestExactRootTempUnlinkSyncFailureRequiresLaterRootSync(t *testing.T) {
+	home := newMetricsTestHome(t)
+	canonicalTemp := filepath.Join(home.Root(), fmt.Sprintf(".pm-tmp-%x-%x", os.Getpid(), uint64(0xac5)))
+	injected := errors.New("injected root sync failure after canonical temp unlink")
+	unlinkStarted := false
+	failedSync := false
+	awaitingRecovery := false
+	recoverySyncs := 0
+	root, err := openStorageRootMutableWithHooks(home, storageTestHooks{
+		beforeMutation: func(step storageStep, path string) {
+			if (step == storageStepDelete || step == storageStepUnlink) && path == canonicalTemp {
+				unlinkStarted = true
+			}
+		},
+		beforeStep: func(step storageStep) error {
+			if unlinkStarted && !failedSync && step == storageStepDirectorySync {
+				failedSync = true
+				awaitingRecovery = true
+				return injected
+			}
+			if awaitingRecovery && step == storageStepDirectorySync {
+				recoverySyncs++
+				awaitingRecovery = false
+			}
+			return nil
+		},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = root.Close() }()
+	writeJournaledRootTempCrashFixture(t, root, filepath.Base(canonicalTemp), []byte("identity"), 0)
+	first := &spoolSweepState{
+		root: root, meter: newSpoolWorkMeter(defaultSpoolWorkBudget()), failClosedArmed: true,
+	}
+	first.cleanupRootTempJournal()
+	if !failedSync || !errors.Is(first.operation, injected) {
+		t.Fatalf("canonical temp unlink sync failure = failed:%v err:%v", failedSync, first.operation)
+	}
+	if _, err := os.Lstat(canonicalTemp); !errors.Is(err, fs.ErrNotExist) {
+		t.Fatalf("applied canonical temp unlink remains: %v", err)
+	}
+
+	second := &spoolSweepState{
+		root: root, meter: newSpoolWorkMeter(defaultSpoolWorkBudget()), failClosedArmed: true,
+	}
+	second.cleanupRootTempJournal()
+	if second.operation != nil || recoverySyncs == 0 || awaitingRecovery {
+		t.Fatalf("canonical temp absence replay = recovery-syncs:%d awaiting:%v err:%v",
+			recoverySyncs, awaitingRecovery, second.operation)
+	}
+}
+
+func TestPurgeSpoolPreservesCrossDeviceDescendantsAtEveryDepth(t *testing.T) {
+	for _, boundary := range []string{
+		"queue", "inflight", "generation", "nested", "active-control", "retired-control",
+	} {
+		t.Run(boundary, func(t *testing.T) {
+			home := newMetricsTestHome(t)
+			plainRoot := mustOpenMutableRoot(t, home)
+			priorQuota := spoolQuota{Events: 1, Bytes: 4}
+			if err := persistSpoolQuota(plainRoot, priorQuota); err != nil {
+				t.Fatal(err)
+			}
+			if err := plainRoot.Close(); err != nil {
+				t.Fatal(err)
+			}
+			generationPath := filepath.Join(home.Root(), queueDirectoryName, testSpoolGeneration)
+			boundaryPath := filepath.Join(generationPath, "mounted")
+			switch boundary {
+			case "queue":
+				boundaryPath = filepath.Join(home.Root(), queueDirectoryName)
+			case "inflight":
+				boundaryPath = filepath.Join(home.Root(), inflightDirectoryName)
+			case "generation":
+				boundaryPath = generationPath
+			case "active-control":
+				boundaryPath = filepath.Join(home.Root(), spoolControlDirectoryName)
+			case "retired-control":
+				boundaryPath = filepath.Join(home.Root(), retiredControlDirectoryName)
+			}
+			sentinelPath := filepath.Join(boundaryPath, "inside", "keep")
+			if err := os.MkdirAll(filepath.Dir(sentinelPath), 0o700); err != nil {
+				t.Fatal(err)
+			}
+			if err := os.WriteFile(sentinelPath, []byte("keep"), 0o600); err != nil {
+				t.Fatal(err)
+			}
+			boundaryOpens := 0
+			boundaryMutations := 0
+			boundaryReadBytes := 0
+			root, err := openStorageRootMutableWithHooks(home, storageTestHooks{
+				metadata: func(path string, metadata storageMetadata) storageMetadata {
+					if path == boundaryPath {
+						metadata.dev ^= 1 << 63
+					}
+					return metadata
+				},
+				beforeDirectoryOpen: func(path string) error {
+					if path == boundaryPath || strings.HasPrefix(path, boundaryPath+string(os.PathSeparator)) {
+						boundaryOpens++
+					}
+					return nil
+				},
+				beforeMutation: func(_ storageStep, path string) {
+					if path == boundaryPath || strings.HasPrefix(path, boundaryPath+string(os.PathSeparator)) {
+						boundaryMutations++
+					}
+				},
+				beforeExchange: func() error {
+					boundaryMutations++
+					return nil
+				},
+				afterRead: func(path string, _ int, read int, _ error) {
+					if path == boundaryPath || strings.HasPrefix(path, boundaryPath+string(os.PathSeparator)) {
+						boundaryReadBytes += read
+					}
+				},
+			})
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer func() { _ = root.Close() }()
+			result, purgeErr := purgeSpoolWithinBudget(root, defaultSpoolWorkBudget())
+			if !errors.Is(purgeErr, syscall.EXDEV) || result.complete ||
+				result.removedEvents != 0 || result.removedBytes != 0 {
+				t.Fatalf("cross-device %s purge = result:%+v err:%v", boundary, result, purgeErr)
+			}
+			if boundaryOpens != 0 || boundaryMutations != 0 || boundaryReadBytes != 0 {
+				t.Fatalf("cross-device %s activity = opens:%d mutations:%d read-bytes:%d",
+					boundary, boundaryOpens, boundaryMutations, boundaryReadBytes)
+			}
+			if data, err := os.ReadFile(sentinelPath); err != nil || string(data) != "keep" {
+				t.Fatalf("cross-device %s sentinel changed: data=%q err=%v", boundary, data, err)
+			}
+			requireIncompletePurgeFailClosedEvidence(t, root, priorQuota)
+		})
+	}
+}
+
+func TestPurgeExactRootProofReservesDirectoryTraversalEnvelope(t *testing.T) {
+	home, _, _ := newRecordServiceFixture(t, testEventIDThree)
+	root := mustOpenMutableRoot(t, home)
+	defer func() { _ = root.Close() }()
+	if err := persistSpoolQuota(root, spoolQuota{}); err != nil {
+		t.Fatal(err)
+	}
+	result := spoolSweepResult{}
+	for attempts := 0; attempts < 8 && !result.complete; attempts++ {
+		var err error
+		result, err = purgeSpool(root, defaultSpoolWorkBudget())
+		if err != nil {
+			t.Fatal(err)
+		}
+	}
+	if !result.complete {
+		t.Fatal("fixture did not reach an exact clean-root proof")
+	}
+
+	budget := defaultSpoolWorkBudget()
+	budget.maxDirectories = spoolFixedDirectoryReserve + 1
+	result, err := purgeSpool(root, budget)
+	if err != nil {
+		t.Fatalf("directory-envelope exhaustion became an operation error: %v", err)
+	}
+	if result.complete {
+		t.Fatal("exact-root proof ignored the directory traversal envelope")
+	}
+	if result.usage.directories > budget.maxDirectories {
+		t.Fatalf("exact-root proof used %d directories, budget %d", result.usage.directories, budget.maxDirectories)
+	}
+}
+
 func TestPurgeLaxTopLevelSpoolTreesUsesOneMeterAndRequiresMutationFreeZeroProof(t *testing.T) {
 	for _, treeName := range []string{queueDirectoryName, inflightDirectoryName} {
 		for _, shape := range []string{"empty", "deep"} {
@@ -1935,7 +3767,7 @@ func TestPurgeLaxTopLevelSpoolTreesUsesOneMeterAndRequiresMutationFreeZeroProof(
 				defer func() { _ = root.Close() }()
 				budget := spoolWorkBudget{
 					maxEntries:     spoolFixedEntryEnvelope + 32,
-					maxDirectories: spoolFixedDirectoryReserve + 2*spoolTraversalDirectoryEnvelope,
+					maxDirectories: spoolMinimumDirectoryProgress,
 					maxReadBytes:   spoolFixedReadEnvelope + 3*maximumControlFileBytes,
 					maxNameBytes:   spoolFixedNameEnvelope + 4096,
 				}
@@ -2024,7 +3856,7 @@ func TestPurgeMalformedSpoolControlConvergesWithoutFollowingEntries(t *testing.T
 			root := mustOpenMutableRoot(t, home)
 			defer func() { _ = root.Close() }()
 			budget := spoolWorkBudget{
-				maxEntries: spoolFixedEntryEnvelope + 64, maxDirectories: 5,
+				maxEntries: spoolFixedEntryEnvelope + 64, maxDirectories: spoolMinimumDirectoryProgress,
 				maxReadBytes: spoolFixedReadEnvelope + 3*maximumControlFileBytes,
 				maxNameBytes: spoolFixedNameEnvelope + 8192,
 			}
@@ -2370,9 +4202,9 @@ func TestSpoolSweepMakesProgressWithOneOrTwoOrdinaryDirectorySlotsLeft(t *testin
 			defer func() { _ = root.Close() }()
 			physicalOpens = 0
 			budget := defaultSpoolWorkBudget()
-			// Top-level tree handle+iterator consume two successful opens. Leave
-			// exactly one or two ordinary slots before the first descent.
-			budget.maxDirectories = spoolFixedDirectoryReserve + 2 + remaining
+			// Journal and top-level tree traversals consume two opens each. Leave
+			// exactly one or two ordinary slots before the first child descent.
+			budget.maxDirectories = spoolFixedDirectoryReserve + 2*spoolTraversalDirectoryEnvelope + remaining
 			result, err := purgeSpool(root, budget)
 			if err != nil {
 				t.Fatal(err)
@@ -2494,7 +4326,6 @@ func TestPurgeMalformedKnownTreeDoesNotEnumerateOrStarveBehindRootSiblings(t *te
 				beforeStep: func(step storageStep) error {
 					if step == storageStepEnumerate && lastMetadataPath == home.Root() {
 						rootEnumerations++
-						return errors.New("root enumeration is forbidden for fixed spool-tree cleanup")
 					}
 					return nil
 				},
@@ -2519,11 +4350,19 @@ func TestPurgeMalformedKnownTreeDoesNotEnumerateOrStarveBehindRootSiblings(t *te
 			if result.complete {
 				t.Fatal("tree-mutating malformed-tree purge certified an empty spool")
 			}
+			if rootEnumerations != 0 {
+				t.Fatalf("fixed malformed-tree cleanup enumerated the root %d times before making known-tree progress", rootEnumerations)
+			}
 			requireIncompletePurgeFailClosedEvidence(t, root, quota)
-			for attempts := 0; attempts < 64 && !result.complete; attempts++ {
+			var cleanupErr error
+			for attempts := 0; attempts < 64; attempts++ {
 				result, err = purgeSpool(root, defaultSpoolWorkBudget())
-				if err != nil {
-					t.Fatal(err)
+				cleanupErr = err
+				if errors.Is(cleanupErr, errUnrecognizedMetricsRootEntry) {
+					break
+				}
+				if cleanupErr != nil {
+					t.Fatal(cleanupErr)
 				}
 				budget := defaultSpoolWorkBudget()
 				if result.usage.entries > budget.maxEntries || result.usage.directories > budget.maxDirectories ||
@@ -2531,21 +4370,19 @@ func TestPurgeMalformedKnownTreeDoesNotEnumerateOrStarveBehindRootSiblings(t *te
 					t.Fatalf("purge usage exceeded its root-global budget: %+v", result.usage)
 				}
 			}
-			if !result.complete {
-				t.Fatal("fixed-name malformed-tree cleanup did not converge")
+			if !errors.Is(cleanupErr, errUnrecognizedMetricsRootEntry) || result.complete {
+				t.Fatalf("unknown root siblings did not keep exact cleanup pending: result=%+v err=%v", result, cleanupErr)
 			}
-			if rootEnumerations != 0 {
-				t.Fatalf("malformed-tree cleanup enumerated the root %d times", rootEnumerations)
+			if rootEnumerations == 0 {
+				t.Fatal("final exact-root proof never enumerated the root")
 			}
-			if got := readQuotaFromRoot(t, root); got != (spoolQuota{}) {
-				t.Fatalf("converged purge quota = %+v", got)
-			}
+			requireIncompletePurgeFailClosedEvidence(t, root, quota)
 			if _, err := os.Lstat(queuePath); !errors.Is(err, fs.ErrNotExist) {
 				t.Fatalf("malformed queue remains: %v", err)
 			}
 			for _, sibling := range []string{firstSibling, lastSibling} {
 				if data, err := os.ReadFile(sibling); err != nil || string(data) != "control" {
-					t.Fatalf("unrelated root control %q changed: data=%q err=%v", sibling, data, err)
+					t.Fatalf("unknown root entry %q changed: data=%q err=%v", sibling, data, err)
 				}
 			}
 			if outsideMarker != "" {
@@ -2684,8 +4521,10 @@ func TestPurgeSpoolConvergesWhenMalformedNestingExceedsDirectoryBudget(t *testin
 		t.Fatal(err)
 	}
 	budget := spoolWorkBudget{
-		maxEntries:     spoolFixedEntryEnvelope + 100,
-		maxDirectories: spoolFixedDirectoryReserve + 2*spoolTraversalDirectoryEnvelope,
+		maxEntries: spoolFixedEntryEnvelope + 100,
+		// Journal proof, top-level tree traversal, and one nested-child step
+		// each consume a two-open traversal envelope.
+		maxDirectories: spoolMinimumDirectoryProgress,
 		maxReadBytes:   spoolFixedReadEnvelope + 1, maxNameBytes: spoolFixedNameEnvelope + 4096,
 	}
 	result := spoolSweepResult{}
@@ -2700,7 +4539,7 @@ func TestPurgeSpoolConvergesWhenMalformedNestingExceedsDirectoryBudget(t *testin
 		}
 	}
 	if !result.complete {
-		t.Fatal("malformed deep nesting made no bounded cleanup progress")
+		t.Fatalf("malformed deep nesting made no bounded cleanup progress: result=%+v", result)
 	}
 	if _, err := os.Lstat(filepath.Join(home.Root(), queueDirectoryName, generation)); !errors.Is(err, fs.ErrNotExist) {
 		t.Fatalf("deep generation remains: %v", err)
@@ -4947,7 +6786,7 @@ func TestNoReplaceAppliedThenEINTRClassifiesWithoutRetry(t *testing.T) {
 		targetAfter, targetErr := os.Stat(targetPath)
 		_, tempErr := os.Lstat(tempPath)
 		entry, entryErr := root.lookupEntry("event.json")
-		if injectedErr != nil || writeErr != nil || attempts != 1 || syncs != 1 || targetErr != nil ||
+		if injectedErr != nil || writeErr != nil || attempts != 1 || syncs != 4 || targetErr != nil ||
 			tempBefore == nil || !os.SameFile(tempBefore, targetAfter) || !errors.Is(tempErr, fs.ErrNotExist) ||
 			entryErr != nil || entry.metadata.nlink != 1 {
 			t.Fatalf("applied-then-EINTR no-replace rename = err:%v injected:%v attempts:%d syncs:%d targetErr:%v tempErr:%v entry:%+v entryErr:%v",
@@ -5455,7 +7294,7 @@ func TestStorageReplaceRenameEINTRClassificationCoversEveryCallsite(t *testing.T
 		result, writeErr := root.writeFileAtomicOutcome("target", []byte("replacement"))
 		data, readErr := os.ReadFile(targetPath)
 		_, tempErr := os.Lstat(tempPath)
-		if injectedErr != nil || writeErr != nil || result.state != storageWriteAppliedDurable || attempts != 1 || syncs != 1 ||
+		if injectedErr != nil || writeErr != nil || result.state != storageWriteAppliedDurable || attempts != 1 || syncs != 4 ||
 			readErr != nil || string(data) != "replacement" || !errors.Is(tempErr, fs.ErrNotExist) {
 			t.Fatalf("applied atomic-replace EINTR = result:%v err:%v injected:%v attempts:%d syncs:%d data:%q readErr:%v tempErr:%v",
 				result.state, writeErr, injectedErr, attempts, syncs, data, readErr, tempErr)
@@ -6229,7 +8068,7 @@ func TestSpoolNestedPurgeConvergesAtFileDescriptorLimitSixteen(t *testing.T) {
 		after := fallbackProgressFingerprint(t, home.Root())
 		strongEvidence := result.complete || hasStrongFailClosedSpoolEvidence(root)
 		closeErr := root.Close()
-		if purgeErr != nil || closeErr != nil || result.usage.directories > 5 ||
+		if purgeErr != nil || closeErr != nil || result.usage.directories > spoolMinimumDirectoryProgress ||
 			!strongEvidence || !result.complete && before == after {
 			t.Fatalf("minimum-NOFILE purge attempt %d = complete:%v err:%v close:%v progressed:%v evidence:%v usage:%+v",
 				attempt+1, result.complete, purgeErr, closeErr, before != after, strongEvidence, result.usage)
@@ -6250,9 +8089,9 @@ func TestSpoolDirectoryBudgetDerivedFromSoftLimit(t *testing.T) {
 		softLimit uint64
 		want      uint64
 	}{
-		{name: "zero descriptors still attempts the progress envelope", requested: maximumCleanupDirectories, softLimit: 0, want: 5},
-		{name: "sixteen descriptors", requested: maximumCleanupDirectories, softLimit: 16, want: 5},
-		{name: "twenty descriptors", requested: maximumCleanupDirectories, softLimit: 20, want: 5},
+		{name: "zero descriptors still attempts the progress envelope", requested: maximumCleanupDirectories, softLimit: 0, want: spoolMinimumDirectoryProgress},
+		{name: "sixteen descriptors", requested: maximumCleanupDirectories, softLimit: 16, want: spoolMinimumDirectoryProgress},
+		{name: "twenty descriptors", requested: maximumCleanupDirectories, softLimit: 20, want: spoolMinimumDirectoryProgress},
 		{name: "one hundred twenty eight descriptors", requested: maximumCleanupDirectories, softLimit: 128, want: 32},
 		{name: "large limit retains caller cap", requested: maximumCleanupDirectories, softLimit: 4096, want: maximumCleanupDirectories},
 		{name: "explicit smaller budget is not raised", requested: 4, softLimit: 16, want: 4},
@@ -7166,7 +9005,7 @@ func TestDualControlFullBreakerExchangeMakesBoundedPurgeProgress(t *testing.T) {
 			}
 
 			budget := defaultSpoolWorkBudget()
-			budget.maxDirectories = 3
+			budget.maxDirectories = 4
 			root, err := openStorageRootMutableWithHooks(home, hooks)
 			if err != nil {
 				t.Fatal(err)
@@ -7951,7 +9790,7 @@ func TestUnsafeQuotaShapesConvergeWithoutFollowingEntries(t *testing.T) {
 				}
 				defer func() { _ = root.Close() }()
 				budget := spoolWorkBudget{
-					maxEntries: spoolFixedEntryEnvelope + 64, maxDirectories: 5,
+					maxEntries: spoolFixedEntryEnvelope + 64, maxDirectories: spoolMinimumDirectoryProgress,
 					maxReadBytes: spoolFixedReadEnvelope + 3*maximumControlFileBytes,
 					maxNameBytes: spoolFixedNameEnvelope + 8192,
 				}
@@ -8735,9 +10574,10 @@ func TestDirectoryOpenExpiryStopsSafeValidationAndRecoverySync(t *testing.T) {
 }
 
 func TestFixedControlReadEnvelopeIncludesLimitProbeAndInventoriesCallsites(t *testing.T) {
-	wantReadEnvelope := uint64(3*maximumQuotaBytes + 4*maximumRelocationBytes + 4)
+	wantReadEnvelope := uint64(3*maximumQuotaBytes+4*maximumRelocationBytes+4) +
+		3*maximumStorageTempAttempts*rootTempJournalMarkerReadLimit
 	if spoolFixedReadEnvelope != wantReadEnvelope {
-		t.Fatalf("fixed read envelope = %d, want %d including four physical limit probes", spoolFixedReadEnvelope, wantReadEnvelope)
+		t.Fatalf("fixed read envelope = %d, want %d including marker and control limit probes", spoolFixedReadEnvelope, wantReadEnvelope)
 	}
 	fileSet := token.NewFileSet()
 	parsed, err := parser.ParseFile(fileSet, "spool.go", nil, 0)
@@ -8756,7 +10596,7 @@ func TestFixedControlReadEnvelopeIncludesLimitProbeAndInventoriesCallsites(t *te
 			return true
 		}
 		switch selector.Sel.Name {
-		case "chargeFixedEntry", "chargeFixedRead", "chargeFixedDirectory", "availableFixedSlots", "claimFixedWorkEnvelope":
+		case "chargeFixedEntry", "chargeFixedRead", "chargeFixedDirectory", "chargeFixedTraversalDirectory", "availableFixedSlots", "claimFixedWorkEnvelope":
 			calls[selector.Sel.Name]++
 		}
 		if selector.Sel.Name != "chargeFixedRead" || len(call.Args) != 1 {
@@ -8776,8 +10616,8 @@ func TestFixedControlReadEnvelopeIncludesLimitProbeAndInventoriesCallsites(t *te
 		return true
 	})
 	wantCalls := map[string]int{
-		"chargeFixedEntry": 22, "chargeFixedRead": 8, "chargeFixedDirectory": 5,
-		"availableFixedSlots": 2, "claimFixedWorkEnvelope": 4,
+		"chargeFixedEntry": 24, "chargeFixedRead": 9, "chargeFixedDirectory": 7, "chargeFixedTraversalDirectory": 2,
+		"availableFixedSlots": 2, "claimFixedWorkEnvelope": 5,
 	}
 	if fmt.Sprint(calls) != fmt.Sprint(wantCalls) || limitReads["maximumQuotaBytes"] != 2 || limitReads["maximumRelocationBytes"] != 2 {
 		t.Fatalf("fixed work callsite inventory = calls:%v limitReads:%v, want calls:%v quota probes:2 relocation probes:2",
@@ -9112,6 +10952,55 @@ func mustOpenMutableRoot(t *testing.T, home gchome.ProductUsageHome) *storageRoo
 		t.Fatalf("open mutable root: %v", err)
 	}
 	return root
+}
+
+func writeJournaledRootTempCrashFixture(t *testing.T, root *storageRoot, name string, data []byte, sparseSize int64) {
+	t.Helper()
+	backend, ok := root.backend.(*unixStorageDirectory)
+	if !ok {
+		t.Fatal("journaled root-temp fixture requires Unix storage")
+	}
+	journal, err := backend.openRootTempJournal()
+	if err != nil {
+		t.Fatal(err)
+	}
+	marker, err := createRootTempJournalMarker(backend, journal, name)
+	if err != nil {
+		_ = journal.close()
+		t.Fatal(err)
+	}
+	rootFD, err := backend.duplicateFD()
+	if err != nil {
+		_ = marker.close()
+		t.Fatal(err)
+	}
+	tempFD, tempMetadata, err := createPrivateTempFileNamed(rootFD, backend.path, backend.euid, backend.hooks, name)
+	if err != nil {
+		_ = unix.Close(rootFD)
+		_ = marker.close()
+		t.Fatal(err)
+	}
+	if err = syncDirectoryFD(rootFD, backend.hooks); err == nil {
+		err = marker.bindTemp(tempMetadata)
+	}
+	if len(data) != 0 {
+		if err == nil {
+			err = writeAllFD(tempFD, data, backend.hooks)
+		}
+	}
+	if err == nil && sparseSize > 0 {
+		err = unix.Ftruncate(tempFD, sparseSize)
+	}
+	if err == nil {
+		err = syncFileFD(tempFD, backend.hooks)
+	}
+	closeErr := unix.Close(tempFD)
+	syncErr := syncDirectoryFD(rootFD, backend.hooks)
+	rootCloseErr := unix.Close(rootFD)
+	markerCloseErr := marker.close()
+	if err := errors.Join(err, closeErr, syncErr, rootCloseErr, markerCloseErr); err != nil {
+		t.Fatal(err)
+	}
 }
 
 func mustOpenSpoolGeneration(t *testing.T, root *storageRoot, tree, generation string) *storageDir {

@@ -163,17 +163,22 @@ type serviceRelease struct {
 // serviceDependencies is package-private by design. Unit tests can exercise a
 // marked synthetic release; normal binaries can only call OpenProduction.
 type serviceDependencies struct {
-	home                  gchome.ProductUsageHome
-	homeErr               error
-	homeReason            StateReason
-	release               serviceRelease
-	notice                noticeDefinition
-	getenv                func(string) string
-	newUUID               func() (string, error)
-	now                   func() time.Time
-	beforeRecordOperation func(recordOperation)
-	verifyTTY             func(io.Writer) bool
-	storageHooks          storageTestHooks
+	home                      gchome.ProductUsageHome
+	homeErr                   error
+	homeReason                StateReason
+	release                   serviceRelease
+	notice                    noticeDefinition
+	getenv                    func(string) string
+	newUUID                   func() (string, error)
+	now                       func() time.Time
+	beforeRecordOperation     func(recordOperation)
+	verifyTTY                 func(io.Writer) bool
+	storageHooks              storageTestHooks
+	disableUploaderWait       time.Duration
+	disableStateWait          time.Duration
+	disableCleanupBudget      spoolWorkBudget
+	beforeDisableUploaderLock func()
+	controlCloseError         func(controlCloseTarget) error
 }
 
 // Service owns the lazy consent and identity state machine.
@@ -220,6 +225,30 @@ type stateVersion struct {
 	recordLease      *storageRecordLease
 }
 
+// lockedState is a capability proving that state.lock is held for root. Code
+// that already owns uploader.lock acquires this capability second and passes
+// it to caller-held state/spool helpers; those helpers must never reacquire
+// state.lock themselves.
+type lockedState struct {
+	root   *storageRoot
+	lock   *advisoryLock
+	closed atomic.Bool
+}
+
+func (locked *lockedState) Close() error {
+	if locked == nil || !locked.closed.CompareAndSwap(false, true) {
+		return nil
+	}
+	if locked.lock == nil {
+		return nil
+	}
+	return locked.lock.Release()
+}
+
+func (locked *lockedState) valid() bool {
+	return locked != nil && locked.root != nil && locked.lock != nil && !locked.closed.Load()
+}
+
 func stateVersionFrom(state persistedState) stateVersion {
 	return stateVersion{counterNamespace: state.CounterNamespace, stateGeneration: state.StateGeneration}
 }
@@ -251,6 +280,7 @@ type cleanupToken struct {
 	stateGeneration  uint64
 	cleanupEpoch     uint64
 	kind             cleanupKind
+	barrier          persistedState
 }
 
 func (token cleanupToken) Close() error {
@@ -270,7 +300,43 @@ func cleanupTokenFromLoaded(loaded *loadedState) cleanupToken {
 		stateGeneration:  loaded.state.StateGeneration,
 		cleanupEpoch:     loaded.state.CleanupEpoch,
 		kind:             loaded.state.CleanupKind,
+		barrier:          loaded.state,
 	}
+}
+
+// prepareCleanupLocked establishes the durability barrier required before a
+// cleanup owner may delete local data. A waiter can open the root before a
+// peer installs an applied-but-unsynced state record, so mutable-root open
+// recovery alone is insufficient: sync and exact-token revalidation must
+// happen after uploader.lock then state.lock are held.
+func (service *Service) prepareCleanupLocked(locked *lockedState, token cleanupToken) error {
+	if service == nil || !locked.valid() || token.recordLease == nil {
+		return errors.New("productmetrics: invalid cleanup authority")
+	}
+	if err := service.revalidateCleanupTokenLocked(locked, token); err != nil {
+		return err
+	}
+	if err := locked.root.syncDirectory(); err != nil {
+		return fmt.Errorf("productmetrics: sync cleanup barrier: %w", err)
+	}
+	return service.revalidateCleanupTokenLocked(locked, token)
+}
+
+func (service *Service) revalidateCleanupTokenLocked(locked *lockedState, token cleanupToken) error {
+	if service == nil || !locked.valid() || token.recordLease == nil {
+		return ErrStateChangedConcurrently
+	}
+	loaded := loadStateFromDirectory(locked.root)
+	defer func() { _ = loaded.Close() }()
+	if loaded.err != nil || !loaded.present || loaded.lease == nil ||
+		!token.recordLease.Matches(loaded.lease) ||
+		loaded.state.CounterNamespace != token.counterNamespace ||
+		loaded.state.StateGeneration != token.stateGeneration ||
+		loaded.state.CleanupEpoch != token.cleanupEpoch || loaded.state.CleanupKind != token.kind ||
+		loaded.state != token.barrier {
+		return ErrStateChangedConcurrently
+	}
+	return nil
 }
 
 // OpenProduction validates and snapshots side-effect-free dependencies. It
@@ -403,10 +469,12 @@ func (service *Service) RecordingPermit(invocation InvocationContext) RecordingP
 		_ = service.invalidateNotice(ctx, stateVersionFromLoaded(loaded))
 		return RecordingPermit{}
 	}
-	if projection.state == StateServerPaused && projection.reason == ReasonGreaterEpochResumeNeeded {
+	if projection.state == StateServerPaused &&
+		(projection.reason == ReasonPauseCleanupPending || projection.reason == ReasonGreaterEpochResumeNeeded) &&
+		service.deps.release.metricsEpoch > state.PausedThroughMetricsEpoch {
 		ctx, cancel := context.WithTimeout(context.Background(), stateLockTimeout)
 		defer cancel()
-		_ = service.resumeGreaterEpoch(ctx, stateVersionFromLoaded(loaded))
+		_, _ = service.finishPauseCleanupAndResume(ctx)
 		return RecordingPermit{}
 	}
 	if projection.state != StateEnabled {
@@ -600,12 +668,16 @@ func (service *Service) invalidateNotice(ctx context.Context, expected stateVers
 		}
 		return incrementStateGeneration(state)
 	})
-	_ = result.Close()
-	return err
+	return errors.Join(err, result.Close())
 }
 
-func (service *Service) resumeGreaterEpoch(ctx context.Context, expected stateVersion) error {
-	result, err := service.mutateState(ctx, expected, stateMutationOptions{allowAppliedActivation: true}, func(state *persistedState) error {
+func (service *Service) resumeGreaterEpochLocked(locked *lockedState, expected stateVersion) error {
+	result, err := service.mutateStateLocked(locked, expected, stateMutationOptions{allowAppliedActivation: true}, service.resumeGreaterEpochMutation())
+	return errors.Join(err, result.Close())
+}
+
+func (service *Service) resumeGreaterEpochMutation() func(*persistedState) error {
+	return func(state *persistedState) error {
 		if state.Preference != preferenceEnabled || state.CleanupKind != cleanupNone ||
 			state.PausedThroughMetricsEpoch == 0 || service.deps.release.metricsEpoch <= state.PausedThroughMetricsEpoch ||
 			state.RequiredNoticeVersion != service.deps.notice.version ||
@@ -621,18 +693,56 @@ func (service *Service) resumeGreaterEpoch(ctx context.Context, expected stateVe
 		}
 		state.SpoolGeneration = spool
 		return incrementStateGeneration(state)
-	})
-	_ = result.Close()
-	return err
+	}
 }
 
 func (service *Service) beginDisable(ctx context.Context, expected stateVersion) (cleanupToken, error) {
+	if service == nil {
+		return cleanupToken{}, errors.New("productmetrics: service is nil")
+	}
+	if service.deps.homeErr != nil {
+		return cleanupToken{}, service.deps.homeErr
+	}
+	root, err := openStorageRootMutableWithHooks(service.deps.home, service.deps.storageHooks)
+	if err != nil {
+		return cleanupToken{}, err
+	}
+	token, disableErr := service.beginDisableAtRoot(ctx, expected, root)
+	if closeErr := root.Close(); closeErr != nil {
+		disableErr = errors.Join(disableErr, closeErr, token.Close())
+		token = cleanupToken{}
+	}
+	return token, disableErr
+}
+
+// beginDisableAtRoot keeps the exact metrics-root descriptor alive from the
+// durable disable transition through the caller's uploader barrier. A lexical
+// root replacement can therefore never redirect quiescence or cleanup to a
+// different lock domain.
+func (service *Service) beginDisableAtRoot(ctx context.Context, expected stateVersion, root *storageRoot) (cleanupToken, error) {
 	bound, closeBound, err := service.bindDisableExpectation(expected)
 	if err != nil {
 		return cleanupToken{}, err
 	}
 	defer closeBound()
-	result, err := service.mutateState(ctx, bound, stateMutationOptions{recoverInvalid: true}, func(state *persistedState) error {
+	locked, err := service.lockState(ctx, root)
+	if err != nil {
+		return cleanupToken{}, err
+	}
+	result, mutationErr := service.mutateStateLocked(locked, bound, stateMutationOptions{recoverInvalid: true}, service.beginDisableMutation())
+	closeErr := locked.Close()
+	if mutationErr != nil || closeErr != nil {
+		return cleanupToken{}, errors.Join(mutationErr, closeErr, result.Close())
+	}
+	defer func() { _ = result.Close() }()
+	return cleanupTokenFromLoaded(&result), nil
+}
+
+func (service *Service) beginDisableMutation() func(*persistedState) error {
+	return func(state *persistedState) error {
+		if state.Preference == preferenceDisabled && state.CleanupKind == cleanupDisable {
+			return nil
+		}
 		if mutationCounterRecoveryRequired(*state) {
 			// The next ordinary increment would enter the reserved terminal
 			// value. Opt-out must remain available, so use the same fresh,
@@ -663,9 +773,6 @@ func (service *Service) beginDisable(ctx context.Context, expected stateVersion)
 			}
 			return nil
 		}
-		if state.Preference == preferenceDisabled && state.CleanupKind == cleanupDisable {
-			return nil
-		}
 		state.Preference = preferenceDisabled
 		state.InstallationID = ""
 		state.SpoolGeneration = ""
@@ -684,13 +791,7 @@ func (service *Service) beginDisable(ctx context.Context, expected stateVersion)
 			return err
 		}
 		return nil
-	})
-	if err != nil {
-		_ = result.Close()
-		return cleanupToken{}, err
 	}
-	defer func() { _ = result.Close() }()
-	return cleanupTokenFromLoaded(&result), nil
 }
 
 // bindDisableExpectation turns the disable call's numeric observation into an
@@ -736,15 +837,49 @@ func (service *Service) bindDisableExpectation(expected stateVersion) (stateVers
 }
 
 func (service *Service) applyPause(ctx context.Context, permit RecordingPermit, pausedThrough uint64) (cleanupToken, error) {
-	if !permit.Valid() || pausedThrough < permit.metricsEpoch ||
-		permit.releaseVersion != service.deps.release.releaseVersion || permit.metricsEpoch != service.deps.release.metricsEpoch {
+	if err := service.validatePauseAuthority(permit, pausedThrough); err != nil {
 		return cleanupToken{}, ErrStateChangedConcurrently
 	}
 	result, err := service.mutateState(ctx, stateVersion{
 		counterNamespace: permit.counterNamespace,
 		stateGeneration:  permit.stateGeneration,
 		recordLease:      permit.recordLease,
-	}, stateMutationOptions{}, func(state *persistedState) error {
+	}, stateMutationOptions{}, service.pauseMutation(permit, pausedThrough))
+	if err != nil {
+		_ = result.Close()
+		return cleanupToken{}, err
+	}
+	defer func() { _ = result.Close() }()
+	return cleanupTokenFromLoaded(&result), nil
+}
+
+func (service *Service) applyPauseLocked(locked *lockedState, permit RecordingPermit, pausedThrough uint64) (cleanupToken, error) {
+	if err := service.validatePauseAuthority(permit, pausedThrough); err != nil {
+		return cleanupToken{}, err
+	}
+	result, err := service.mutateStateLocked(locked, stateVersion{
+		counterNamespace: permit.counterNamespace,
+		stateGeneration:  permit.stateGeneration,
+		recordLease:      permit.recordLease,
+	}, stateMutationOptions{}, service.pauseMutation(permit, pausedThrough))
+	if err != nil {
+		_ = result.Close()
+		return cleanupToken{}, err
+	}
+	defer func() { _ = result.Close() }()
+	return cleanupTokenFromLoaded(&result), nil
+}
+
+func (service *Service) validatePauseAuthority(permit RecordingPermit, pausedThrough uint64) error {
+	if service == nil || !permit.Valid() || pausedThrough < permit.metricsEpoch ||
+		permit.releaseVersion != service.deps.release.releaseVersion || permit.metricsEpoch != service.deps.release.metricsEpoch {
+		return ErrStateChangedConcurrently
+	}
+	return nil
+}
+
+func (service *Service) pauseMutation(permit RecordingPermit, pausedThrough uint64) func(*persistedState) error {
+	return func(state *persistedState) error {
 		if !stateMatchesPermit(*state, permit) {
 			return ErrStateChangedConcurrently
 		}
@@ -782,13 +917,7 @@ func (service *Service) applyPause(ctx context.Context, permit RecordingPermit, 
 			return err
 		}
 		return nil
-	})
-	if err != nil {
-		_ = result.Close()
-		return cleanupToken{}, err
 	}
-	defer func() { _ = result.Close() }()
-	return cleanupTokenFromLoaded(&result), nil
 }
 
 func (service *Service) completeCleanup(ctx context.Context, token cleanupToken) error {
@@ -796,24 +925,58 @@ func (service *Service) completeCleanup(ctx context.Context, token cleanupToken)
 		counterNamespace: token.counterNamespace,
 		stateGeneration:  token.stateGeneration,
 		recordLease:      token.recordLease,
-	}, stateMutationOptions{}, func(state *persistedState) error {
-		if state.CleanupKind != token.kind || state.CleanupEpoch != token.cleanupEpoch {
+	}, stateMutationOptions{}, completeCleanupMutation(token))
+	return errors.Join(err, result.Close())
+}
+
+func (service *Service) completeCleanupLocked(locked *lockedState, token cleanupToken) error {
+	result, err := service.mutateStateLocked(locked, stateVersion{
+		counterNamespace: token.counterNamespace,
+		stateGeneration:  token.stateGeneration,
+		recordLease:      token.recordLease,
+	}, stateMutationOptions{}, completeCleanupMutation(token))
+	return errors.Join(err, result.Close())
+}
+
+func (service *Service) completeCleanupLockedWithJournalProof(locked *lockedState, token cleanupToken, meter *spoolWorkMeter) error {
+	if service == nil || !locked.valid() || meter == nil {
+		return errStorageClosed
+	}
+	if !meter.chargeFixedDirectory() {
+		return errors.New("productmetrics: cleanup budget cannot persist final state")
+	}
+	restore := locked.root.installDirectoryOpenHooks(meter.beforePhysicalDirectoryOpen, meter.afterPhysicalDirectoryOpen)
+	completeErr := service.completeCleanupLocked(locked, token)
+	restore()
+	if completeErr != nil {
+		return completeErr
+	}
+	return proveRootTempJournalReadOnlyWithMeter(locked.root, meter, true)
+}
+
+func completeCleanupMutation(token cleanupToken) func(*persistedState) error {
+	return func(state *persistedState) error {
+		if *state != token.barrier || state.CleanupKind != token.kind || state.CleanupEpoch != token.cleanupEpoch {
 			return ErrStateChangedConcurrently
 		}
-		if mutationCounterRecoveryRequired(*state) {
-			if state.CounterNamespace < terminalCounterNamespace {
-				state.CounterNamespace++
-			}
-			state.StateGeneration = 1
-			state.CleanupEpoch = 1
-			state.CleanupKind = cleanupNone
-			return nil
+		*state = cleanupSuccessorState(*state)
+		return nil
+	}
+}
+
+func cleanupSuccessorState(state persistedState) persistedState {
+	if mutationCounterRecoveryRequired(state) {
+		if state.CounterNamespace < terminalCounterNamespace {
+			state.CounterNamespace++
 		}
+		state.StateGeneration = 1
+		state.CleanupEpoch = 1
 		state.CleanupKind = cleanupNone
-		return incrementStateGeneration(state)
-	})
-	_ = result.Close()
-	return err
+		return state
+	}
+	state.CleanupKind = cleanupNone
+	state.StateGeneration++
+	return state
 }
 
 func stateMatchesPermit(state persistedState, permit RecordingPermit) bool {
@@ -827,7 +990,44 @@ func mutationCounterRecoveryRequired(state persistedState) bool {
 	return state.StateGeneration >= maximumStateCounter-1 || state.CleanupEpoch >= maximumStateCounter-1
 }
 
-func (service *Service) mutateState(ctx context.Context, expected stateVersion, options stateMutationOptions, mutate func(*persistedState) error) (loadedState, error) {
+func (service *Service) lockState(ctx context.Context, root *storageRoot) (*lockedState, error) {
+	if service == nil {
+		return nil, errors.New("productmetrics: service is nil")
+	}
+	if ctx == nil {
+		return nil, errors.New("productmetrics: state-lock context is nil")
+	}
+	if root == nil {
+		return nil, errStorageClosed
+	}
+	lock, err := root.acquireLock(ctx, stateLockName)
+	if err != nil {
+		return nil, err
+	}
+	return &lockedState{root: root, lock: lock}, nil
+}
+
+func (service *Service) revalidatePermitLocked(locked *lockedState, permit RecordingPermit) error {
+	if service == nil || !locked.valid() || !permit.Valid() ||
+		permit.releaseVersion != service.deps.release.releaseVersion ||
+		permit.metricsEpoch != service.deps.release.metricsEpoch ||
+		permit.operatingSystem != operatingSystemForRuntime() {
+		return ErrStateChangedConcurrently
+	}
+	loaded := loadStateFromDirectory(locked.root)
+	defer func() { _ = loaded.Close() }()
+	if loaded.err != nil || !loaded.present || loaded.lease == nil ||
+		!permit.recordLease.Matches(loaded.lease) || !stateMatchesPermit(loaded.state, permit) ||
+		service.project(InvocationContext{
+			DoNotTrack:          service.deps.getenv(envDoNotTrack),
+			DisableUsageMetrics: service.deps.getenv(envDisableUsageMetrics),
+		}, loaded).state != StateEnabled {
+		return ErrStateChangedConcurrently
+	}
+	return nil
+}
+
+func (service *Service) mutateState(ctx context.Context, expected stateVersion, options stateMutationOptions, mutate func(*persistedState) error) (result loadedState, returnErr error) {
 	if ctx == nil {
 		return loadedState{}, errors.New("productmetrics: mutation context is nil")
 	}
@@ -838,13 +1038,26 @@ func (service *Service) mutateState(ctx context.Context, expected stateVersion, 
 	if err != nil {
 		return loadedState{}, err
 	}
-	defer func() { _ = root.Close() }()
-	lock, err := root.acquireLock(ctx, stateLockName)
+	defer func() { returnErr = errors.Join(returnErr, root.Close()) }()
+	locked, err := service.lockState(ctx, root)
 	if err != nil {
 		return loadedState{}, err
 	}
-	defer func() { _ = lock.Release() }()
-	loaded := loadStateFromDirectory(root)
+	defer func() { returnErr = errors.Join(returnErr, locked.Close()) }()
+	return service.mutateStateLocked(locked, expected, options, mutate)
+}
+
+func (service *Service) mutateStateLocked(locked *lockedState, expected stateVersion, options stateMutationOptions, mutate func(*persistedState) error) (loadedState, error) {
+	if service == nil || !locked.valid() {
+		return loadedState{}, errors.New("productmetrics: state lock is not held")
+	}
+	if service.deps.homeErr != nil {
+		return loadedState{}, service.deps.homeErr
+	}
+	if mutate == nil {
+		return loadedState{}, errors.New("productmetrics: state mutation is nil")
+	}
+	loaded := loadStateFromDirectory(locked.root)
 	defer func() { _ = loaded.Close() }()
 	if loaded.err != nil && !options.recoverInvalid {
 		return loadedState{}, loaded.err
@@ -875,7 +1088,7 @@ func (service *Service) mutateState(ctx context.Context, expected stateVersion, 
 		loaded.reason = ""
 		return loadedState{state: state, raw: loaded.raw, lease: loaded.takeLease(), present: loaded.present}, nil
 	}
-	return persistStateMutation(root, state, options.allowAppliedActivation)
+	return persistStateMutation(locked.root, state, options.allowAppliedActivation)
 }
 
 func expectedStateMatchesLoaded(expected stateVersion, loaded loadedState, recoverInvalid bool) bool {

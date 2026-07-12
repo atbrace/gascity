@@ -333,6 +333,14 @@ func TestNoticeInvalidationIsAtomicAndFirstReacceptingInvocationHasNoPermit(t *t
 func TestPauseCleanupAndGreaterEpochResumeAreMonotonic(t *testing.T) {
 	home := newMetricsTestHome(t)
 	writeStateFixture(t, home, enabledState(5, 1, testInstallationID, testSpoolGeneration))
+	root := mustOpenMutableRoot(t, home)
+	if err := persistSpoolQuota(root, spoolQuota{}); err != nil {
+		_ = root.Close()
+		t.Fatal(err)
+	}
+	if err := root.Close(); err != nil {
+		t.Fatal(err)
+	}
 	baseDeps := defaultTestServiceDependencies(home, 1)
 	baseDeps.notice.version = 1
 	service := mustOpenTestService(t, baseDeps)
@@ -387,6 +395,14 @@ func TestGreaterEpochResumeEntropyFailureLeavesPauseStateUnchanged(t *testing.T)
 	paused.PausedThroughMetricsEpoch = 1
 	paused.CleanupEpoch = 2
 	writeStateFixture(t, home, paused)
+	root := mustOpenMutableRoot(t, home)
+	if err := persistSpoolQuota(root, spoolQuota{}); err != nil {
+		_ = root.Close()
+		t.Fatal(err)
+	}
+	if err := root.Close(); err != nil {
+		t.Fatal(err)
+	}
 	before := readConfigFixture(t, home)
 	deps := defaultTestServiceDependencies(home, 2)
 	deps.notice.version = 1
@@ -615,7 +631,7 @@ func TestMutationCounterLowerNeighborsCanDurablyApplyPause(t *testing.T) {
 	}
 }
 
-func TestTerminalAdjacentDisableCleanupMovesToFreshCompletableNamespace(t *testing.T) {
+func TestTerminalAdjacentDisableCleanupReusesExactOwnerAndCompletionRollsNamespace(t *testing.T) {
 	tests := map[string]persistedState{
 		"state generation": disabledState(maximumStateCounter-1, 1, cleanupDisable),
 		"cleanup epoch":    disabledState(7, maximumStateCounter-1, cleanupDisable),
@@ -629,17 +645,21 @@ func TestTerminalAdjacentDisableCleanupMovesToFreshCompletableNamespace(t *testi
 			service := mustOpenTestService(t, deps)
 			token, err := service.beginDisable(context.Background(), stateVersionFrom(state))
 			if err != nil {
-				t.Fatalf("move cleanup to fresh namespace: %v", err)
+				t.Fatalf("reuse cleanup owner: %v", err)
 			}
-			if token.stateGeneration != 1 || token.cleanupEpoch != 1 || token.kind != cleanupDisable {
-				t.Fatalf("fresh cleanup token = %#v", token)
+			if token.counterNamespace != state.CounterNamespace || token.stateGeneration != state.StateGeneration ||
+				token.cleanupEpoch != state.CleanupEpoch || token.kind != cleanupDisable {
+				t.Fatalf("reused cleanup token = %#v, want %#v", token, state)
+			}
+			if visible := readStateFixture(t, home); visible != state {
+				t.Fatalf("reusing cleanup owner mutated state:\nbefore=%#v\nafter=%#v", state, visible)
 			}
 			if err := service.completeCleanup(context.Background(), token); err != nil {
-				t.Fatalf("complete fresh cleanup: %v", err)
+				t.Fatalf("complete reused cleanup: %v", err)
 			}
 			clean := readStateFixture(t, home)
-			if clean.Preference != preferenceDisabled || clean.StateGeneration != 2 ||
-				clean.CounterNamespace <= state.CounterNamespace ||
+			if clean.Preference != preferenceDisabled || clean.StateGeneration != 1 ||
+				clean.CounterNamespace != state.CounterNamespace+1 ||
 				clean.CleanupKind != cleanupNone || clean.CleanupEpoch != 1 ||
 				clean.InstallationID != "" || clean.SpoolGeneration != "" {
 				t.Fatalf("clean disabled state = %#v", clean)
@@ -786,22 +806,152 @@ func TestAppliedSyncPendingDisableAndPauseReturnNonSuccessWhilePeersFailClosed(t
 	}
 }
 
+func TestCallerHeldStateMutationDoesNotReacquireStateLock(t *testing.T) {
+	home := newMetricsTestHome(t)
+	writeStateFixture(t, home, disabledState(8, 3, cleanupDisable))
+
+	lockAttempts := 0
+	deps := defaultTestServiceDependencies(home, 2)
+	deps.storageHooks.beforeStep = func(step storageStep) error {
+		if step != storageStepLock {
+			return nil
+		}
+		lockAttempts++
+		if lockAttempts > 1 {
+			return errors.New("caller-held mutation attempted a nested state lock")
+		}
+		return nil
+	}
+	service := mustOpenTestService(t, deps)
+	root, err := openStorageRootMutableWithHooks(home, deps.storageHooks)
+	if err != nil {
+		t.Fatal(err)
+	}
+	locked, err := service.lockState(context.Background(), root)
+	if err != nil {
+		_ = root.Close()
+		t.Fatal(err)
+	}
+	loaded := loadStateFromDirectory(root)
+	if loaded.err != nil || !loaded.present {
+		_ = loaded.Close()
+		_ = locked.Close()
+		_ = root.Close()
+		t.Fatalf("load cleanup state: present=%v err=%v", loaded.present, loaded.err)
+	}
+	token := cleanupTokenFromLoaded(&loaded)
+	_ = loaded.Close()
+	if err := service.completeCleanupLocked(locked, token); err != nil {
+		_ = token.Close()
+		_ = locked.Close()
+		_ = root.Close()
+		t.Fatalf("complete cleanup under caller-held lock: %v", err)
+	}
+	if err := token.Close(); err != nil {
+		t.Errorf("close cleanup token: %v", err)
+	}
+	if err := locked.Close(); err != nil {
+		t.Errorf("release state lock: %v", err)
+	}
+	if err := root.Close(); err != nil {
+		t.Errorf("close root: %v", err)
+	}
+	if lockAttempts != 1 {
+		t.Fatalf("state-lock attempts = %d, want exactly one", lockAttempts)
+	}
+	clean := readStateFixture(t, home)
+	if clean.Preference != preferenceDisabled || clean.CleanupKind != cleanupNone || clean.StateGeneration != 9 {
+		t.Fatalf("clean state = %#v", clean)
+	}
+}
+
+func TestCallerHeldPermitRevalidationIncludesRecordReleaseAndEpoch(t *testing.T) {
+	home := newMetricsTestHome(t)
+	state := enabledState(7, 2, testInstallationID, testSpoolGeneration)
+	writeStateFixture(t, home, state)
+	service := mustOpenTestService(t, defaultTestServiceDependencies(home, 2))
+	permit := service.RecordingPermit(recordableInvocation())
+	defer func() { _ = permit.Close() }()
+	if !permit.Valid() {
+		t.Fatal("enabled state did not issue a permit")
+	}
+
+	root, err := openStorageRootMutable(home)
+	if err != nil {
+		t.Fatal(err)
+	}
+	locked, err := service.lockState(context.Background(), root)
+	if err != nil {
+		_ = root.Close()
+		t.Fatal(err)
+	}
+	defer func() {
+		_ = locked.Close()
+		_ = root.Close()
+	}()
+	if err := service.revalidatePermitLocked(locked, permit); err != nil {
+		t.Fatalf("revalidate exact permit: %v", err)
+	}
+
+	wrongRelease := permit
+	wrongRelease.releaseVersion = "1.0.1"
+	if err := service.revalidatePermitLocked(locked, wrongRelease); !errors.Is(err, ErrStateChangedConcurrently) {
+		t.Fatalf("wrong-release revalidation error = %v, want state conflict", err)
+	}
+	wrongEpoch := permit
+	wrongEpoch.metricsEpoch++
+	if err := service.revalidatePermitLocked(locked, wrongEpoch); !errors.Is(err, ErrStateChangedConcurrently) {
+		t.Fatalf("wrong-epoch revalidation error = %v, want state conflict", err)
+	}
+	wrongOS := permit
+	if wrongOS.operatingSystem == OSLinux {
+		wrongOS.operatingSystem = OSDarwin
+	} else {
+		wrongOS.operatingSystem = OSLinux
+	}
+	if err := service.revalidatePermitLocked(locked, wrongOS); !errors.Is(err, ErrStateChangedConcurrently) {
+		t.Fatalf("wrong-OS revalidation error = %v, want state conflict", err)
+	}
+
+	data, err := encodePersistedState(state)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := root.writeFileAtomic(configFileName, data); err != nil {
+		t.Fatalf("replace config with byte-identical state: %v", err)
+	}
+	if err := service.revalidatePermitLocked(locked, permit); !errors.Is(err, ErrStateChangedConcurrently) {
+		t.Fatalf("old-incarnation revalidation error = %v, want state conflict", err)
+	}
+}
+
 func TestConcurrentGreaterEpochResumeAndDisableHaveOneCASWinner(t *testing.T) {
 	home := newMetricsTestHome(t)
 	paused := enabledState(7, 1, testInstallationID, "")
 	paused.PausedThroughMetricsEpoch = 1
 	paused.CleanupEpoch = 2
 	writeStateFixture(t, home, paused)
+	root := mustOpenMutableRoot(t, home)
+	if err := persistSpoolQuota(root, spoolQuota{}); err != nil {
+		_ = root.Close()
+		t.Fatal(err)
+	}
+	if err := root.Close(); err != nil {
+		t.Fatal(err)
+	}
 	deps := defaultTestServiceDependencies(home, 2)
 	deps.notice.version = 1
 	deps.newUUID = uuidSequence(t, "56565656-5656-4656-8656-565656565656")
 	service := mustOpenTestService(t, deps)
-	resumeVersion := leasedStateVersionFixture(t, home)
 	start := make(chan struct{})
 	results := make(chan error, 2)
 	go func() {
 		<-start
-		results <- service.resumeGreaterEpoch(context.Background(), resumeVersion)
+		transitioned, err := service.finishPauseCleanupAndResume(context.Background())
+		if err == nil && !transitioned {
+			err = ErrStateChangedConcurrently
+		}
+		results <- err
 	}()
 	go func() {
 		<-start
@@ -991,28 +1141,6 @@ func readStateFixture(t *testing.T, home gchome.ProductUsageHome) persistedState
 		t.Fatalf("decode config fixture: %v", err)
 	}
 	return state
-}
-
-func leasedStateVersionFixture(t *testing.T, home gchome.ProductUsageHome) stateVersion {
-	t.Helper()
-	root, err := openStorageRootReadOnly(home)
-	if err != nil {
-		t.Fatalf("open state-version fixture: %v", err)
-	}
-	loaded := loadStateFromDirectory(root)
-	if err := root.Close(); err != nil {
-		_ = loaded.Close()
-		t.Fatalf("close state-version root: %v", err)
-	}
-	if loaded.err != nil || !loaded.present || loaded.lease == nil {
-		_ = loaded.Close()
-		t.Fatalf("load state-version fixture: present=%v err=%v", loaded.present, loaded.err)
-	}
-	version := stateVersionFrom(loaded.state)
-	version.recordLease = loaded.takeLease()
-	_ = loaded.Close()
-	t.Cleanup(func() { _ = version.Close() })
-	return version
 }
 
 func leasedCleanupTokenFixture(t *testing.T, home gchome.ProductUsageHome) cleanupToken {

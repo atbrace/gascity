@@ -4,6 +4,7 @@ package productmetrics
 
 import (
 	"bufio"
+	"bytes"
 	"context"
 	"errors"
 	"fmt"
@@ -90,7 +91,13 @@ func TestStorageAtomicWriteUsesPrivateModesAndDurabilitySteps(t *testing.T) {
 	if got := fileInfo.Mode().Perm(); got != 0o600 {
 		t.Fatalf("file mode = %04o, want 0600", got)
 	}
-	wantSteps := []storageStep{storageStepWrite, storageStepFileSync, storageStepRename, storageStepDirectorySync}
+	wantSteps := []storageStep{
+		storageStepDirectorySync, storageStepDirectorySync,
+		storageStepMarkerCreate, storageStepFileSync, storageStepDirectorySync,
+		storageStepDirectorySync, storageStepMarkerBind, storageStepFileSync, storageStepDirectorySync,
+		storageStepWrite, storageStepFileSync, storageStepRename, storageStepDirectorySync,
+		storageStepDelete, storageStepDirectorySync, storageStepDirectorySync, storageStepDirectorySync,
+	}
 	if fmt.Sprint(steps) != fmt.Sprint(wantSteps) {
 		t.Fatalf("durability steps = %v, want %v", steps, wantSteps)
 	}
@@ -144,6 +151,64 @@ func TestStorageAllowsTrustedHomeComponentsOutsideMetadataAlphabet(t *testing.T)
 	}
 	if err := root.Close(); err != nil {
 		t.Fatal(err)
+	}
+}
+
+func TestStorageOpenDirRejectsCrossDeviceDescendantsBeforeDescending(t *testing.T) {
+	for _, test := range []struct {
+		name          string
+		crossOnLookup int
+	}{
+		{name: "pre-open", crossOnLookup: 1},
+		{name: "post-open-revalidation", crossOnLookup: 2},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			inspection := inspectStorageTestHome(t, true)
+			boundary := filepath.Join(inspection.Root(), "queue", "generation")
+			below := filepath.Join(boundary, "child")
+			if err := os.MkdirAll(below, 0o700); err != nil {
+				t.Fatal(err)
+			}
+			boundaryMetadata := 0
+			boundaryOpens := 0
+			belowOpens := 0
+			root, err := openStorageRootMutableWithHooks(inspection, storageTestHooks{
+				metadata: func(path string, metadata storageMetadata) storageMetadata {
+					if path == boundary {
+						boundaryMetadata++
+						if boundaryMetadata >= test.crossOnLookup {
+							metadata.dev ^= 1 << 63
+						}
+					}
+					return metadata
+				},
+				beforeDirectoryOpen: func(path string) error {
+					switch path {
+					case boundary:
+						boundaryOpens++
+					case below:
+						belowOpens++
+					}
+					return nil
+				},
+			})
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer func() { _ = root.Close() }()
+
+			directory, openErr := root.openDir([]string{"queue", "generation", "child"}, false)
+			if directory != nil {
+				_ = directory.Close()
+			}
+			if !errors.Is(openErr, unix.EXDEV) || belowOpens != 0 {
+				t.Fatalf("cross-device open = boundaryMetadata:%d boundaryOpens:%d belowOpens:%d err:%v",
+					boundaryMetadata, boundaryOpens, belowOpens, openErr)
+			}
+			if test.crossOnLookup == 1 && boundaryOpens != 0 {
+				t.Fatalf("pre-open cross-device boundary was opened %d times", boundaryOpens)
+			}
+		})
 	}
 }
 
@@ -573,13 +638,21 @@ func TestStorageAtomicWriteCleansTempsAtEveryFailure(t *testing.T) {
 			inspection := inspectStorageTestHome(t, true)
 			armed := false
 			failed := false
-			hooks := storageTestHooks{beforeStep: func(step storageStep) error {
-				if armed && !failed && step == test.step {
-					failed = true
-					return errors.New("injected " + string(step))
-				}
-				return nil
-			}}
+			renameStarted := false
+			hooks := storageTestHooks{
+				beforeMutation: func(step storageStep, _ string) {
+					if step == storageStepRename {
+						renameStarted = true
+					}
+				},
+				beforeStep: func(step storageStep) error {
+					if armed && !failed && step == test.step && (step != storageStepDirectorySync || renameStarted) {
+						failed = true
+						return errors.New("injected " + string(step))
+					}
+					return nil
+				},
+			}
 			root, err := openStorageRootMutableWithHooks(inspection, hooks)
 			if err != nil {
 				t.Fatalf("open root: %v", err)
@@ -624,13 +697,7 @@ func TestStorageAtomicWriteCleansTempsAtEveryFailure(t *testing.T) {
 		if err := root.writeFileAtomic("config.toml", []byte("new")); err == nil {
 			t.Fatal("atomic write accepted injected unsafe temp metadata")
 		}
-		entries, err := os.ReadDir(inspection.Root())
-		if err != nil {
-			t.Fatal(err)
-		}
-		if len(entries) != 0 {
-			t.Fatalf("rejected temporary file survived cleanup: %v", entries)
-		}
+		requireOnlyPersistentRootTempJournal(t, inspection.Root())
 	})
 }
 
@@ -651,7 +718,9 @@ func TestStorageAtomicNoReplaceAndWriteFailureSeams(t *testing.T) {
 		if err := root.writeFileAtomicNoReplace("event.json", []byte("first")); err != nil {
 			t.Fatalf("first no-replace write: %v", err)
 		}
-		if countStep(steps, storageStepFileSync) != 1 || countStep(steps, storageStepRename) != 1 || countStep(steps, storageStepDirectorySync) != 1 {
+		if countStep(steps, storageStepFileSync) != 3 || countStep(steps, storageStepRename) != 1 ||
+			countStep(steps, storageStepDirectorySync) != 9 || countStep(steps, storageStepMarkerCreate) != 1 ||
+			countStep(steps, storageStepMarkerBind) != 1 {
 			t.Fatalf("no-replace durability steps = %v", steps)
 		}
 		if err := root.writeFileAtomicNoReplace("event.json", []byte("second")); !errors.Is(err, errStorageEntryExists) {
@@ -729,12 +798,9 @@ func TestStorageAtomicNoReplaceAndWriteFailureSeams(t *testing.T) {
 			if !failed {
 				t.Fatalf("%s failure seam was not reached", test.name)
 			}
-			entries, err := os.ReadDir(inspection.Root())
-			if err != nil {
-				t.Fatal(err)
-			}
-			if len(entries) != 0 {
-				t.Fatalf("failed no-replace write left entries: %v", entries)
+			journalEntries := requireOnlyPersistentRootTempJournal(t, inspection.Root())
+			if len(journalEntries) != 0 {
+				t.Fatalf("failed no-replace write left journal markers: %v", journalEntries)
 			}
 		})
 	}
@@ -1774,8 +1840,11 @@ func TestStorageIteratorYieldsBoundedNoFollowMetadata(t *testing.T) {
 	}
 
 	entries := enumerateAllStorageEntries(t, root.storageDir)
-	if len(entries) != 8 {
-		t.Fatalf("enumerated %d entries, want 8: %v", len(entries), entries)
+	if len(entries) != 9 {
+		t.Fatalf("enumerated %d entries, want 9: %v", len(entries), entries)
+	}
+	if got := entries[rootTempJournalDirectoryName]; got.metadata.kind != storageEntryDirectory || !got.metadata.ownerOnly {
+		t.Fatalf("persistent root-temp journal metadata = %#v", got)
 	}
 	if got := entries[longName]; got.nameBytes != 129 || got.metadata.size != 1<<30 || got.metadata.mode&unix.S_IFMT != unix.S_IFREG {
 		t.Fatalf("sparse overlong entry = %#v", got)
@@ -2530,6 +2599,856 @@ func TestStorageIdentityCheckedEmptyDirectoryRemoval(t *testing.T) {
 	}
 }
 
+func TestStorageCleanupDirectoryRejectsCrossDeviceDescentBeforeOpen(t *testing.T) {
+	inspection := inspectStorageTestHome(t, true)
+	childPath := filepath.Join(inspection.Root(), "child")
+	sentinelPath := filepath.Join(childPath, "keep")
+	if err := os.Mkdir(childPath, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(sentinelPath, []byte("keep"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	childOpens := 0
+	root, err := openStorageRootMutableWithHooks(inspection, storageTestHooks{
+		metadata: func(path string, metadata storageMetadata) storageMetadata {
+			if path == childPath {
+				metadata.dev ^= 1 << 63
+			}
+			return metadata
+		},
+		beforeDirectoryOpen: func(path string) error {
+			if path == childPath {
+				childOpens++
+			}
+			return nil
+		},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = root.Close() }()
+	entry, err := root.lookupEntry("child")
+	if err != nil {
+		t.Fatal(err)
+	}
+	child, openErr := root.openEnumeratedCleanupDirectory(entry)
+	if child != nil {
+		_ = child.Close()
+	}
+	if openErr == nil || childOpens != 0 {
+		t.Fatalf("cross-device cleanup descent = child:%v opens:%d err:%v", child != nil, childOpens, openErr)
+	}
+	if data, err := os.ReadFile(sentinelPath); err != nil || string(data) != "keep" {
+		t.Fatalf("cross-device rejection changed sentinel: data=%q err=%v", data, err)
+	}
+}
+
+func TestStorageCleanupDirectoryAllowsSameDeviceDescent(t *testing.T) {
+	inspection := inspectStorageTestHome(t, true)
+	childPath := filepath.Join(inspection.Root(), "child")
+	if err := os.Mkdir(childPath, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	root, err := openStorageRootMutable(inspection)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = root.Close() }()
+	entry, err := root.lookupEntry("child")
+	if err != nil {
+		t.Fatal(err)
+	}
+	child, err := root.openEnumeratedCleanupDirectory(entry)
+	if err != nil {
+		t.Fatalf("same-device cleanup descent: %v", err)
+	}
+	if err := child.Close(); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestStorageCleanupBoundaryBeginsAtRetainedMetricsRoot(t *testing.T) {
+	inspection := inspectStorageTestHome(t, true)
+	childPath := filepath.Join(inspection.Root(), "child")
+	if err := os.Mkdir(childPath, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	var actual unix.Stat_t
+	if err := unix.Stat(inspection.Root(), &actual); err != nil {
+		t.Fatal(err)
+	}
+	syntheticRootDevice := unixStatDevice(actual) ^ (1 << 63)
+	root, err := openStorageRootMutableWithHooks(inspection, storageTestHooks{
+		metadata: func(path string, metadata storageMetadata) storageMetadata {
+			if path == inspection.Root() || strings.HasPrefix(path, inspection.Root()+string(os.PathSeparator)) {
+				metadata.dev = syntheticRootDevice
+			}
+			return metadata
+		},
+	})
+	if err != nil {
+		t.Fatalf("open separately mounted metrics root simulation: %v", err)
+	}
+	defer func() { _ = root.Close() }()
+	entry, err := root.lookupEntry("child")
+	if err != nil {
+		t.Fatal(err)
+	}
+	child, err := root.openEnumeratedCleanupDirectory(entry)
+	if err != nil {
+		t.Fatalf("retained-root-local cleanup descent: %v", err)
+	}
+	if err := child.Close(); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestRootAtomicWritesJournalMarkerBeforeCreatingTemp(t *testing.T) {
+	for _, operation := range []string{"replace", "outcome", "no-replace"} {
+		t.Run(operation, func(t *testing.T) {
+			inspection := inspectStorageTestHome(t, false)
+			journalName := ".pm-root-temp-journal"
+			markerObserved := false
+			root, err := openStorageRootMutableWithHooks(inspection, storageTestHooks{
+				beforeTempFileCreate: func(path string) {
+					if filepath.Dir(path) != inspection.Root() {
+						return
+					}
+					marker := filepath.Join(inspection.Root(), journalName, filepath.Base(path))
+					info, markerErr := os.Lstat(marker)
+					if markerErr == nil && info.Mode().IsRegular() && info.Mode().Perm() == 0o600 {
+						markerObserved = true
+					}
+				},
+			})
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer func() { _ = root.Close() }()
+			switch operation {
+			case "replace":
+				err = root.writeFileAtomic("target", []byte("value"))
+			case "outcome":
+				_, err = root.writeFileAtomicOutcome("target", []byte("value"))
+			case "no-replace":
+				err = root.writeFileAtomicNoReplace("target", []byte("value"))
+			}
+			if err != nil {
+				t.Fatal(err)
+			}
+			if !markerObserved {
+				t.Fatal("root temporary file was created before its durable journal marker")
+			}
+			entries, err := os.ReadDir(filepath.Join(inspection.Root(), journalName))
+			if err != nil || len(entries) != 0 {
+				t.Fatalf("successful root write journal is not empty: entries=%v err=%v", entries, err)
+			}
+		})
+	}
+}
+
+func TestRootTempJournalMarkerCodecIsStrictAndExact(t *testing.T) {
+	name := ".pm-tmp-1-2"
+	temp := recordIncarnation{dev: 3, ino: 4}
+	bound, err := encodeBoundRootTempJournalMarker(name, temp)
+	if err != nil {
+		t.Fatal(err)
+	}
+	wantBound := []byte{
+		'G', 'C', 'P', 'M', 'R', 'T', 'J', '1', 0x02, byte(len(name)), 0, 0, 0, 0, 0, 0,
+		0, 0, 0, 0, 0, 0, 0, 3,
+		0, 0, 0, 0, 0, 0, 0, 4,
+	}
+	wantBound = append(wantBound, []byte(name)...)
+	if !bytes.Equal(bound, wantBound) {
+		t.Fatalf("bound marker wire form = %x, want %x", bound, wantBound)
+	}
+	decoded, err := decodeRootTempJournalMarker(name, bound)
+	if err != nil || decoded.state != rootTempJournalMarkerBound || decoded.name != name || decoded.temp != temp {
+		t.Fatalf("bound marker round trip = %+v err=%v", decoded, err)
+	}
+	intent, err := decodeRootTempJournalMarker(name, nil)
+	if err != nil || intent.state != rootTempJournalMarkerIntent || intent.name != name {
+		t.Fatalf("intent marker = %+v err=%v", intent, err)
+	}
+
+	clone := func() []byte { return append([]byte(nil), bound...) }
+	badMagic := clone()
+	badMagic[0] = 'X'
+	reservedState := clone()
+	reservedState[8] = 0x01
+	badReserved := clone()
+	badReserved[10] = 1
+	zeroDevice := clone()
+	for index := 16; index < 24; index++ {
+		zeroDevice[index] = 0
+	}
+	zeroInode := clone()
+	for index := 24; index < 32; index++ {
+		zeroInode[index] = 0
+	}
+	for _, test := range []struct {
+		name       string
+		markerName string
+		data       []byte
+	}{
+		{name: "empty marker name intent", markerName: "", data: nil},
+		{name: "noncanonical intent name", markerName: "intent", data: nil},
+		{name: "wrong magic", markerName: name, data: badMagic},
+		{name: "reserved state", markerName: name, data: reservedState},
+		{name: "reserved bytes", markerName: name, data: badReserved},
+		{name: "truncated header", markerName: name, data: clone()[:rootTempJournalMarkerHeaderBytes-1]},
+		{name: "truncated name", markerName: name, data: clone()[:len(bound)-1]},
+		{name: "trailing byte", markerName: name, data: append(clone(), 0)},
+		{name: "wrong enumerated name", markerName: ".pm-tmp-1-3", data: clone()},
+		{name: "zero device", markerName: name, data: zeroDevice},
+		{name: "zero inode", markerName: name, data: zeroInode},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			if decoded, err := decodeRootTempJournalMarker(test.markerName, test.data); err == nil ||
+				decoded.state != rootTempJournalMarkerInvalid {
+				t.Fatalf("invalid marker decoded as %+v err=%v", decoded, err)
+			}
+		})
+	}
+}
+
+func TestRootAtomicWritePreservesPreexistingTempCollision(t *testing.T) {
+	inspection := inspectStorageTestHome(t, false)
+	setup, err := openStorageRootMutable(inspection)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := setup.Close(); err != nil {
+		t.Fatal(err)
+	}
+	sequence := storageTempSequence.Load() + 1
+	if sequence == 0 {
+		sequence++
+	}
+	name := fmt.Sprintf(".pm-tmp-%x-%x", os.Getpid(), sequence)
+	collisionPath := filepath.Join(inspection.Root(), name)
+	if err := os.WriteFile(collisionPath, []byte("preexisting root entry"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	root, err := openStorageRootMutable(inspection)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = root.Close() }()
+	if err := root.writeFileAtomic("target", []byte("value")); err != nil {
+		t.Fatalf("root write did not continue after a safely retained collision: %v", err)
+	}
+	if data, err := os.ReadFile(collisionPath); err != nil || string(data) != "preexisting root entry" {
+		t.Fatalf("root write changed preexisting collision: data=%q err=%v", data, err)
+	}
+	markerPath := filepath.Join(inspection.Root(), rootTempJournalDirectoryName, name)
+	if _, err := os.Lstat(markerPath); !errors.Is(err, fs.ErrNotExist) {
+		t.Fatalf("root collision left its exact intent marker unsettled: %v", err)
+	}
+}
+
+func TestRootAtomicWriteCounterWrapDoesNotConsumeCollisionAttempt(t *testing.T) {
+	inspection := inspectStorageTestHome(t, false)
+	setup, err := openStorageRootMutable(inspection)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := setup.Close(); err != nil {
+		t.Fatal(err)
+	}
+	for sequence := uint64(1); sequence < maximumStorageTempAttempts; sequence++ {
+		name := fmt.Sprintf(".pm-tmp-%x-%x", os.Getpid(), sequence)
+		if err := os.WriteFile(filepath.Join(inspection.Root(), name), []byte("preexisting collision"), 0o600); err != nil {
+			t.Fatal(err)
+		}
+	}
+	priorSequence := storageTempSequence.Load()
+	storageTempSequence.Store(^uint64(0))
+	t.Cleanup(func() { storageTempSequence.Store(priorSequence) })
+	root, err := openStorageRootMutable(inspection)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = root.Close() }()
+	if err := root.writeFileAtomic("target", []byte("value")); err != nil {
+		t.Fatalf("counter wrap consumed one of %d real attempts: %v", maximumStorageTempAttempts, err)
+	}
+	if data, err := os.ReadFile(filepath.Join(inspection.Root(), "target")); err != nil || string(data) != "value" {
+		t.Fatalf("counter-wrap write target = %q err=%v", data, err)
+	}
+	for sequence := uint64(1); sequence < maximumStorageTempAttempts; sequence++ {
+		name := fmt.Sprintf(".pm-tmp-%x-%x", os.Getpid(), sequence)
+		if data, err := os.ReadFile(filepath.Join(inspection.Root(), name)); err != nil || string(data) != "preexisting collision" {
+			t.Fatalf("counter-wrap collision %q changed: data=%q err=%v", name, data, err)
+		}
+	}
+}
+
+func TestRootAtomicWriteRejectsRetainedMarkerReplacementBeforeTempCreation(t *testing.T) {
+	inspection := inspectStorageTestHome(t, false)
+	var markerPath, displacedPath string
+	replaced := false
+	var replaceErr error
+	root, err := openStorageRootMutableWithHooks(inspection, storageTestHooks{
+		beforeTempFileCreate: func(path string) {
+			if replaced || filepath.Dir(path) != inspection.Root() {
+				return
+			}
+			replaced = true
+			markerPath = filepath.Join(inspection.Root(), rootTempJournalDirectoryName, filepath.Base(path))
+			displacedPath = markerPath + ".displaced"
+			if err := os.Rename(markerPath, displacedPath); err != nil {
+				replaceErr = err
+				return
+			}
+			replaceErr = os.WriteFile(markerPath, []byte("replacement marker"), 0o600)
+		},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = root.Close() }()
+
+	writeErr := root.writeFileAtomic("target", []byte("sensitive"))
+	if replaceErr != nil {
+		t.Fatalf("replace retained marker fixture: %v", replaceErr)
+	}
+	if !replaced {
+		t.Fatal("retained marker replacement was not injected")
+	}
+	if writeErr == nil {
+		t.Fatal("root atomic write continued after its exact marker was replaced")
+	}
+	if _, err := os.Lstat(filepath.Join(inspection.Root(), "target")); !errors.Is(err, fs.ErrNotExist) {
+		t.Fatalf("marker replacement installed sensitive target: %v", err)
+	}
+	if data, err := os.ReadFile(markerPath); err != nil || string(data) != "replacement marker" {
+		t.Fatalf("marker replacement was not retained: data=%q err=%v", data, err)
+	}
+	if _, err := os.Lstat(displacedPath); err != nil {
+		t.Fatalf("displaced exact marker was unexpectedly removed: %v", err)
+	}
+	entries, err := os.ReadDir(inspection.Root())
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, entry := range entries {
+		if canonicalStorageTempName(entry.Name()) {
+			t.Fatalf("marker replacement left a root temp %q", entry.Name())
+		}
+	}
+}
+
+func TestRootAtomicWriteRevalidatesTempAfterBindHookBeforeBoundBytes(t *testing.T) {
+	inspection := inspectStorageTestHome(t, false)
+	var tempPath, displacedTemp, markerPath string
+	swapped := false
+	var swapErr error
+	root, err := openStorageRootMutableWithHooks(inspection, storageTestHooks{
+		beforeTempFileCreate: func(path string) {
+			if filepath.Dir(path) != inspection.Root() {
+				return
+			}
+			tempPath = path
+			markerPath = filepath.Join(inspection.Root(), rootTempJournalDirectoryName, filepath.Base(path))
+		},
+		beforeStep: func(step storageStep) error {
+			if swapped || step != storageStepMarkerBind || tempPath == "" {
+				return nil
+			}
+			swapped = true
+			displacedTemp = tempPath + ".displaced"
+			if err := os.Rename(tempPath, displacedTemp); err != nil {
+				swapErr = err
+				return nil
+			}
+			swapErr = os.WriteFile(tempPath, nil, 0o600)
+			return nil
+		},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = root.Close() }()
+	writeErr := root.writeFileAtomic("target", []byte("sensitive"))
+	if swapErr != nil || !swapped {
+		t.Fatalf("swap root temp at marker bind: swapped=%v err=%v", swapped, swapErr)
+	}
+	if writeErr == nil {
+		t.Fatal("root write accepted a temp replacement at marker bind")
+	}
+	if data, err := os.ReadFile(markerPath); err != nil || len(data) != 0 {
+		t.Fatalf("failed bind made marker authoritative: bytes=%x err=%v", data, err)
+	}
+	for _, path := range []string{tempPath, displacedTemp} {
+		if info, err := os.Lstat(path); err != nil || info.Size() != 0 {
+			t.Fatalf("failed bind changed temp %q: info=%v err=%v", path, info, err)
+		}
+	}
+}
+
+func TestRootAtomicWriteRevalidatesIntentMarkerAfterTempMetadataBeforeBoundBytes(t *testing.T) {
+	inspection := inspectStorageTestHome(t, false)
+	var tempPath, markerPath, displacedMarker string
+	armed := false
+	swapped := false
+	var swapErr error
+	root, err := openStorageRootMutableWithHooks(inspection, storageTestHooks{
+		beforeTempFileCreate: func(path string) {
+			if filepath.Dir(path) != inspection.Root() {
+				return
+			}
+			tempPath = path
+			markerPath = filepath.Join(inspection.Root(), rootTempJournalDirectoryName, filepath.Base(path))
+		},
+		beforeStep: func(step storageStep) error {
+			if step == storageStepMarkerBind {
+				armed = true
+			}
+			return nil
+		},
+		beforeMetadataAttempt: func(path string) error {
+			if !armed || swapped || path != tempPath {
+				return nil
+			}
+			swapped = true
+			displacedMarker = markerPath + ".displaced"
+			if err := os.Rename(markerPath, displacedMarker); err != nil {
+				swapErr = err
+				return nil
+			}
+			swapErr = os.WriteFile(markerPath, nil, 0o600)
+			return nil
+		},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = root.Close() }()
+
+	writeErr := root.writeFileAtomic("target", []byte("sensitive"))
+	if swapErr != nil || !swapped {
+		t.Fatalf("swap marker during intent temp validation: swapped=%v err=%v", swapped, swapErr)
+	}
+	if writeErr == nil {
+		t.Fatal("root write accepted a marker replacement during intent temp validation")
+	}
+	if _, err := os.Lstat(filepath.Join(inspection.Root(), "target")); !errors.Is(err, fs.ErrNotExist) {
+		t.Fatalf("marker replacement installed target: %v", err)
+	}
+	for _, path := range []string{markerPath, displacedMarker} {
+		if data, err := os.ReadFile(path); err != nil || len(data) != 0 {
+			t.Fatalf("failed intent guard wrote BOUND bytes through %q: data=%x err=%v", path, data, err)
+		}
+	}
+}
+
+func TestRootAtomicWritePreBindCrashLeavesOnlyIntentAndEmptyTemp(t *testing.T) {
+	inspection := inspectStorageTestHome(t, false)
+	var tempPath, markerPath string
+	injected := false
+	root, err := openStorageRootMutableWithHooks(inspection, storageTestHooks{
+		beforeTempFileCreate: func(path string) {
+			if filepath.Dir(path) == inspection.Root() {
+				tempPath = path
+				markerPath = filepath.Join(inspection.Root(), rootTempJournalDirectoryName, filepath.Base(path))
+			}
+		},
+		beforeStep: func(step storageStep) error {
+			if !injected && step == storageStepMarkerBind {
+				injected = true
+				return errors.New("injected pre-bind crash")
+			}
+			return nil
+		},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	writeErr := root.writeFileAtomic("target", []byte("sensitive"))
+	if closeErr := root.Close(); closeErr != nil {
+		t.Fatal(closeErr)
+	}
+	if writeErr == nil || !injected {
+		t.Fatalf("pre-bind crash = injected:%v err:%v", injected, writeErr)
+	}
+	for _, path := range []string{tempPath, markerPath} {
+		if data, err := os.ReadFile(path); err != nil || len(data) != 0 {
+			t.Fatalf("pre-bind crash artifact %q = %x err=%v", path, data, err)
+		}
+	}
+	cleanRoot, err := openStorageRootMutable(inspection)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = cleanRoot.Close() }()
+	state := &spoolSweepState{
+		root:     cleanRoot,
+		purgeAll: true, meter: newSpoolWorkMeter(defaultSpoolWorkBudget()),
+		seen: make(map[string]struct{}), pruneDirs: make(map[string]*storageDir), failClosedArmed: true,
+	}
+	state.cleanupRootTempJournal()
+	if !errors.Is(state.operation, errUnsettledRootTempJournal) || state.mutated {
+		t.Fatalf("pre-bind intent cleanup = mutated:%v err:%v", state.mutated, state.operation)
+	}
+	if data, err := os.ReadFile(tempPath); err != nil || len(data) != 0 {
+		t.Fatalf("pre-bind cleanup changed empty temp: data=%x err=%v", data, err)
+	}
+}
+
+func TestRootAtomicWriteRevalidatesMarkerAfterPayloadHookBeforeFirstByte(t *testing.T) {
+	inspection := inspectStorageTestHome(t, false)
+	var tempPath, markerPath, displacedMarker string
+	swapped := false
+	var swapErr error
+	root, err := openStorageRootMutableWithHooks(inspection, storageTestHooks{
+		beforeTempFileCreate: func(path string) {
+			if filepath.Dir(path) != inspection.Root() {
+				return
+			}
+			tempPath = path
+			markerPath = filepath.Join(inspection.Root(), rootTempJournalDirectoryName, filepath.Base(path))
+		},
+		beforeStep: func(step storageStep) error {
+			if swapped || step != storageStepWrite || markerPath == "" {
+				return nil
+			}
+			swapped = true
+			displacedMarker = markerPath + ".displaced"
+			if err := os.Rename(markerPath, displacedMarker); err != nil {
+				swapErr = err
+				return nil
+			}
+			swapErr = os.WriteFile(markerPath, nil, 0o600)
+			return nil
+		},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = root.Close() }()
+	writeErr := root.writeFileAtomic("target", []byte("sensitive"))
+	if swapErr != nil || !swapped {
+		t.Fatalf("swap marker before payload: swapped=%v err=%v", swapped, swapErr)
+	}
+	if writeErr == nil {
+		t.Fatal("root write accepted a marker replacement before payload")
+	}
+	if data, err := os.ReadFile(tempPath); err != nil || len(data) != 0 {
+		t.Fatalf("marker replacement allowed sensitive temp bytes: data=%q err=%v", data, err)
+	}
+	for _, path := range []string{markerPath, displacedMarker} {
+		if _, err := os.Lstat(path); err != nil {
+			t.Fatalf("marker replacement evidence %q was removed: %v", path, err)
+		}
+	}
+}
+
+func TestRootAtomicWriteFailureCleanupRevalidatesMarkerAfterDeleteHook(t *testing.T) {
+	inspection := inspectStorageTestHome(t, false)
+	var tempPath, markerPath, displacedMarker string
+	payloadStarted := false
+	failedSync := false
+	swapped := false
+	var swapErr error
+	root, err := openStorageRootMutableWithHooks(inspection, storageTestHooks{
+		beforeTempFileCreate: func(path string) {
+			if filepath.Dir(path) == inspection.Root() {
+				tempPath = path
+				markerPath = filepath.Join(inspection.Root(), rootTempJournalDirectoryName, filepath.Base(path))
+			}
+		},
+		beforeStep: func(step storageStep) error {
+			if step == storageStepWrite {
+				payloadStarted = true
+			}
+			if payloadStarted && !failedSync && step == storageStepFileSync {
+				failedSync = true
+				return errors.New("injected payload sync failure")
+			}
+			return nil
+		},
+		beforeMutation: func(step storageStep, path string) {
+			if swapped || !failedSync || step != storageStepDelete || path != tempPath {
+				return
+			}
+			swapped = true
+			displacedMarker = markerPath + ".displaced"
+			if err := os.Rename(markerPath, displacedMarker); err != nil {
+				swapErr = err
+				return
+			}
+			swapErr = os.WriteFile(markerPath, nil, 0o600)
+		},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = root.Close() }()
+	writeErr := root.writeFileAtomic("target", []byte("sensitive"))
+	if writeErr == nil || !failedSync || !swapped || swapErr != nil {
+		t.Fatalf("failure cleanup marker swap = failed:%v swapped:%v swapErr:%v writeErr:%v",
+			failedSync, swapped, swapErr, writeErr)
+	}
+	if data, err := os.ReadFile(tempPath); err != nil || string(data) != "sensitive" {
+		t.Fatalf("failure cleanup mutated temp without marker authority: data=%q err=%v", data, err)
+	}
+	for _, path := range []string{markerPath, displacedMarker} {
+		if _, err := os.Lstat(path); err != nil {
+			t.Fatalf("failure cleanup marker evidence %q missing: %v", path, err)
+		}
+	}
+}
+
+func TestRootAtomicWriteMarkerRetirementRequiresTempAbsenceAfterDeleteHook(t *testing.T) {
+	inspection := inspectStorageTestHome(t, false)
+	var tempPath, markerPath string
+	created := false
+	var createErr error
+	root, err := openStorageRootMutableWithHooks(inspection, storageTestHooks{
+		beforeTempFileCreate: func(path string) {
+			if filepath.Dir(path) == inspection.Root() {
+				tempPath = path
+				markerPath = filepath.Join(inspection.Root(), rootTempJournalDirectoryName, filepath.Base(path))
+			}
+		},
+		beforeMutation: func(step storageStep, path string) {
+			if created || step != storageStepDelete || path != markerPath {
+				return
+			}
+			created = true
+			createErr = os.WriteFile(tempPath, []byte("late temp"), 0o600)
+		},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = root.Close() }()
+	if err := root.writeFileAtomic("target", []byte("value")); err != nil {
+		t.Fatal(err)
+	}
+	if createErr != nil || !created {
+		t.Fatalf("create temp at writer marker retirement: created=%v err=%v", created, createErr)
+	}
+	if data, err := os.ReadFile(filepath.Join(inspection.Root(), "target")); err != nil || string(data) != "value" {
+		t.Fatalf("durable target changed: data=%q err=%v", data, err)
+	}
+	if data, err := os.ReadFile(tempPath); err != nil || string(data) != "late temp" {
+		t.Fatalf("late writer temp changed: data=%q err=%v", data, err)
+	}
+	if _, err := os.Lstat(markerPath); err != nil {
+		t.Fatalf("writer marker retired over late temp: %v", err)
+	}
+}
+
+func TestRootAtomicWritePreservesTempNameReplacementDuringValidationFailure(t *testing.T) {
+	inspection := inspectStorageTestHome(t, false)
+	var tempPath, displacedTemp, markerPath string
+	swapped := false
+	var swapErr error
+	root, err := openStorageRootMutableWithHooks(inspection, storageTestHooks{
+		beforeTempFileCreate: func(path string) {
+			if filepath.Dir(path) == inspection.Root() {
+				tempPath = path
+				markerPath = filepath.Join(inspection.Root(), rootTempJournalDirectoryName, filepath.Base(path))
+			}
+		},
+		metadata: func(path string, metadata storageMetadata) storageMetadata {
+			if swapped || path != tempPath {
+				return metadata
+			}
+			swapped = true
+			displacedTemp = tempPath + ".displaced"
+			if err := os.Rename(tempPath, displacedTemp); err != nil {
+				swapErr = err
+				return metadata
+			}
+			swapErr = os.WriteFile(tempPath, nil, 0o600)
+			return metadata
+		},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = root.Close() }()
+	writeErr := root.writeFileAtomic("target", []byte("sensitive"))
+	if writeErr == nil || !swapped || swapErr != nil {
+		t.Fatalf("validation temp swap = swapped:%v swapErr:%v writeErr:%v", swapped, swapErr, writeErr)
+	}
+	for _, path := range []string{tempPath, displacedTemp, markerPath} {
+		if data, err := os.ReadFile(path); err != nil || len(data) != 0 {
+			t.Fatalf("validation failure changed evidence %q: data=%x err=%v", path, data, err)
+		}
+	}
+}
+
+func TestRootAtomicWriteRevalidatesMarkerAfterRenameHookBeforeInstall(t *testing.T) {
+	inspection := inspectStorageTestHome(t, false)
+	var markerPath, displacedMarker string
+	swapped := false
+	var swapErr error
+	root, err := openStorageRootMutableWithHooks(inspection, storageTestHooks{
+		beforeTempFileCreate: func(path string) {
+			if filepath.Dir(path) == inspection.Root() {
+				markerPath = filepath.Join(inspection.Root(), rootTempJournalDirectoryName, filepath.Base(path))
+			}
+		},
+		beforeStep: func(step storageStep) error {
+			if swapped || step != storageStepRename || markerPath == "" {
+				return nil
+			}
+			swapped = true
+			displacedMarker = markerPath + ".displaced"
+			if err := os.Rename(markerPath, displacedMarker); err != nil {
+				swapErr = err
+				return nil
+			}
+			swapErr = os.WriteFile(markerPath, nil, 0o600)
+			return nil
+		},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = root.Close() }()
+	writeErr := root.writeFileAtomic("target", []byte("sensitive"))
+	if swapErr != nil || !swapped {
+		t.Fatalf("swap marker before rename: swapped=%v err=%v", swapped, swapErr)
+	}
+	if writeErr == nil {
+		t.Fatal("root write installed target after marker replacement at rename")
+	}
+	if _, err := os.Lstat(filepath.Join(inspection.Root(), "target")); !errors.Is(err, fs.ErrNotExist) {
+		t.Fatalf("marker replacement installed target: %v", err)
+	}
+	for _, path := range []string{markerPath, displacedMarker} {
+		if _, err := os.Lstat(path); err != nil {
+			t.Fatalf("rename marker evidence %q was removed: %v", path, err)
+		}
+	}
+}
+
+func TestRootAtomicWriteRejectsJournalPathReplacementBeforeTempCreation(t *testing.T) {
+	inspection := inspectStorageTestHome(t, false)
+	journalPath := filepath.Join(inspection.Root(), rootTempJournalDirectoryName)
+	displacedPath := filepath.Join(inspection.Root(), ".displaced-root-temp-journal")
+	swapped := false
+	var swapErr error
+	root, err := openStorageRootMutableWithHooks(inspection, storageTestHooks{
+		beforeTempFileCreate: func(path string) {
+			if swapped || filepath.Dir(path) != inspection.Root() {
+				return
+			}
+			swapped = true
+			if err := os.Rename(journalPath, displacedPath); err != nil {
+				swapErr = err
+				return
+			}
+			swapErr = os.Mkdir(journalPath, 0o700)
+		},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = root.Close() }()
+
+	writeErr := root.writeFileAtomic("target", []byte("sensitive"))
+	if swapErr != nil {
+		t.Fatalf("replace root-temp journal fixture: %v", swapErr)
+	}
+	if !swapped {
+		t.Fatal("journal path replacement was not injected")
+	}
+	if writeErr == nil {
+		t.Fatal("root atomic write continued after its journal became unreachable by name")
+	}
+	if _, err := os.Lstat(filepath.Join(inspection.Root(), "target")); !errors.Is(err, fs.ErrNotExist) {
+		t.Fatalf("journal-path replacement installed target: %v", err)
+	}
+	entries, err := os.ReadDir(inspection.Root())
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, entry := range entries {
+		if canonicalStorageTempName(entry.Name()) {
+			t.Fatalf("journal-path replacement left unjournaled root temp %q", entry.Name())
+		}
+	}
+}
+
+func TestStorageEnumeratedCleanupMutationsRejectCrossDeviceBoundary(t *testing.T) {
+	for _, operation := range []string{"unlink", "rmdir", "rename", "exchange"} {
+		t.Run(operation, func(t *testing.T) {
+			inspection := inspectStorageTestHome(t, true)
+			childPath := filepath.Join(inspection.Root(), "child")
+			sentinelPath := filepath.Join(childPath, "keep")
+			if err := os.Mkdir(childPath, 0o700); err != nil {
+				t.Fatal(err)
+			}
+			if err := os.WriteFile(sentinelPath, []byte("keep"), 0o600); err != nil {
+				t.Fatal(err)
+			}
+			otherPath := filepath.Join(inspection.Root(), "other")
+			if err := os.Mkdir(otherPath, 0o700); err != nil {
+				t.Fatal(err)
+			}
+			mutationAttempts := 0
+			root, err := openStorageRootMutableWithHooks(inspection, storageTestHooks{
+				metadata: func(path string, metadata storageMetadata) storageMetadata {
+					if path == childPath {
+						metadata.dev ^= 1 << 63
+					}
+					return metadata
+				},
+				beforeMutation: func(_ storageStep, path string) {
+					if path == childPath || strings.HasPrefix(path, childPath+string(os.PathSeparator)) {
+						mutationAttempts++
+					}
+				},
+				beforeExchange: func() error {
+					mutationAttempts++
+					return nil
+				},
+			})
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer func() { _ = root.Close() }()
+			entry, err := root.lookupEntry("child")
+			if err != nil {
+				t.Fatal(err)
+			}
+			var mutationErr error
+			switch operation {
+			case "unlink":
+				mutationErr = root.unlinkEnumeratedEntry(entry)
+			case "rmdir":
+				mutationErr = root.removeEnumeratedCleanupDirectory(entry)
+			case "rename":
+				_, mutationErr = root.renameEnumeratedDirectory(entry, root.storageDir, "parked")
+			case "exchange":
+				other, lookupErr := root.lookupEntry("other")
+				if lookupErr != nil {
+					t.Fatal(lookupErr)
+				}
+				_, mutationErr = root.exchangeEnumeratedEntries(entry, root.storageDir, other)
+			}
+			if !errors.Is(mutationErr, unix.EXDEV) || mutationAttempts != 0 {
+				t.Fatalf("cross-device %s = attempts:%d err:%v", operation, mutationAttempts, mutationErr)
+			}
+			if data, err := os.ReadFile(sentinelPath); err != nil || string(data) != "keep" {
+				t.Fatalf("cross-device %s changed sentinel: data=%q err=%v", operation, data, err)
+			}
+			if _, err := os.Lstat(filepath.Join(inspection.Root(), "parked")); !errors.Is(err, fs.ErrNotExist) {
+				t.Fatalf("cross-device %s created rename target: %v", operation, err)
+			}
+		})
+	}
+}
+
 func TestStorageDirectoryRemovalRejectsPostEnumerationTrustDrift(t *testing.T) {
 	inspection := inspectStorageTestHome(t, true)
 	root, err := openStorageRootMutable(inspection)
@@ -2666,6 +3585,22 @@ func countStep(steps []storageStep, want storageStep) int {
 		}
 	}
 	return count
+}
+
+func requireOnlyPersistentRootTempJournal(t *testing.T, rootPath string) []os.DirEntry {
+	t.Helper()
+	entries, err := os.ReadDir(rootPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(entries) != 1 || entries[0].Name() != rootTempJournalDirectoryName || !entries[0].IsDir() {
+		t.Fatalf("storage root entries = %v, want only persistent root-temp journal", entries)
+	}
+	journalEntries, err := os.ReadDir(filepath.Join(rootPath, rootTempJournalDirectoryName))
+	if err != nil {
+		t.Fatal(err)
+	}
+	return journalEntries
 }
 
 func TestStorageAdvisoryLockUsesStableInodeAndHonorsContext(t *testing.T) {

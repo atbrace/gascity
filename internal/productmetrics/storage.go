@@ -2,6 +2,7 @@ package productmetrics
 
 import (
 	"context"
+	"encoding/binary"
 	"errors"
 	"fmt"
 	"io/fs"
@@ -24,6 +25,77 @@ var (
 	errStorageClosed              = errors.New("productmetrics: storage handle is closed")
 )
 
+const (
+	rootTempJournalDirectoryName      = ".pm-root-temp-journal"
+	rootTempJournalMarkerMagic        = "GCPMRTJ1"
+	rootTempJournalBoundState         = byte(0x02)
+	rootTempJournalMarkerHeaderBytes  = 32
+	maximumRootTempMarkerNameBytes    = 128
+	maximumRootTempJournalMarkerBytes = rootTempJournalMarkerHeaderBytes + maximumRootTempMarkerNameBytes
+	rootTempJournalMarkerReadLimit    = maximumRootTempJournalMarkerBytes + 1
+)
+
+type rootTempJournalMarkerState uint8
+
+const (
+	rootTempJournalMarkerInvalid rootTempJournalMarkerState = iota
+	rootTempJournalMarkerIntent
+	rootTempJournalMarkerBound
+)
+
+type rootTempJournalMarkerEvidence struct {
+	state rootTempJournalMarkerState
+	name  string
+	temp  recordIncarnation
+}
+
+func encodeBoundRootTempJournalMarker(name string, temp recordIncarnation) ([]byte, error) {
+	if !canonicalStorageTempName(name) || len(name) == 0 || len(name) > maximumRootTempMarkerNameBytes ||
+		temp.dev == 0 || temp.ino == 0 {
+		return nil, errors.New("productmetrics: invalid root temporary-file marker binding")
+	}
+	data := make([]byte, rootTempJournalMarkerHeaderBytes+len(name))
+	copy(data[:8], rootTempJournalMarkerMagic)
+	data[8] = rootTempJournalBoundState
+	data[9] = byte(len(name))
+	binary.BigEndian.PutUint64(data[16:24], temp.dev)
+	binary.BigEndian.PutUint64(data[24:32], temp.ino)
+	copy(data[rootTempJournalMarkerHeaderBytes:], name)
+	return data, nil
+}
+
+func decodeRootTempJournalMarker(name string, data []byte) (rootTempJournalMarkerEvidence, error) {
+	if !canonicalStorageTempName(name) || len(name) == 0 || len(name) > maximumRootTempMarkerNameBytes {
+		return rootTempJournalMarkerEvidence{}, errors.New("productmetrics: invalid root temporary-file marker name")
+	}
+	if len(data) == 0 {
+		return rootTempJournalMarkerEvidence{state: rootTempJournalMarkerIntent, name: name}, nil
+	}
+	if len(data) < rootTempJournalMarkerHeaderBytes || len(data) > maximumRootTempJournalMarkerBytes ||
+		string(data[:8]) != rootTempJournalMarkerMagic || data[8] != rootTempJournalBoundState {
+		return rootTempJournalMarkerEvidence{}, errors.New("productmetrics: malformed root temporary-file marker")
+	}
+	nameBytes := int(data[9])
+	if nameBytes == 0 || nameBytes > maximumRootTempMarkerNameBytes ||
+		len(data) != rootTempJournalMarkerHeaderBytes+nameBytes {
+		return rootTempJournalMarkerEvidence{}, errors.New("productmetrics: malformed root temporary-file marker length")
+	}
+	for _, reserved := range data[10:16] {
+		if reserved != 0 {
+			return rootTempJournalMarkerEvidence{}, errors.New("productmetrics: malformed root temporary-file marker reserved bytes")
+		}
+	}
+	boundName := string(data[rootTempJournalMarkerHeaderBytes:])
+	temp := recordIncarnation{
+		dev: binary.BigEndian.Uint64(data[16:24]),
+		ino: binary.BigEndian.Uint64(data[24:32]),
+	}
+	if boundName != name || !canonicalStorageTempName(boundName) || temp.dev == 0 || temp.ino == 0 {
+		return rootTempJournalMarkerEvidence{}, errors.New("productmetrics: invalid root temporary-file marker binding")
+	}
+	return rootTempJournalMarkerEvidence{state: rootTempJournalMarkerBound, name: boundName, temp: temp}, nil
+}
+
 type storageStep string
 
 const (
@@ -36,6 +108,8 @@ const (
 	storageStepUnlink        storageStep = "unlink"
 	storageStepRmdir         storageStep = "rmdir"
 	storageStepDirectorySync storageStep = "directory-sync"
+	storageStepMarkerCreate  storageStep = "marker-create"
+	storageStepMarkerBind    storageStep = "marker-bind"
 	storageStepLock          storageStep = "lock"
 )
 
@@ -198,6 +272,20 @@ func (hooks storageTestHooks) run(step storageStep) error {
 	return hooks.beforeStep(step)
 }
 
+func (hooks storageTestHooks) markerBindingHooks() storageTestHooks {
+	original := hooks.beforeStep
+	if original == nil {
+		return hooks
+	}
+	hooks.beforeStep = func(step storageStep) error {
+		if step == storageStepWrite {
+			step = storageStepMarkerBind
+		}
+		return original(step)
+	}
+	return hooks
+}
+
 func (hooks storageTestHooks) openedComponent(path string) {
 	if hooks.afterComponentOpen != nil {
 		hooks.afterComponentOpen(path)
@@ -291,16 +379,19 @@ type storageDirectoryBackend interface {
 	removeFile(string) error
 	removeFileClockFree(string) error
 	removeFileMatching(string, recordIncarnation) error
+	removeFileMatchingGuarded(string, recordIncarnation, func() error) error
 	confirmEntryAbsent(string) error
 	renameFile(string, storageDirectoryBackend, string) (storageRenameResult, error)
 	replaceFile(string, storageDirectoryBackend, string) (storageRenameResult, error)
 	renameEnumeratedEntry(storageEntry, storageDirectoryBackend, string) (storageRenameResult, error)
 	renameEnumeratedDirectory(storageEntry, storageDirectoryBackend, string) (storageRenameResult, error)
 	exchangeEnumeratedEntries(storageEntry, storageDirectoryBackend, storageEntry) (storageRenameResult, error)
+	exchangeFilesMatching(string, recordIncarnation, storageDirectoryBackend, string, recordIncarnation) (storageRenameResult, error)
 	syncDirectory() error
 	iterateEntries() (storageIteratorBackend, error)
 	firstEntryFromRetainedHandle() (storageEntry, error)
 	lookupEntry(string) (storageEntry, error)
+	validateFileMatching(string, recordIncarnation) error
 	openEnumeratedCleanupDirectory(storageEntry) (storageDirectoryBackend, error)
 	unlinkEnumeratedEntry(storageEntry) error
 	removeEnumeratedDirectory(storageEntry) error
@@ -498,6 +589,24 @@ func (directory *storageDir) removeFileClockFree(name string) error {
 }
 
 func (directory *storageDir) removeFileMatchingLease(name string, lease *storageRecordLease) error {
+	return directory.removeFileMatchingLeaseGuarded(name, lease, nil)
+}
+
+func (directory *storageDir) validateFileMatchingLease(name string, lease *storageRecordLease) error {
+	if directory == nil || directory.backend == nil {
+		return errStorageClosed
+	}
+	if err := validateMutableStorageName(name); err != nil {
+		return err
+	}
+	incarnation := lease.incarnation()
+	if incarnation == (recordIncarnation{}) {
+		return errors.New("productmetrics: closed or invalid record lease for identity validation")
+	}
+	return directory.backend.validateFileMatching(name, incarnation)
+}
+
+func (directory *storageDir) removeFileMatchingLeaseGuarded(name string, lease *storageRecordLease, guard func() error) error {
 	if directory == nil || directory.backend == nil {
 		return errStorageClosed
 	}
@@ -512,7 +621,7 @@ func (directory *storageDir) removeFileMatchingLease(name string, lease *storage
 	if lease.backend == nil || lease.record == (recordIncarnation{}) {
 		return errors.New("productmetrics: closed or invalid record lease for identity-bound deletion")
 	}
-	if err := directory.backend.removeFileMatching(name, lease.record); err != nil {
+	if err := directory.backend.removeFileMatchingGuarded(name, lease.record, guard); err != nil {
 		return err
 	}
 	metadata, err := lease.backend.metadata()
@@ -598,6 +707,41 @@ func (directory *storageDir) exchangeEnumeratedEntries(source storageEntry, targ
 		return storageRenameResult{state: storageRenameNotApplied}, err
 	}
 	return directory.backend.exchangeEnumeratedEntries(source, target.backend, targetEntry)
+}
+
+// exchangeFilesMatchingLeases atomically swaps two exact leased private files.
+// Both descriptors remain retained for the whole exchange, preventing either
+// inode from being reused while its name-bound authority is revalidated.
+func (directory *storageDir) exchangeFilesMatchingLeases(
+	name string,
+	lease *storageRecordLease,
+	target *storageDir,
+	targetName string,
+	targetLease *storageRecordLease,
+) (storageRenameResult, error) {
+	notApplied := storageRenameResult{state: storageRenameNotApplied}
+	if directory == nil || directory.backend == nil || target == nil || target.backend == nil {
+		return notApplied, errStorageClosed
+	}
+	if err := validateMutableStorageName(name); err != nil {
+		return notApplied, err
+	}
+	if err := validateMutableStorageName(targetName); err != nil {
+		return notApplied, err
+	}
+	if lease == nil || targetLease == nil || lease == targetLease {
+		return notApplied, errors.New("productmetrics: distinct source and target leases are required for file exchange")
+	}
+	lease.mu.Lock()
+	defer lease.mu.Unlock()
+	targetLease.mu.Lock()
+	defer targetLease.mu.Unlock()
+	if lease.backend == nil || targetLease.backend == nil ||
+		lease.record == (recordIncarnation{}) || targetLease.record == (recordIncarnation{}) ||
+		lease.record == targetLease.record {
+		return notApplied, errors.New("productmetrics: invalid file leases for exact exchange")
+	}
+	return directory.backend.exchangeFilesMatching(name, lease.record, target.backend, targetName, targetLease.record)
 }
 
 func (directory *storageDir) syncDirectory() error {

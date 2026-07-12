@@ -12,6 +12,7 @@ import (
 	"path/filepath"
 	"runtime"
 	"strings"
+	"sync/atomic"
 	"time"
 
 	"github.com/gastownhall/gascity/internal/gchome"
@@ -95,6 +96,7 @@ type InvocationContext struct {
 	ManagedAutomation   bool
 	NoticeEligible      bool
 	Recordable          bool
+	OccurredHourUTC     string
 }
 
 // RecordingPermit is an immutable snapshot of the state that authorized one
@@ -110,6 +112,8 @@ type RecordingPermit struct {
 	metricsEpoch     uint64
 	requiredNotice   uint64
 	acceptedNotice   uint64
+	operatingSystem  OperatingSystem
+	occurredHourUTC  string
 }
 
 // Valid reports whether the immutable snapshot was recording-eligible when
@@ -159,20 +163,23 @@ type serviceRelease struct {
 // serviceDependencies is package-private by design. Unit tests can exercise a
 // marked synthetic release; normal binaries can only call OpenProduction.
 type serviceDependencies struct {
-	home         gchome.ProductUsageHome
-	homeErr      error
-	homeReason   StateReason
-	release      serviceRelease
-	notice       noticeDefinition
-	getenv       func(string) string
-	newUUID      func() (string, error)
-	verifyTTY    func(io.Writer) bool
-	storageHooks storageTestHooks
+	home                  gchome.ProductUsageHome
+	homeErr               error
+	homeReason            StateReason
+	release               serviceRelease
+	notice                noticeDefinition
+	getenv                func(string) string
+	newUUID               func() (string, error)
+	now                   func() time.Time
+	beforeRecordOperation func(recordOperation)
+	verifyTTY             func(io.Writer) bool
+	storageHooks          storageTestHooks
 }
 
 // Service owns the lazy consent and identity state machine.
 type Service struct {
-	deps serviceDependencies
+	deps          serviceDependencies
+	recordAttempt atomic.Bool
 }
 
 type loadedState struct {
@@ -284,6 +291,7 @@ func OpenProduction(options ProductionOptions) (*Service, error) {
 		newUUID: func() (string, error) {
 			return randomUUIDv4(rand.Reader)
 		},
+		now:       time.Now,
 		verifyTTY: productionNoticeWriterIsTTY,
 	}
 	return openWithDependencies(deps)
@@ -295,6 +303,9 @@ func openWithDependencies(deps serviceDependencies) (*Service, error) {
 	}
 	if deps.newUUID == nil {
 		return nil, errors.New("productmetrics: UUID dependency is nil")
+	}
+	if deps.now == nil {
+		deps.now = time.Now
 	}
 	if deps.verifyTTY == nil {
 		return nil, errors.New("productmetrics: TTY verifier dependency is nil")
@@ -379,6 +390,13 @@ func (service *Service) RecordingPermit(invocation InvocationContext) RecordingP
 		return RecordingPermit{}
 	}
 	state := loaded.state
+	occurredHour := invocation.OccurredHourUTC
+	if occurredHour == "" {
+		occurredHour = depsHourUTC(service.deps.now())
+	}
+	if _, err := parseCanonicalHourUTC(occurredHour); err != nil {
+		return RecordingPermit{}
+	}
 	if projection.state == StateNoticeUpdateRequired {
 		ctx, cancel := context.WithTimeout(context.Background(), stateLockTimeout)
 		defer cancel()
@@ -405,6 +423,8 @@ func (service *Service) RecordingPermit(invocation InvocationContext) RecordingP
 		metricsEpoch:     service.deps.release.metricsEpoch,
 		requiredNotice:   state.RequiredNoticeVersion,
 		acceptedNotice:   state.AcceptedNoticeVersion,
+		operatingSystem:  operatingSystemForRuntime(),
+		occurredHourUTC:  occurredHour,
 	}
 }
 

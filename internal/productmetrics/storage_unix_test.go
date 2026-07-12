@@ -651,7 +651,7 @@ func TestStorageAtomicNoReplaceAndWriteFailureSeams(t *testing.T) {
 		if err := root.writeFileAtomicNoReplace("event.json", []byte("first")); err != nil {
 			t.Fatalf("first no-replace write: %v", err)
 		}
-		if countStep(steps, storageStepFileSync) != 1 || countStep(steps, storageStepInstall) != 1 || countStep(steps, storageStepDirectorySync) != 1 {
+		if countStep(steps, storageStepFileSync) != 1 || countStep(steps, storageStepRename) != 1 || countStep(steps, storageStepDirectorySync) != 1 {
 			t.Fatalf("no-replace durability steps = %v", steps)
 		}
 		if err := root.writeFileAtomicNoReplace("event.json", []byte("second")); !errors.Is(err, errStorageEntryExists) {
@@ -662,12 +662,49 @@ func TestStorageAtomicNoReplaceAndWriteFailureSeams(t *testing.T) {
 		}
 	})
 
+	t.Run("rejects staged source replacement at mutation boundary", func(t *testing.T) {
+		inspection := inspectStorageTestHome(t, true)
+		var tempPath string
+		var displacedPath string
+		var injectedErr error
+		armed := false
+		swapped := false
+		hooks := storageTestHooks{
+			beforeTempFileCreate: func(path string) { tempPath = path },
+			beforeMutation: func(step storageStep, _ string) {
+				if !armed || swapped || step != storageStepRename {
+					return
+				}
+				swapped = true
+				displacedPath = tempPath + ".displaced"
+				injectedErr = os.Rename(tempPath, displacedPath)
+				if injectedErr == nil {
+					injectedErr = os.WriteFile(tempPath, []byte("attacker"), 0o600)
+				}
+			},
+		}
+		root, err := openStorageRootMutableWithHooks(inspection, hooks)
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer func() { _ = root.Close() }()
+		armed = true
+		writeErr := root.writeFileAtomicNoReplace("event.json", []byte("source"))
+		_, targetErr := os.Lstat(filepath.Join(inspection.Root(), "event.json"))
+		displacedData, displacedErr := os.ReadFile(displacedPath)
+		if injectedErr != nil || !swapped || !errors.Is(writeErr, errStorageEntryChanged) ||
+			!errors.Is(targetErr, fs.ErrNotExist) || displacedErr != nil || string(displacedData) != "source" {
+			t.Fatalf("staged source replacement = swapped:%v injected:%v write:%v target:%v displaced:%q displacedErr:%v",
+				swapped, injectedErr, writeErr, targetErr, displacedData, displacedErr)
+		}
+	})
+
 	for _, test := range []struct {
 		name string
 		step storageStep
 	}{
 		{name: "write", step: storageStepWrite},
-		{name: "no-replace install", step: storageStepInstall},
+		{name: "no-replace install", step: storageStepRename},
 	} {
 		t.Run(test.name+" failure", func(t *testing.T) {
 			inspection := inspectStorageTestHome(t, true)
@@ -736,6 +773,43 @@ func TestStorageDeleteRetriesDirectorySyncAfterUncertainFailure(t *testing.T) {
 	// the prior uncertain unlink durable before reporting success.
 	if err := root.removeFile("event.json"); err != nil {
 		t.Fatalf("retry durable delete: %v", err)
+	}
+}
+
+func TestStorageRemoveFileRejectsIdentityReplacementAtMutationBoundary(t *testing.T) {
+	inspection := inspectStorageTestHome(t, true)
+	victimPath := filepath.Join(inspection.Root(), "event.json")
+	displacedPath := victimPath + ".displaced"
+	var injectedErr error
+	armed := false
+	swapped := false
+	hooks := storageTestHooks{beforeMutation: func(step storageStep, _ string) {
+		if !armed || swapped || step != storageStepDelete {
+			return
+		}
+		swapped = true
+		injectedErr = os.Rename(victimPath, displacedPath)
+		if injectedErr == nil {
+			injectedErr = os.WriteFile(victimPath, []byte("replacement"), 0o600)
+		}
+	}}
+	root, err := openStorageRootMutableWithHooks(inspection, hooks)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = root.Close() }()
+	if err := root.writeFileAtomic("event.json", []byte("original")); err != nil {
+		t.Fatal(err)
+	}
+	armed = true
+	removeErr := root.removeFile("event.json")
+	victimData, victimErr := os.ReadFile(victimPath)
+	displacedData, displacedErr := os.ReadFile(displacedPath)
+	if injectedErr != nil || !swapped || !errors.Is(removeErr, errStorageEntryChanged) ||
+		victimErr != nil || string(victimData) != "replacement" ||
+		displacedErr != nil || string(displacedData) != "original" {
+		t.Fatalf("remove identity replacement = swapped:%v injected:%v remove:%v victim:%q victimErr:%v displaced:%q displacedErr:%v",
+			swapped, injectedErr, removeErr, victimData, victimErr, displacedData, displacedErr)
 	}
 }
 
@@ -991,6 +1065,269 @@ func TestStorageRenameDeleteAndNestedDirectoriesAreDescriptorRelativeAndDurable(
 	}
 }
 
+type oneWayRenameSyncFixture struct {
+	source     *storageDir
+	target     *storageDir
+	run        func() (storageRenameResult, error)
+	sourcePath string
+	targetPath string
+	wantTarget string
+}
+
+func setStorageDirectoryStepHook(t *testing.T, directory *storageDir, hook func(storageStep) error) {
+	t.Helper()
+	if directory == nil || directory.backend == nil {
+		t.Fatal("cannot install a step hook on a closed storage directory")
+	}
+	backend, ok := directory.backend.(*unixStorageDirectory)
+	if !ok {
+		t.Fatalf("storage directory backend = %T, want *unixStorageDirectory", directory.backend)
+	}
+	backend.mu.Lock()
+	backend.hooks.beforeStep = hook
+	backend.mu.Unlock()
+}
+
+func TestStorageCrossDirectoryOneWayRenamesSyncDestinationBeforeSource(t *testing.T) {
+	openRoot := func(t *testing.T) (*storageRoot, gchome.ProductUsageHome) {
+		t.Helper()
+		inspection := inspectStorageTestHome(t, true)
+		root, err := openStorageRootMutable(inspection)
+		if err != nil {
+			t.Fatal(err)
+		}
+		t.Cleanup(func() { _ = root.Close() })
+		return root, inspection
+	}
+	openChild := func(t *testing.T, root *storageRoot, name string) *storageDir {
+		t.Helper()
+		directory, err := root.openDir([]string{name}, true)
+		if err != nil {
+			t.Fatal(err)
+		}
+		t.Cleanup(func() { _ = directory.Close() })
+		return directory
+	}
+	ordinaryFixture := func(t *testing.T, sourceName, targetName string) oneWayRenameSyncFixture {
+		t.Helper()
+		root, inspection := openRoot(t)
+		source := openChild(t, root, sourceName)
+		target := openChild(t, root, targetName)
+		if err := source.writeFileAtomic("event.json", []byte("event")); err != nil {
+			t.Fatal(err)
+		}
+		return oneWayRenameSyncFixture{
+			source: source,
+			target: target,
+			run: func() (storageRenameResult, error) {
+				return source.renameFile("event.json", target, "event.json")
+			},
+			sourcePath: filepath.Join(inspection.Root(), sourceName, "event.json"),
+			targetPath: filepath.Join(inspection.Root(), targetName, "event.json"),
+			wantTarget: "event",
+		}
+	}
+	operations := []struct {
+		name  string
+		setup func(*testing.T) oneWayRenameSyncFixture
+	}{
+		{
+			name: "claim queue to inflight",
+			setup: func(t *testing.T) oneWayRenameSyncFixture {
+				return ordinaryFixture(t, queueDirectoryName, inflightDirectoryName)
+			},
+		},
+		{
+			name: "restore inflight to queue",
+			setup: func(t *testing.T) oneWayRenameSyncFixture {
+				return ordinaryFixture(t, inflightDirectoryName, queueDirectoryName)
+			},
+		},
+		{
+			name: "cross-parent replacement",
+			setup: func(t *testing.T) oneWayRenameSyncFixture {
+				root, inspection := openRoot(t)
+				control := openChild(t, root, "control")
+				if err := control.writeFileAtomic("staged", []byte("new-quota")); err != nil {
+					t.Fatal(err)
+				}
+				if err := root.writeFileAtomic("quota", []byte("old-quota")); err != nil {
+					t.Fatal(err)
+				}
+				return oneWayRenameSyncFixture{
+					source: control,
+					target: root.storageDir,
+					run: func() (storageRenameResult, error) {
+						return control.replaceFile("staged", root.storageDir, "quota")
+					},
+					sourcePath: filepath.Join(inspection.Root(), "control", "staged"),
+					targetPath: filepath.Join(inspection.Root(), "quota"),
+					wantTarget: "new-quota",
+				}
+			},
+		},
+		{
+			name: "enumerated entry",
+			setup: func(t *testing.T) oneWayRenameSyncFixture {
+				root, inspection := openRoot(t)
+				target := openChild(t, root, "target")
+				if err := root.writeFileAtomic("source", []byte("enumerated")); err != nil {
+					t.Fatal(err)
+				}
+				entry, err := root.lookupEntry("source")
+				if err != nil {
+					t.Fatal(err)
+				}
+				return oneWayRenameSyncFixture{
+					source: root.storageDir,
+					target: target,
+					run: func() (storageRenameResult, error) {
+						return root.renameEnumeratedEntry(entry, target, "parked")
+					},
+					sourcePath: filepath.Join(inspection.Root(), "source"),
+					targetPath: filepath.Join(inspection.Root(), "target", "parked"),
+					wantTarget: "enumerated",
+				}
+			},
+		},
+	}
+	cuts := []struct {
+		name            string
+		failDestination bool
+		failSource      bool
+		wantOrder       string
+	}{
+		{name: "durable", wantOrder: "destination,source"},
+		{name: "destination sync crash", failDestination: true, wantOrder: "destination"},
+		{name: "source sync crash", failSource: true, wantOrder: "destination,source"},
+	}
+	for _, operation := range operations {
+		for _, cut := range cuts {
+			t.Run(operation.name+"/"+cut.name, func(t *testing.T) {
+				fixture := operation.setup(t)
+				destinationFailure := errors.New("injected destination parent sync failure")
+				sourceFailure := errors.New("injected source parent sync failure")
+				var order []string
+				setStorageDirectoryStepHook(t, fixture.target, func(step storageStep) error {
+					if step != storageStepDirectorySync {
+						return nil
+					}
+					order = append(order, "destination")
+					if cut.failDestination {
+						return destinationFailure
+					}
+					return nil
+				})
+				setStorageDirectoryStepHook(t, fixture.source, func(step storageStep) error {
+					if step != storageStepDirectorySync {
+						return nil
+					}
+					order = append(order, "source")
+					if cut.failSource {
+						return sourceFailure
+					}
+					return nil
+				})
+
+				result, renameErr := fixture.run()
+				wantState := storageRenameAppliedDurable
+				var wantErr error
+				switch {
+				case cut.failDestination:
+					wantState = storageRenameAppliedSyncPending
+					wantErr = destinationFailure
+				case cut.failSource:
+					wantState = storageRenameAppliedSyncPending
+					wantErr = sourceFailure
+				}
+				targetData, targetErr := os.ReadFile(fixture.targetPath)
+				_, sourceErr := os.Lstat(fixture.sourcePath)
+				if result.state != wantState || (wantErr == nil && renameErr != nil) ||
+					(wantErr != nil && !errors.Is(renameErr, wantErr)) || strings.Join(order, ",") != cut.wantOrder ||
+					targetErr != nil || string(targetData) != fixture.wantTarget || !errors.Is(sourceErr, fs.ErrNotExist) {
+					t.Fatalf("one-way rename = state:%v err:%v order:%v target:%q/%v source:%v, want state:%v err:%v order:%s target:%q",
+						result.state, renameErr, order, targetData, targetErr, sourceErr,
+						wantState, wantErr, cut.wantOrder, fixture.wantTarget)
+				}
+			})
+		}
+	}
+}
+
+func TestStorageSameDirectoryOneWayRenamesSyncOnce(t *testing.T) {
+	operations := []struct {
+		name  string
+		setup func(*testing.T, *storageRoot) (func() (storageRenameResult, error), string, string)
+	}{
+		{
+			name: "ordinary rename",
+			setup: func(t *testing.T, root *storageRoot) (func() (storageRenameResult, error), string, string) {
+				if err := root.writeFileAtomic("source", []byte("ordinary")); err != nil {
+					t.Fatal(err)
+				}
+				return func() (storageRenameResult, error) {
+					return root.renameFile("source", root.storageDir, "target")
+				}, "source", "target"
+			},
+		},
+		{
+			name: "replacement",
+			setup: func(t *testing.T, root *storageRoot) (func() (storageRenameResult, error), string, string) {
+				if err := root.writeFileAtomic("source", []byte("replacement")); err != nil {
+					t.Fatal(err)
+				}
+				if err := root.writeFileAtomic("target", []byte("old")); err != nil {
+					t.Fatal(err)
+				}
+				return func() (storageRenameResult, error) {
+					return root.replaceFile("source", root.storageDir, "target")
+				}, "source", "target"
+			},
+		},
+		{
+			name: "enumerated entry",
+			setup: func(t *testing.T, root *storageRoot) (func() (storageRenameResult, error), string, string) {
+				if err := root.writeFileAtomic("source", []byte("enumerated")); err != nil {
+					t.Fatal(err)
+				}
+				entry, err := root.lookupEntry("source")
+				if err != nil {
+					t.Fatal(err)
+				}
+				return func() (storageRenameResult, error) {
+					return root.renameEnumeratedEntry(entry, root.storageDir, "target")
+				}, "source", "target"
+			},
+		},
+	}
+	for _, operation := range operations {
+		t.Run(operation.name, func(t *testing.T) {
+			inspection := inspectStorageTestHome(t, true)
+			root, err := openStorageRootMutable(inspection)
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer func() { _ = root.Close() }()
+			run, sourceName, targetName := operation.setup(t, root)
+			syncs := 0
+			setStorageDirectoryStepHook(t, root.storageDir, func(step storageStep) error {
+				if step == storageStepDirectorySync {
+					syncs++
+				}
+				return nil
+			})
+			result, renameErr := run()
+			data, targetErr := os.ReadFile(filepath.Join(inspection.Root(), targetName))
+			_, sourceErr := os.Lstat(filepath.Join(inspection.Root(), sourceName))
+			if renameErr != nil || result.state != storageRenameAppliedDurable || syncs != 1 ||
+				targetErr != nil || len(data) == 0 || !errors.Is(sourceErr, fs.ErrNotExist) {
+				t.Fatalf("same-directory rename = state:%v err:%v syncs:%d target:%q/%v source:%v",
+					result.state, renameErr, syncs, data, targetErr, sourceErr)
+			}
+		})
+	}
+}
+
 func TestStorageRenameOutcomesAreTypedAndRecoverable(t *testing.T) {
 	t.Run("rename syscall failure is not applied", func(t *testing.T) {
 		inspection := inspectStorageTestHome(t, true)
@@ -1022,8 +1359,8 @@ func TestStorageRenameOutcomesAreTypedAndRecoverable(t *testing.T) {
 		name       string
 		failOnSync int
 	}{
-		{name: "source sync failure", failOnSync: 1},
-		{name: "target sync failure", failOnSync: 2},
+		{name: "target sync failure", failOnSync: 1},
+		{name: "source sync failure", failOnSync: 2},
 	} {
 		t.Run(test.name, func(t *testing.T) {
 			inspection := inspectStorageTestHome(t, true)
@@ -1659,6 +1996,414 @@ func TestStorageIteratorCloseAndFailureSeams(t *testing.T) {
 			t.Fatalf("iterator redirected to %q, want retained directory entry", entry.name)
 		}
 	})
+}
+
+func TestStorageEnumeratedEntryRenameMovesExactAnyKindAndSyncsParents(t *testing.T) {
+	for _, shape := range []struct {
+		name  string
+		setup func(*testing.T, string, string)
+		check func(*testing.T, string, string)
+	}{
+		{
+			name: "regular file",
+			setup: func(t *testing.T, source, _ string) {
+				if err := os.WriteFile(source, []byte("file-payload"), 0o600); err != nil {
+					t.Fatal(err)
+				}
+			},
+			check: func(t *testing.T, target, _ string) {
+				data, err := os.ReadFile(target)
+				if err != nil || string(data) != "file-payload" {
+					t.Fatalf("moved file = %q, %v", data, err)
+				}
+			},
+		},
+		{
+			name: "nonempty directory",
+			setup: func(t *testing.T, source, _ string) {
+				if err := os.Mkdir(source, 0o700); err != nil {
+					t.Fatal(err)
+				}
+				if err := os.WriteFile(filepath.Join(source, "payload"), []byte("directory-payload"), 0o600); err != nil {
+					t.Fatal(err)
+				}
+			},
+			check: func(t *testing.T, target, _ string) {
+				data, err := os.ReadFile(filepath.Join(target, "payload"))
+				if err != nil || string(data) != "directory-payload" {
+					t.Fatalf("moved directory = %q, %v", data, err)
+				}
+			},
+		},
+		{
+			name: "symlink",
+			setup: func(t *testing.T, source, sentinel string) {
+				if err := os.Symlink(sentinel, source); err != nil {
+					t.Fatal(err)
+				}
+			},
+			check: func(t *testing.T, target, sentinel string) {
+				link, err := os.Readlink(target)
+				data, readErr := os.ReadFile(sentinel)
+				if err != nil || link != sentinel || readErr != nil || string(data) != "outside" {
+					t.Fatalf("moved symlink = %q err:%v sentinel=%q readErr:%v", link, err, data, readErr)
+				}
+			},
+		},
+	} {
+		t.Run(shape.name, func(t *testing.T) {
+			inspection := inspectStorageTestHome(t, true)
+			syncs := 0
+			armed := false
+			root, err := openStorageRootMutableWithHooks(inspection, storageTestHooks{beforeStep: func(step storageStep) error {
+				if armed && step == storageStepDirectorySync {
+					syncs++
+				}
+				return nil
+			}})
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer func() { _ = root.Close() }()
+			targetDirectory, err := root.openDir([]string{"target"}, true)
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer func() { _ = targetDirectory.Close() }()
+			sentinel := filepath.Join(t.TempDir(), "sentinel")
+			if err := os.WriteFile(sentinel, []byte("outside"), 0o600); err != nil {
+				t.Fatal(err)
+			}
+			sourcePath := filepath.Join(inspection.Root(), "source")
+			targetPath := filepath.Join(inspection.Root(), "target", "parked")
+			shape.setup(t, sourcePath, sentinel)
+			source, err := root.lookupEntry("source")
+			if err != nil {
+				t.Fatal(err)
+			}
+			armed = true
+			result, renameErr := root.renameEnumeratedEntry(source, targetDirectory, "parked")
+			if renameErr != nil || result.state != storageRenameAppliedDurable || syncs != 2 {
+				t.Fatalf("enumerated %s rename = state:%v syncs:%d err:%v", shape.name, result.state, syncs, renameErr)
+			}
+			if _, err := os.Lstat(sourcePath); !errors.Is(err, fs.ErrNotExist) {
+				t.Fatalf("enumerated %s source remains: %v", shape.name, err)
+			}
+			parked, err := targetDirectory.lookupEntry("parked")
+			if err != nil || parked.metadata.dev != source.metadata.dev || parked.metadata.ino != source.metadata.ino ||
+				parked.metadata.kind != source.metadata.kind {
+				t.Fatalf("enumerated %s target = %+v source=%+v err:%v", shape.name, parked, source, err)
+			}
+			shape.check(t, targetPath, sentinel)
+		})
+	}
+}
+
+func TestStorageEnumeratedEntryRenameCollisionPreservesBothEntries(t *testing.T) {
+	inspection := inspectStorageTestHome(t, true)
+	root, err := openStorageRootMutable(inspection)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = root.Close() }()
+	target, err := root.openDir([]string{"target"}, true)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = target.Close() }()
+	sourcePath := filepath.Join(inspection.Root(), "source")
+	targetPath := filepath.Join(inspection.Root(), "target", "occupied")
+	if err := os.WriteFile(sourcePath, []byte("source"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(targetPath, []byte("target"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	source, err := root.lookupEntry("source")
+	if err != nil {
+		t.Fatal(err)
+	}
+	var sourceBefore, targetBefore unix.Stat_t
+	if err := unix.Lstat(sourcePath, &sourceBefore); err != nil {
+		t.Fatal(err)
+	}
+	if err := unix.Lstat(targetPath, &targetBefore); err != nil {
+		t.Fatal(err)
+	}
+	result, renameErr := root.renameEnumeratedEntry(source, target, "occupied")
+	var sourceAfter, targetAfter unix.Stat_t
+	if err := unix.Lstat(sourcePath, &sourceAfter); err != nil {
+		t.Fatal(err)
+	}
+	if err := unix.Lstat(targetPath, &targetAfter); err != nil {
+		t.Fatal(err)
+	}
+	if result.state != storageRenameNotApplied || !errors.Is(renameErr, errStorageDestinationExists) ||
+		sourceBefore.Dev != sourceAfter.Dev || sourceBefore.Ino != sourceAfter.Ino ||
+		targetBefore.Dev != targetAfter.Dev || targetBefore.Ino != targetAfter.Ino {
+		t.Fatalf("enumerated collision = state:%v err:%v source:%+v/%+v target:%+v/%+v",
+			result.state, renameErr, sourceBefore, sourceAfter, targetBefore, targetAfter)
+	}
+}
+
+func TestStorageEnumeratedEntryRenameRejectsSourceReplacementAtMutationBoundary(t *testing.T) {
+	inspection := inspectStorageTestHome(t, true)
+	armed := false
+	replaced := false
+	sourcePath := filepath.Join(inspection.Root(), "source")
+	displacedPath := filepath.Join(inspection.Root(), "enumerated-source")
+	root, err := openStorageRootMutableWithHooks(inspection, storageTestHooks{beforeMutation: func(step storageStep, name string) {
+		if !armed || replaced || step != storageStepRename || name != "source" {
+			return
+		}
+		replaced = true
+		if err := os.Rename(sourcePath, displacedPath); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(sourcePath, []byte("replacement"), 0o600); err != nil {
+			t.Fatal(err)
+		}
+	}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = root.Close() }()
+	target, err := root.openDir([]string{"target"}, true)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = target.Close() }()
+	if err := os.WriteFile(sourcePath, []byte("enumerated"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	source, err := root.lookupEntry("source")
+	if err != nil {
+		t.Fatal(err)
+	}
+	armed = true
+	result, renameErr := root.renameEnumeratedEntry(source, target, "parked")
+	replacement, replacementErr := os.ReadFile(sourcePath)
+	displaced, displacedErr := os.ReadFile(displacedPath)
+	_, targetErr := os.Lstat(filepath.Join(inspection.Root(), "target", "parked"))
+	if !replaced || result.state != storageRenameNotApplied || !errors.Is(renameErr, errStorageEntryChanged) ||
+		replacementErr != nil || string(replacement) != "replacement" || displacedErr != nil || string(displaced) != "enumerated" ||
+		!errors.Is(targetErr, fs.ErrNotExist) {
+		t.Fatalf("enumerated replacement = replaced:%v state:%v err:%v replacement:%q/%v displaced:%q/%v target:%v",
+			replaced, result.state, renameErr, replacement, replacementErr, displaced, displacedErr, targetErr)
+	}
+}
+
+func TestStorageEnumeratedEntryRenameSyncFailureIsAppliedPending(t *testing.T) {
+	inspection := inspectStorageTestHome(t, true)
+	armed := false
+	failed := false
+	root, err := openStorageRootMutableWithHooks(inspection, storageTestHooks{beforeStep: func(step storageStep) error {
+		if armed && !failed && step == storageStepDirectorySync {
+			failed = true
+			return errors.New("injected enumerated rename parent sync failure")
+		}
+		return nil
+	}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = root.Close() }()
+	target, err := root.openDir([]string{"target"}, true)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = target.Close() }()
+	sourcePath := filepath.Join(inspection.Root(), "source")
+	if err := os.WriteFile(sourcePath, []byte("source"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	source, err := root.lookupEntry("source")
+	if err != nil {
+		t.Fatal(err)
+	}
+	armed = true
+	result, renameErr := root.renameEnumeratedEntry(source, target, "parked")
+	parked, parkedErr := target.lookupEntry("parked")
+	_, sourceErr := os.Lstat(sourcePath)
+	if !failed || renameErr == nil || result.state != storageRenameAppliedSyncPending ||
+		parkedErr != nil || parked.metadata.dev != source.metadata.dev || parked.metadata.ino != source.metadata.ino ||
+		!errors.Is(sourceErr, fs.ErrNotExist) {
+		t.Fatalf("enumerated sync failure = failed:%v state:%v err:%v parked:%+v/%v source:%v",
+			failed, result.state, renameErr, parked, parkedErr, sourceErr)
+	}
+}
+
+func TestStorageEnumeratedEntryRenameProtectsStableRootLockNames(t *testing.T) {
+	for _, lockName := range []string{stateLockName, "uploader.lock"} {
+		t.Run(lockName+" source", func(t *testing.T) {
+			inspection := inspectStorageTestHome(t, true)
+			root, err := openStorageRootMutable(inspection)
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer func() { _ = root.Close() }()
+			target, err := root.openDir([]string{"target"}, true)
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer func() { _ = target.Close() }()
+			lockPath := filepath.Join(inspection.Root(), lockName)
+			if err := os.WriteFile(lockPath, []byte("lock"), 0o600); err != nil {
+				t.Fatal(err)
+			}
+			entry, err := root.lookupEntry(lockName)
+			if err != nil {
+				t.Fatal(err)
+			}
+			result, renameErr := root.renameEnumeratedEntry(entry, target, "parked")
+			data, readErr := os.ReadFile(lockPath)
+			if renameErr == nil || result.state != storageRenameNotApplied || readErr != nil || string(data) != "lock" {
+				t.Fatalf("stable source lock rename = state:%v err:%v data:%q readErr:%v", result.state, renameErr, data, readErr)
+			}
+		})
+		t.Run(lockName+" target", func(t *testing.T) {
+			inspection := inspectStorageTestHome(t, true)
+			root, err := openStorageRootMutable(inspection)
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer func() { _ = root.Close() }()
+			sourcePath := filepath.Join(inspection.Root(), "source")
+			if err := os.WriteFile(sourcePath, []byte("source"), 0o600); err != nil {
+				t.Fatal(err)
+			}
+			entry, err := root.lookupEntry("source")
+			if err != nil {
+				t.Fatal(err)
+			}
+			result, renameErr := root.renameEnumeratedEntry(entry, root.storageDir, lockName)
+			data, readErr := os.ReadFile(sourcePath)
+			_, targetErr := os.Lstat(filepath.Join(inspection.Root(), lockName))
+			if renameErr == nil || result.state != storageRenameNotApplied || readErr != nil || string(data) != "source" ||
+				!errors.Is(targetErr, fs.ErrNotExist) {
+				t.Fatalf("stable target lock rename = state:%v err:%v data:%q readErr:%v target:%v", result.state, renameErr, data, readErr, targetErr)
+			}
+		})
+	}
+}
+
+func TestStorageEnumeratedUnlinkRejectsReplacementAtMutationBoundary(t *testing.T) {
+	inspection := inspectStorageTestHome(t, true)
+	victimPath := filepath.Join(inspection.Root(), "victim")
+	displacedPath := victimPath + "-enumerated"
+	replaced := false
+	root, err := openStorageRootMutableWithHooks(inspection, storageTestHooks{beforeMutation: func(step storageStep, path string) {
+		if replaced || step != storageStepUnlink || path != victimPath {
+			return
+		}
+		replaced = true
+		if renameErr := os.Rename(victimPath, displacedPath); renameErr != nil {
+			t.Fatal(renameErr)
+		}
+		if writeErr := os.WriteFile(victimPath, []byte("replacement"), 0o600); writeErr != nil {
+			t.Fatal(writeErr)
+		}
+	}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = root.Close() }()
+	if err := os.WriteFile(victimPath, []byte("enumerated"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	entry, err := root.lookupEntry("victim")
+	if err != nil {
+		t.Fatal(err)
+	}
+	unlinkErr := root.unlinkEnumeratedEntry(entry)
+	replacement, replacementErr := os.ReadFile(victimPath)
+	displaced, displacedErr := os.ReadFile(displacedPath)
+	if !replaced || !errors.Is(unlinkErr, errStorageEntryChanged) || replacementErr != nil || string(replacement) != "replacement" ||
+		displacedErr != nil || string(displaced) != "enumerated" {
+		t.Fatalf("enumerated unlink replacement = replaced:%v err:%v replacement:%q/%v displaced:%q/%v",
+			replaced, unlinkErr, replacement, replacementErr, displaced, displacedErr)
+	}
+}
+
+func TestStorageEnumeratedRmdirRejectsReplacementAtMutationBoundary(t *testing.T) {
+	inspection := inspectStorageTestHome(t, true)
+	victimPath := filepath.Join(inspection.Root(), "victim")
+	displacedPath := victimPath + "-enumerated"
+	replaced := false
+	root, err := openStorageRootMutableWithHooks(inspection, storageTestHooks{beforeMutation: func(step storageStep, path string) {
+		if replaced || step != storageStepRmdir || path != victimPath {
+			return
+		}
+		replaced = true
+		if renameErr := os.Rename(victimPath, displacedPath); renameErr != nil {
+			t.Fatal(renameErr)
+		}
+		if mkdirErr := os.Mkdir(victimPath, 0o700); mkdirErr != nil {
+			t.Fatal(mkdirErr)
+		}
+	}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = root.Close() }()
+	if err := os.Mkdir(victimPath, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	entry, err := root.lookupEntry("victim")
+	if err != nil {
+		t.Fatal(err)
+	}
+	removeErr := root.removeEnumeratedCleanupDirectory(entry)
+	replacement, replacementErr := os.Stat(victimPath)
+	displaced, displacedErr := os.Stat(displacedPath)
+	if !replaced || !errors.Is(removeErr, errStorageEntryChanged) || replacementErr != nil || !replacement.IsDir() ||
+		displacedErr != nil || !displaced.IsDir() {
+		t.Fatalf("enumerated rmdir replacement = replaced:%v err:%v replacement:%v/%v displaced:%v/%v",
+			replaced, removeErr, replacement, replacementErr, displaced, displacedErr)
+	}
+}
+
+func TestStorageEnumeratedExchangeProtectsBothStableRootLockEndpoints(t *testing.T) {
+	for _, lockName := range []string{stateLockName, "uploader.lock"} {
+		for _, lockEndpoint := range []string{"source", "target"} {
+			t.Run(lockName+" "+lockEndpoint, func(t *testing.T) {
+				inspection := inspectStorageTestHome(t, true)
+				root, err := openStorageRootMutable(inspection)
+				if err != nil {
+					t.Fatal(err)
+				}
+				defer func() { _ = root.Close() }()
+				lockPath := filepath.Join(inspection.Root(), lockName)
+				otherPath := filepath.Join(inspection.Root(), "other")
+				if err := os.WriteFile(lockPath, []byte("stable-lock"), 0o600); err != nil {
+					t.Fatal(err)
+				}
+				if err := os.WriteFile(otherPath, []byte("other"), 0o600); err != nil {
+					t.Fatal(err)
+				}
+				lockEntry, err := root.lookupEntry(lockName)
+				if err != nil {
+					t.Fatal(err)
+				}
+				otherEntry, err := root.lookupEntry("other")
+				if err != nil {
+					t.Fatal(err)
+				}
+				source, target := lockEntry, otherEntry
+				if lockEndpoint == "target" {
+					source, target = otherEntry, lockEntry
+				}
+				result, exchangeErr := root.exchangeEnumeratedEntries(source, root.storageDir, target)
+				lockData, lockErr := os.ReadFile(lockPath)
+				otherData, otherErr := os.ReadFile(otherPath)
+				if exchangeErr == nil || result.state != storageRenameNotApplied || lockErr != nil || string(lockData) != "stable-lock" ||
+					otherErr != nil || string(otherData) != "other" {
+					t.Fatalf("stable-lock exchange = state:%v err:%v lock:%q/%v other:%q/%v",
+						result.state, exchangeErr, lockData, lockErr, otherData, otherErr)
+				}
+			})
+		}
+	}
 }
 
 func TestStorageIdentityCheckedUnsafeCleanup(t *testing.T) {

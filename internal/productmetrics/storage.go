@@ -13,10 +13,15 @@ import (
 )
 
 var (
-	errStorageDestinationExists = errors.New("productmetrics: rename destination already exists")
-	errStorageEntryExists       = errors.New("productmetrics: storage entry already exists")
-	errStorageEntryChanged      = errors.New("productmetrics: enumerated storage entry changed")
-	errStorageClosed            = errors.New("productmetrics: storage handle is closed")
+	errStorageDestinationExists   = errors.New("productmetrics: rename destination already exists")
+	errStorageEntryExists         = errors.New("productmetrics: storage entry already exists")
+	errStorageEntryChanged        = errors.New("productmetrics: enumerated storage entry changed")
+	errStorageEntryIsDirectory    = errors.New("productmetrics: storage entry is a directory")
+	errStorageDirectoryNotEmpty   = errors.New("productmetrics: storage directory is not empty")
+	errStorageExchangeAncestor    = errors.New("productmetrics: exchange target contains its source")
+	errStorageExchangeSameEntry   = errors.New("productmetrics: exchange source and target are the same entry")
+	errStorageExchangeUnsupported = errors.New("productmetrics: atomic directory exchange is unsupported")
+	errStorageClosed              = errors.New("productmetrics: storage handle is closed")
 )
 
 type storageStep string
@@ -25,7 +30,6 @@ const (
 	storageStepFileSync      storageStep = "file-sync"
 	storageStepWrite         storageStep = "write"
 	storageStepRename        storageStep = "rename"
-	storageStepInstall       storageStep = "install-no-replace"
 	storageStepDelete        storageStep = "delete"
 	storageStepEnumerate     storageStep = "enumerate"
 	storageStepEntryStat     storageStep = "entry-stat"
@@ -35,15 +39,26 @@ const (
 	storageStepLock          storageStep = "lock"
 )
 
+type storageEntryKind uint8
+
+const (
+	storageEntryOther storageEntryKind = iota
+	storageEntryRegular
+	storageEntryDirectory
+)
+
 type storageMetadata struct {
-	uid              uint32
-	mode             uint32
-	nlink            uint64
-	dev              uint64
-	ino              uint64
-	size             int64
-	mtimeSeconds     int64
-	mtimeNanoseconds int64
+	uid               uint32
+	mode              uint32
+	nlink             uint64
+	dev               uint64
+	ino               uint64
+	size              int64
+	mtimeSeconds      int64
+	mtimeNanoseconds  int64
+	kind              storageEntryKind
+	ownerOnly         bool
+	physicalReadBytes uint64
 }
 
 type storageEntry struct {
@@ -83,15 +98,17 @@ type recordIncarnation struct {
 
 type storageRecordBackend interface {
 	close() error
+	metadata() (storageMetadata, error)
 }
 
 // storageRecordLease retains the validated descriptor for one exact atomic
 // config record. Keeping that descriptor open prevents its inode from being
 // reused while stale in-process authority still exists.
 type storageRecordLease struct {
-	mu      sync.Mutex
-	backend storageRecordBackend
-	record  recordIncarnation
+	mu                sync.Mutex
+	backend           storageRecordBackend
+	record            recordIncarnation
+	physicalReadBytes uint64
 }
 
 func newStorageRecordLease(backend storageRecordBackend, metadata storageMetadata) *storageRecordLease {
@@ -99,8 +116,9 @@ func newStorageRecordLease(backend storageRecordBackend, metadata storageMetadat
 		return nil
 	}
 	lease := &storageRecordLease{
-		backend: backend,
-		record:  recordIncarnation{dev: metadata.dev, ino: metadata.ino},
+		backend:           backend,
+		record:            recordIncarnation{dev: metadata.dev, ino: metadata.ino},
+		physicalReadBytes: metadata.physicalReadBytes,
 	}
 	runtime.SetFinalizer(lease, func(retained *storageRecordLease) { _ = retained.Close() })
 	return lease
@@ -154,9 +172,23 @@ func (lease *storageRecordLease) Matches(other *storageRecordLease) bool {
 // storageTestHooks is deliberately package-private. No external construction
 // path can weaken validation or inject filesystem behavior.
 type storageTestHooks struct {
-	beforeStep         func(storageStep) error
-	afterComponentOpen func(string)
-	metadata           func(string, storageMetadata) storageMetadata
+	beforeStep            func(storageStep) error
+	beforeDirectoryOpen   func(string) error
+	afterDirectoryAttempt func(string, error)
+	beforeTempFileCreate  func(string)
+	beforeMutation        func(storageStep, string)
+	afterComponentOpen    func(string)
+	afterDirectoryOpen    func(string)
+	afterFileOpen         func(string)
+	afterAtomicWrite      func(string, storageWriteState)
+	afterRename           func(string, string, storageRenameState)
+	beforeExchange        func() error
+	afterExchange         func() error
+	decisionGate          func() bool
+	beforeMetadataAttempt func(string) error
+	beforeRead            func(string)
+	afterRead             func(string, int, int, error)
+	metadata              func(string, storageMetadata) storageMetadata
 }
 
 func (hooks storageTestHooks) run(step storageStep) error {
@@ -172,6 +204,49 @@ func (hooks storageTestHooks) openedComponent(path string) {
 	}
 }
 
+func (hooks storageTestHooks) openingDirectory(path string) error {
+	if hooks.beforeDirectoryOpen == nil {
+		return nil
+	}
+	return hooks.beforeDirectoryOpen(path)
+}
+
+func (hooks storageTestHooks) observedDirectoryAttempt(path string, err error) {
+	if hooks.afterDirectoryAttempt != nil {
+		hooks.afterDirectoryAttempt(path, err)
+	}
+}
+
+func (hooks storageTestHooks) creatingTempFile(path string) {
+	if hooks.beforeTempFileCreate != nil {
+		hooks.beforeTempFileCreate(path)
+	}
+}
+
+func (hooks storageTestHooks) openedDirectory(path string) {
+	if hooks.afterDirectoryOpen != nil {
+		hooks.afterDirectoryOpen(path)
+	}
+}
+
+func (hooks storageTestHooks) openedFile(path string) {
+	if hooks.afterFileOpen != nil {
+		hooks.afterFileOpen(path)
+	}
+}
+
+func (hooks storageTestHooks) wroteAtomic(path string, state storageWriteState) {
+	if hooks.afterAtomicWrite != nil {
+		hooks.afterAtomicWrite(path, state)
+	}
+}
+
+func (hooks storageTestHooks) renamed(sourcePath, targetPath string, state storageRenameState) {
+	if hooks.afterRename != nil {
+		hooks.afterRename(sourcePath, targetPath, state)
+	}
+}
+
 func (hooks storageTestHooks) inspect(path string, metadata storageMetadata) storageMetadata {
 	if hooks.metadata != nil {
 		return hooks.metadata(path, metadata)
@@ -179,21 +254,67 @@ func (hooks storageTestHooks) inspect(path string, metadata storageMetadata) sto
 	return metadata
 }
 
+func (hooks storageTestHooks) canStartStorageWork() error {
+	if hooks.decisionGate != nil && !hooks.decisionGate() {
+		return errRecordDecisionWindowExpired
+	}
+	return nil
+}
+
+func (hooks storageTestHooks) observedRead(path string, requested, read int, err error) {
+	if hooks.afterRead != nil {
+		hooks.afterRead(path, requested, read, err)
+	}
+}
+
+func (hooks storageTestHooks) startingRead(path string) {
+	if hooks.beforeRead != nil {
+		hooks.beforeRead(path)
+	}
+}
+
+func (hooks storageTestHooks) preparingMutation(step storageStep, path string) {
+	if hooks.beforeMutation != nil {
+		hooks.beforeMutation(step, path)
+	}
+}
+
 type storageDirectoryBackend interface {
 	close() error
 	openDir([]string, bool) (storageDirectoryBackend, error)
 	readFile(string, int64) ([]byte, error)
 	readFileLease(string, int64) ([]byte, storageRecordBackend, storageMetadata, error)
+	readFileLeaseClockFree(string, int64) ([]byte, storageRecordBackend, storageMetadata, error)
 	writeFileAtomic(string, []byte) error
 	writeFileAtomicOutcome(string, []byte) (storageWriteResult, error)
 	writeFileAtomicNoReplace(string, []byte) error
 	removeFile(string) error
+	removeFileClockFree(string) error
+	removeFileMatching(string, recordIncarnation) error
+	confirmEntryAbsent(string) error
 	renameFile(string, storageDirectoryBackend, string) (storageRenameResult, error)
+	replaceFile(string, storageDirectoryBackend, string) (storageRenameResult, error)
+	renameEnumeratedEntry(storageEntry, storageDirectoryBackend, string) (storageRenameResult, error)
+	renameEnumeratedDirectory(storageEntry, storageDirectoryBackend, string) (storageRenameResult, error)
+	exchangeEnumeratedEntries(storageEntry, storageDirectoryBackend, storageEntry) (storageRenameResult, error)
 	syncDirectory() error
 	iterateEntries() (storageIteratorBackend, error)
+	firstEntryFromRetainedHandle() (storageEntry, error)
+	lookupEntry(string) (storageEntry, error)
+	openEnumeratedCleanupDirectory(storageEntry) (storageDirectoryBackend, error)
 	unlinkEnumeratedEntry(storageEntry) error
 	removeEnumeratedDirectory(storageEntry) error
+	removeEnumeratedCleanupDirectory(storageEntry) error
 	acquireLock(context.Context, string) (storageLockBackend, error)
+	cleanupOnlyHandle() bool
+}
+
+type storageDirectoryOpenHookInstaller interface {
+	installDirectoryOpenHooks(func(string) error, func(string)) func()
+}
+
+type storageFileDescriptorLimitBackend interface {
+	fileDescriptorSoftLimit() (uint64, error)
 }
 
 type storageIteratorBackend interface {
@@ -248,6 +369,21 @@ func (directory *storageDir) Close() error {
 	return directory.backend.close()
 }
 
+func (directory *storageDir) cleanupOnly() bool {
+	return directory != nil && directory.backend != nil && directory.backend.cleanupOnlyHandle()
+}
+
+func (root *storageRoot) installDirectoryOpenHooks(before func(string) error, after func(string)) func() {
+	if root == nil || root.backend == nil {
+		return func() {}
+	}
+	installer, ok := root.backend.(storageDirectoryOpenHookInstaller)
+	if !ok {
+		return func() {}
+	}
+	return installer.installDirectoryOpenHooks(before, after)
+}
+
 func (directory *storageDir) openDir(components []string, create bool) (*storageDir, error) {
 	if directory == nil || directory.backend == nil {
 		return nil, errStorageClosed
@@ -265,9 +401,34 @@ func (directory *storageDir) openDir(components []string, create bool) (*storage
 }
 
 func (directory *storageDir) readFile(name string, maximumBytes int64) ([]byte, error) {
-	data, lease, err := directory.readFileLease(name, maximumBytes)
+	data, _, lease, err := directory.readFileMeasured(name, maximumBytes)
 	if lease != nil {
 		err = errors.Join(err, lease.Close())
+	}
+	return data, err
+}
+
+func (directory *storageDir) readFileMeasured(name string, maximumBytes int64) ([]byte, uint64, *storageRecordLease, error) {
+	data, lease, err := directory.readFileLease(name, maximumBytes)
+	if lease == nil {
+		return data, 0, nil, err
+	}
+	return data, lease.physicalReadBytes, lease, err
+}
+
+func (directory *storageDir) readFileClockFree(name string, maximumBytes int64) ([]byte, error) {
+	if directory == nil || directory.backend == nil {
+		return nil, errStorageClosed
+	}
+	if err := validateStorageName(name); err != nil {
+		return nil, err
+	}
+	if maximumBytes <= 0 {
+		return nil, errors.New("productmetrics: read size limit must be positive")
+	}
+	data, backend, _, err := directory.backend.readFileLeaseClockFree(name, maximumBytes)
+	if backend != nil {
+		err = errors.Join(err, backend.close())
 	}
 	return data, err
 }
@@ -326,6 +487,54 @@ func (directory *storageDir) removeFile(name string) error {
 	return directory.backend.removeFile(name)
 }
 
+func (directory *storageDir) removeFileClockFree(name string) error {
+	if directory == nil || directory.backend == nil {
+		return errStorageClosed
+	}
+	if err := validateMutableStorageName(name); err != nil {
+		return err
+	}
+	return directory.backend.removeFileClockFree(name)
+}
+
+func (directory *storageDir) removeFileMatchingLease(name string, lease *storageRecordLease) error {
+	if directory == nil || directory.backend == nil {
+		return errStorageClosed
+	}
+	if err := validateMutableStorageName(name); err != nil {
+		return err
+	}
+	if lease == nil {
+		return errors.New("productmetrics: missing record lease for identity-bound deletion")
+	}
+	lease.mu.Lock()
+	defer lease.mu.Unlock()
+	if lease.backend == nil || lease.record == (recordIncarnation{}) {
+		return errors.New("productmetrics: closed or invalid record lease for identity-bound deletion")
+	}
+	if err := directory.backend.removeFileMatching(name, lease.record); err != nil {
+		return err
+	}
+	metadata, err := lease.backend.metadata()
+	if err != nil {
+		return fmt.Errorf("productmetrics: inspect unlinked record lease: %w", err)
+	}
+	if metadata.dev != lease.record.dev || metadata.ino != lease.record.ino || metadata.nlink != 0 {
+		return fmt.Errorf("%w: identity-bound deletion did not unlink the leased record", errStorageEntryChanged)
+	}
+	return nil
+}
+
+func (directory *storageDir) confirmEntryAbsent(name string) error {
+	if directory == nil || directory.backend == nil {
+		return errStorageClosed
+	}
+	if err := validateMutableStorageName(name); err != nil {
+		return err
+	}
+	return directory.backend.confirmEntryAbsent(name)
+}
+
 func (directory *storageDir) renameFile(name string, target *storageDir, targetName string) (storageRenameResult, error) {
 	if directory == nil || directory.backend == nil || target == nil || target.backend == nil {
 		return storageRenameResult{state: storageRenameNotApplied}, errStorageClosed
@@ -337,6 +546,58 @@ func (directory *storageDir) renameFile(name string, target *storageDir, targetN
 		return storageRenameResult{state: storageRenameNotApplied}, err
 	}
 	return directory.backend.renameFile(name, target.backend, targetName)
+}
+
+func (directory *storageDir) replaceFile(name string, target *storageDir, targetName string) (storageRenameResult, error) {
+	if directory == nil || directory.backend == nil || target == nil || target.backend == nil {
+		return storageRenameResult{state: storageRenameNotApplied}, errStorageClosed
+	}
+	if err := validateMutableStorageName(name); err != nil {
+		return storageRenameResult{state: storageRenameNotApplied}, err
+	}
+	if err := validateMutableStorageName(targetName); err != nil {
+		return storageRenameResult{state: storageRenameNotApplied}, err
+	}
+	return directory.backend.replaceFile(name, target.backend, targetName)
+}
+
+func (directory *storageDir) renameEnumeratedDirectory(entry storageEntry, target *storageDir, targetName string) (storageRenameResult, error) {
+	if directory == nil || directory.backend == nil || target == nil || target.backend == nil {
+		return storageRenameResult{state: storageRenameNotApplied}, errStorageClosed
+	}
+	if err := validateEnumeratedEntry(entry); err != nil {
+		return storageRenameResult{state: storageRenameNotApplied}, err
+	}
+	if err := validateMutableStorageName(targetName); err != nil {
+		return storageRenameResult{state: storageRenameNotApplied}, err
+	}
+	return directory.backend.renameEnumeratedDirectory(entry, target.backend, targetName)
+}
+
+func (directory *storageDir) renameEnumeratedEntry(entry storageEntry, target *storageDir, targetName string) (storageRenameResult, error) {
+	if directory == nil || directory.backend == nil || target == nil || target.backend == nil {
+		return storageRenameResult{state: storageRenameNotApplied}, errStorageClosed
+	}
+	if err := validateEnumeratedEntry(entry); err != nil {
+		return storageRenameResult{state: storageRenameNotApplied}, err
+	}
+	if err := validateMutableStorageName(targetName); err != nil {
+		return storageRenameResult{state: storageRenameNotApplied}, err
+	}
+	return directory.backend.renameEnumeratedEntry(entry, target.backend, targetName)
+}
+
+func (directory *storageDir) exchangeEnumeratedEntries(source storageEntry, target *storageDir, targetEntry storageEntry) (storageRenameResult, error) {
+	if directory == nil || directory.backend == nil || target == nil || target.backend == nil {
+		return storageRenameResult{state: storageRenameNotApplied}, errStorageClosed
+	}
+	if err := validateEnumeratedEntry(source); err != nil {
+		return storageRenameResult{state: storageRenameNotApplied}, err
+	}
+	if err := validateEnumeratedEntry(targetEntry); err != nil {
+		return storageRenameResult{state: storageRenameNotApplied}, err
+	}
+	return directory.backend.exchangeEnumeratedEntries(source, target.backend, targetEntry)
 }
 
 func (directory *storageDir) syncDirectory() error {
@@ -357,6 +618,13 @@ func (directory *storageDir) iterateEntries() (*storageIterator, error) {
 	return &storageIterator{backend: backend}, nil
 }
 
+func (directory *storageDir) firstEntryFromRetainedHandle() (storageEntry, error) {
+	if directory == nil || directory.backend == nil {
+		return storageEntry{}, errStorageClosed
+	}
+	return directory.backend.firstEntryFromRetainedHandle()
+}
+
 func (iterator *storageIterator) Next() (storageEntry, error) {
 	if iterator == nil || iterator.backend == nil {
 		return storageEntry{}, errStorageClosed
@@ -369,6 +637,30 @@ func (iterator *storageIterator) Close() error {
 		return nil
 	}
 	return iterator.backend.close()
+}
+
+func (directory *storageDir) lookupEntry(name string) (storageEntry, error) {
+	if directory == nil || directory.backend == nil {
+		return storageEntry{}, errStorageClosed
+	}
+	if err := validateStorageName(name); err != nil {
+		return storageEntry{}, err
+	}
+	return directory.backend.lookupEntry(name)
+}
+
+func (directory *storageDir) openEnumeratedCleanupDirectory(entry storageEntry) (*storageDir, error) {
+	if directory == nil || directory.backend == nil {
+		return nil, errStorageClosed
+	}
+	if err := validateEnumeratedEntry(entry); err != nil {
+		return nil, err
+	}
+	backend, err := directory.backend.openEnumeratedCleanupDirectory(entry)
+	if err != nil {
+		return nil, err
+	}
+	return &storageDir{backend: backend}, nil
 }
 
 func (directory *storageDir) unlinkEnumeratedEntry(entry storageEntry) error {
@@ -389,6 +681,16 @@ func (directory *storageDir) removeEnumeratedDirectory(entry storageEntry) error
 		return err
 	}
 	return directory.backend.removeEnumeratedDirectory(entry)
+}
+
+func (directory *storageDir) removeEnumeratedCleanupDirectory(entry storageEntry) error {
+	if directory == nil || directory.backend == nil {
+		return errStorageClosed
+	}
+	if err := validateEnumeratedEntry(entry); err != nil {
+		return err
+	}
+	return directory.backend.removeEnumeratedCleanupDirectory(entry)
 }
 
 func validateEnumeratedEntry(entry storageEntry) error {
@@ -431,7 +733,7 @@ func validateStorageName(name string) error {
 	if name == "" || name == "." || name == ".." {
 		return fmt.Errorf("productmetrics: invalid empty or relative storage name %q", name)
 	}
-	if len(name) > 128 {
+	if len(name) > maximumStorageNameBytes {
 		return fmt.Errorf("productmetrics: storage name exceeds 128 bytes")
 	}
 	for index := range len(name) {

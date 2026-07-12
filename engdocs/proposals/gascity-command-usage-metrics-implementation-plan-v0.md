@@ -554,25 +554,56 @@ Primary files:
 
 TDD sequence and acceptance:
 
-- Under `state.lock`, reserve a fresh random UUIDv4 attempt token with attempted
-  time, pass it to the child, and require exact token equality after a bounded/
-  nonblocking `uploader.lock` attempt. Missing/corrupt/future records get a new
-  token, never a reset counter, so delayed-child ABA is impossible. Entropy
-  failure skips spawning only.
+- In the same root and `state.lock` transaction that just made the event
+  durable, reserve the strict `throttle_schema=1`/canonical UUIDv4/canonical
+  UTC record within the existing 50-ms decision window. Exactly 60 seconds
+  permits replacement. Missing, corrupt, oversized, expired, and
+  future/rollback records are replaced once; arbitrary read uncertainty and
+  every not-applied or sync-pending atomic outcome fail closed. A generated
+  token equal to any canonical UUIDv4 recoverable from the bounded prior bytes
+  cannot spawn, including malformed duplicate-key orders. Entropy and every
+  reservation, retained-lease-close, or start failure leave the event result
+  `RecordStored`.
+- The parent closes queue/generation descriptors, the config lease,
+  `state.lock`, and the retained root before executable/environment resolution
+  or process `Start`; any close error suppresses Start. The child opens one
+  root, acquires `uploader.lock` once, and retains both capabilities through
+  claim, request initiation, and settlement. It validates the exact token
+  under `state.lock` before claim and again immediately before `Start`; it
+  never validates and then releases and reacquires `uploader.lock`.
 - Prove at most one reserved attempt per 60 seconds and at most one
   `uploader.lock` owner/network-active uploader, not impossible process
   cardinality. Stale/losing children perform zero network work and exit; a
   child stuck in uninterruptible local I/O may overlap as an OS process after
   the lease, but cannot own a second lock. `off` then times out cleanup-pending
-  rather than claim success.
-- Long-lived parents call `Wait` asynchronously so completed children are
-  reaped without blocking the command; short-lived parents safely hand the
-  detached child to the OS reaper when they exit.
-- Snapshot the exact child environment; proxy, CA, OTel, Beads OTel,
-  usage/cost, arbitrary parent variables, and secrets are absent.
-- The private child does not construct Cobra, discover packs, initialize OTel,
-  emit product events, or write normal command streams.
+  rather than claim success. A valid replaced-token or no-batch child returns
+  success before production transport construction and performs zero network
+  work. The timestamp is a parent replacement throttle, not a child-token TTL;
+  an exact token remains current until replacement.
+- Production `Start` handshakes on actual `RoundTrip` entry while the final
+  state lock is held. A pre-entry error/cancellation permanently aborts that
+  gate; after entry, `Wait` only observes completion outside `state.lock`.
+- Linux/Darwin use `Setsid`, cwd `/`, and null stdin/stdout/stderr. Long-lived
+  parents call one asynchronous `Wait` owner so completed children are reaped
+  without blocking the command; a successful process start followed by a
+  parent-descriptor close error still schedules exactly one `Wait`. There is no
+  `Process.Release`; short-lived parents may exit and let the OS reparent the
+  detached child.
+- Snapshot the exact sorted positive-allowlist environment: pinned `GC_HOME`,
+  recursion marker, validated absolute HOME/TMPDIR/XDG paths, and only the
+  reviewed locale variable names. `PATH`, proxy, CA, loader, `GODEBUG`, OTel,
+  Beads OTel, usage/cost, arbitrary parent variables, credentials, and secrets
+  are absent.
+- Every argv beginning with `__gc-product-metrics-uploader-v1` is consumed
+  before Cobra, packs, and OTel, even when malformed. The exact recursion
+  marker is required before storage/network. The private child does not emit
+  product events or write normal command streams.
 - Normal release builds contain no test endpoint/client injection symbols.
+- Unsupported-platform private entry returns before selecting a runner or
+  inspecting home/root state, and spawn returns before executable/env/throttle
+  work. Supported Linux/Darwin targets and unsupported Android/Windows targets
+  are compile-checked. iOS selects the unsupported file set and is
+  compile-checked when an Apple SDK is available.
 
 Focused verification: package tests, a separately built tagged `gc` process
 binary (not ambient testscript re-exec), normal binary symbol scan, real

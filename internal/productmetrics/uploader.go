@@ -45,6 +45,7 @@ type uploaderDependencies struct {
 	start           uploadStartFunc
 	budget          spoolWorkBudget
 	beforeOperation func(uploaderOperation)
+	authorizeLocked func(*lockedState) error
 }
 
 type lockedUploader struct {
@@ -110,7 +111,11 @@ func (service *Service) uploadOneBatch(ctx context.Context, dependencies uploade
 	if dependencies.budget == (spoolWorkBudget{}) {
 		dependencies.budget = defaultSpoolWorkBudget()
 	}
-	if !service.uploadNeedsMutableWork() {
+	eligible, err := service.uploadNeedsMutableWork()
+	if err != nil {
+		return result, err
+	}
+	if !eligible {
 		return uploadRunResult{outcome: uploadRunNoBatch}, nil
 	}
 
@@ -124,10 +129,45 @@ func (service *Service) uploadOneBatch(ctx context.Context, dependencies uploade
 		return result, err
 	}
 	defer func() { returnErr = errors.Join(returnErr, uploader.Close()) }()
+	return service.uploadOneBatchLocked(ctx, root, uploader, dependencies)
+}
 
+// uploadOneBatchLocked performs one batch while retaining the caller's exact
+// root and uploader-lock capabilities. Detached children use this boundary so
+// root replacement cannot move token validation and upload onto different
+// filesystem objects.
+func (service *Service) uploadOneBatchLocked(
+	ctx context.Context,
+	root *storageRoot,
+	uploader *lockedUploader,
+	dependencies uploaderDependencies,
+) (result uploadRunResult, returnErr error) {
+	if service == nil || root == nil || !uploader.valid() || uploader.root != root {
+		return result, errors.New("productmetrics: uploader lock is not held for the supplied root")
+	}
+	if ctx == nil {
+		return result, errors.New("productmetrics: upload context is nil")
+	}
+	if dependencies.start == nil {
+		return result, errors.New("productmetrics: upload starter is nil")
+	}
+	if dependencies.now == nil {
+		dependencies.now = service.deps.now
+	}
+	if dependencies.now == nil {
+		dependencies.now = time.Now
+	}
+	if dependencies.budget == (spoolWorkBudget{}) {
+		dependencies.budget = defaultSpoolWorkBudget()
+	}
 	state, err := uploader.lockState(ctx, service)
 	if err != nil {
 		return result, err
+	}
+	if dependencies.authorizeLocked != nil {
+		if err := dependencies.authorizeLocked(state); err != nil {
+			return result, errors.Join(err, state.Close())
+		}
 	}
 	pauseToken, _, pausePending, err := service.pauseCleanupLocked(state)
 	if err != nil {
@@ -187,6 +227,12 @@ func (service *Service) uploadOneBatch(ctx context.Context, dependencies uploade
 	}
 	if err := service.revalidatePermitLocked(state, permit); err != nil {
 		return uploadRunResult{outcome: uploadRunStale, events: len(claim.records)}, errors.Join(err, state.Close())
+	}
+	if dependencies.authorizeLocked != nil {
+		if err := dependencies.authorizeLocked(state); err != nil {
+			settleErr := restoreSpoolClaim(root, claim)
+			return uploadRunResult{outcome: uploadRunRestored, events: len(claim.records)}, errors.Join(err, settleErr, state.Close())
+		}
 	}
 	wait, startErr := dependencies.start(ctx, prepared, permit.metricsEpoch)
 	if startErr != nil || wait == nil {
@@ -342,18 +388,21 @@ func (service *Service) finishPauseCleanupAndResume(ctx context.Context) (transi
 	return true, nil
 }
 
-func (service *Service) uploadNeedsMutableWork() bool {
+func (service *Service) uploadNeedsMutableWork() (bool, error) {
 	if service == nil || service.deps.homeErr != nil {
-		return false
+		return false, nil
 	}
-	loaded := service.readStateReadOnly()
-	defer func() { _ = loaded.Close() }()
+	loaded := service.readStateReadOnlyWithHooks(service.deps.storageHooks)
 	projection := service.project(InvocationContext{
 		DoNotTrack:          service.deps.getenv(envDoNotTrack),
 		DisableUsageMetrics: service.deps.getenv(envDisableUsageMetrics),
 	}, loaded)
-	return projection.state == StateEnabled ||
+	eligible := projection.state == StateEnabled ||
 		(projection.state == StateServerPaused && projection.reason == ReasonPauseCleanupPending)
+	if err := loaded.Close(); err != nil {
+		return false, err
+	}
+	return eligible, nil
 }
 
 func (service *Service) currentUploadPermitLocked(locked *lockedState) (RecordingPermit, error) {

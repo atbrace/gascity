@@ -28,7 +28,14 @@ import (
 )
 
 func main() {
-	os.Exit(run(os.Args[1:], os.Stdout, os.Stderr))
+	os.Exit(mainExitCode(os.Args[1:], os.Stdout, os.Stderr))
+}
+
+func mainExitCode(args []string, stdout, stderr io.Writer) int {
+	if handled, code := privateProductMetricsEntrypoint(args); handled {
+		return code
+	}
+	return run(args, stdout, stderr)
 }
 
 // errExit is a sentinel error returned by cobra RunE functions to signal

@@ -44,14 +44,16 @@ const (
 	// marker inspect/revalidation/unlink. Reserve nine per possible attempt so
 	// one additional operation cannot silently escape the shared cap, plus
 	// 32 per relocation candidate and 64 for control/quota/cursor bookkeeping.
-	spoolFixedEntryEnvelope = uint64(9*maximumStorageTempAttempts + 32*maximumRelocationSlots + 64 + 1)
+	// Spawn-throttle cleanup spends two additional exact-name operations: one
+	// bounded identity-leased read and one identity-bound unlink.
+	spoolFixedEntryEnvelope = uint64(9*maximumStorageTempAttempts + 32*maximumRelocationSlots + 64 + 1 + 2)
 	spoolFixedNameEnvelope  = spoolFixedEntryEnvelope * maximumStorageNameBytes
 	// The relocation envelope covers quota read + conflict replay + quota
 	// stage, followed by the control and root-fallback cursor read/stage pairs.
 	// Writes share the same byte dimension as reads so neither direction can
 	// escape the cap.
 	spoolFixedReadEnvelope = uint64(3*maximumQuotaBytes+4*maximumRelocationBytes+4) +
-		3*maximumStorageTempAttempts*rootTempJournalMarkerReadLimit
+		3*maximumStorageTempAttempts*rootTempJournalMarkerReadLimit + maximumSpawnThrottleBytes + 1
 
 	defaultRecordDecisionBudget = 50 * time.Millisecond
 	canonicalHourLayout         = "2006-01-02T15:04:05Z"
@@ -82,18 +84,23 @@ type recordDecisionWindow struct {
 type recordOperation string
 
 const (
-	recordOperationQuotaRead      recordOperation = "quota-read"
-	recordOperationControlOpen    recordOperation = "control-open"
-	recordOperationQuotaStage     recordOperation = "quota-stage"
-	recordOperationQuotaInstall   recordOperation = "quota-install"
-	recordOperationQuotaReplay    recordOperation = "quota-replay-read"
-	recordOperationQuotaSync      recordOperation = "quota-replay-sync"
-	recordOperationStageCleanup   recordOperation = "quota-stage-cleanup"
-	recordOperationControlClean   recordOperation = "control-cleanup"
-	recordOperationControlRemove  recordOperation = "control-remove"
-	recordOperationQueueOpen      recordOperation = "queue-open"
-	recordOperationGenerationOpen recordOperation = "generation-open"
-	recordOperationEventWrite     recordOperation = "event-write"
+	recordOperationQuotaRead          recordOperation = "quota-read"
+	recordOperationControlOpen        recordOperation = "control-open"
+	recordOperationQuotaStage         recordOperation = "quota-stage"
+	recordOperationQuotaInstall       recordOperation = "quota-install"
+	recordOperationQuotaReplay        recordOperation = "quota-replay-read"
+	recordOperationQuotaSync          recordOperation = "quota-replay-sync"
+	recordOperationStageCleanup       recordOperation = "quota-stage-cleanup"
+	recordOperationControlClean       recordOperation = "control-cleanup"
+	recordOperationControlRemove      recordOperation = "control-remove"
+	recordOperationQueueOpen          recordOperation = "queue-open"
+	recordOperationGenerationOpen     recordOperation = "generation-open"
+	recordOperationEventWrite         recordOperation = "event-write"
+	recordOperationSpawnThrottleRead  recordOperation = "spawn-throttle-read"
+	recordOperationSpawnToken         recordOperation = "spawn-token"
+	recordOperationSpawnThrottleWrite recordOperation = "spawn-throttle-write"
+	recordOperationSpawnPrepare       recordOperation = "spawn-prepare"
+	recordOperationSpawnStart         recordOperation = "spawn-start"
 )
 
 func recordLookupOperation(name string) recordOperation {
@@ -265,6 +272,25 @@ func (service *Service) RecordOnce(permit RecordingPermit, commandID CommandID) 
 		// window can overcount but can never admit an event past the cap.
 		return RecordDropped
 	}
+	spawnDependencies := service.deps.spawn
+	if spawnDependencies.executable == nil || spawnDependencies.environ == nil || spawnDependencies.start == nil {
+		return RecordStored
+	}
+	if _, ok := window.remaining(); !ok {
+		return RecordStored
+	}
+	attemptedAt := service.deps.now().UTC()
+	reservation, reservedSpawn, reservationErr := service.reserveSpawnAttemptAtRoot(root, attemptedAt, canStart)
+	if reservationErr != nil || !reservedSpawn {
+		return RecordStored
+	}
+	// Process creation must not inherit any transaction authority. Close every
+	// directory, exact-config lease, and state lock opened by this operation
+	// before even resolving the executable/environment or calling Start.
+	if err := errors.Join(queue.Close(), queueRoot.Close(), loaded.Close(), lock.Release(), root.Close(), permit.Close()); err != nil {
+		return RecordStored
+	}
+	_ = service.startReservedUploader(reservation, spawnDependencies, canStart)
 	return RecordStored
 }
 
@@ -897,6 +923,10 @@ func runSpoolSweepWithMeter(root *storageRoot, policy spoolPolicy, now time.Time
 		if state.mutated || state.operation != nil || state.meter.exhausted {
 			return state
 		}
+		state.cleanupSpawnThrottle()
+		if state.mutated || state.operation != nil || state.meter.exhausted {
+			return state
+		}
 	}
 	for _, tree := range []string{queueDirectoryName, inflightDirectoryName} {
 		if state.meter.exhausted {
@@ -924,6 +954,48 @@ func runSpoolSweepWithMeter(root *storageRoot, policy spoolPolicy, now time.Time
 	}
 	state.traversed = !state.meter.exhausted && state.meter.traversalError == nil && state.operation == nil
 	return state
+}
+
+// cleanupSpawnThrottle removes only the exact identity-leased, owner-private
+// regular file at the implemented control name. Invalid and oversized bytes
+// are still safe to remove during opt-out because the fd-relative type,
+// ownership, link-count, device, and incarnation checks establish that this
+// is the subsystem-owned ephemeral attempt record; no content grants deletion
+// authority. Unsafe shapes remain preserved and keep cleanup pending.
+func (state *spoolSweepState) cleanupSpawnThrottle() {
+	if state == nil || state.root == nil || state.meter == nil {
+		return
+	}
+	if !state.meter.chargeFixedEntry(spawnThrottleFileName) ||
+		!state.meter.chargeFixedRead(maximumSpawnThrottleBytes+1) {
+		state.operation = errors.Join(state.operation, errors.New("productmetrics: cleanup budget cannot inspect spawn throttle"))
+		return
+	}
+	_, _, lease, err := state.root.readFileMeasured(spawnThrottleFileName, maximumSpawnThrottleBytes)
+	if lease == nil {
+		if errors.Is(err, fs.ErrNotExist) {
+			return
+		}
+		state.operation = errors.Join(state.operation, err)
+		return
+	}
+	defer func() { state.operation = errors.Join(state.operation, lease.Close()) }()
+	// A retained lease proves the safe filesystem shape even when bounded
+	// decoding failed. Bytes never grant deletion authority for this ephemeral
+	// record; the exact retained incarnation does.
+	if err != nil && !errors.Is(err, errStorageReadLimit) {
+		state.operation = errors.Join(state.operation, err)
+		return
+	}
+	if !state.meter.chargeFixedEntry(spawnThrottleFileName) {
+		state.operation = errors.Join(state.operation, errors.New("productmetrics: cleanup budget cannot remove spawn throttle"))
+		return
+	}
+	if err := state.root.removeFileMatchingLease(spawnThrottleFileName, lease); err != nil {
+		state.operation = errors.Join(state.operation, err)
+		return
+	}
+	state.mutated = true
 }
 
 // cleanupUnexpectedRootEntries preserves every unrecognized root child and

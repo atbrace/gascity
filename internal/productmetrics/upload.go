@@ -12,6 +12,7 @@ import (
 	"net/url"
 	"os"
 	"strings"
+	"sync"
 	"time"
 )
 
@@ -74,6 +75,7 @@ type uploadTransport struct {
 	client           *http.Client
 	pauseKeys        pausePublicKeyCatalog
 	productionPolicy bool
+	roundTripGate    *roundTripStartGate
 }
 
 type uploadRequestDependencies struct {
@@ -308,6 +310,14 @@ func (transport *uploadTransport) upload(ctx context.Context, prepared preparedU
 	if err != nil {
 		return retry, err
 	}
+	if transport.roundTripGate != nil {
+		client := *dependencies.client
+		client.Transport = &roundTripEntryTransport{
+			base: dependencies.client.Transport,
+			gate: transport.roundTripGate,
+		}
+		dependencies.client = &client
+	}
 	if !validMetricsEpoch(metricsEpoch) {
 		return retry, fmt.Errorf("productmetrics: upload metrics epoch is invalid")
 	}
@@ -377,6 +387,63 @@ func (transport *uploadTransport) upload(ctx context.Context, prepared preparedU
 	default:
 		return retry, nil
 	}
+}
+
+type roundTripEntryTransport struct {
+	base http.RoundTripper
+	gate *roundTripStartGate
+}
+
+func (transport *roundTripEntryTransport) RoundTrip(request *http.Request) (*http.Response, error) {
+	if transport.gate == nil || !transport.gate.enter() {
+		return nil, errors.New("productmetrics: upload start was canceled before RoundTrip entry")
+	}
+	return transport.base.RoundTrip(request)
+}
+
+type roundTripStartGate struct {
+	mu      sync.Mutex
+	entered chan struct{}
+	state   uint8
+}
+
+const (
+	roundTripStartPending uint8 = iota
+	roundTripStartEntered
+	roundTripStartAborted
+)
+
+func newRoundTripStartGate() *roundTripStartGate {
+	return &roundTripStartGate{entered: make(chan struct{})}
+}
+
+func (gate *roundTripStartGate) enter() bool {
+	gate.mu.Lock()
+	defer gate.mu.Unlock()
+	if gate.state == roundTripStartAborted {
+		return false
+	}
+	if gate.state == roundTripStartPending {
+		gate.state = roundTripStartEntered
+		close(gate.entered)
+	}
+	return true
+}
+
+func (gate *roundTripStartGate) abort() bool {
+	gate.mu.Lock()
+	defer gate.mu.Unlock()
+	if gate.state != roundTripStartPending {
+		return false
+	}
+	gate.state = roundTripStartAborted
+	return true
+}
+
+func (gate *roundTripStartGate) didEnter() bool {
+	gate.mu.Lock()
+	defer gate.mu.Unlock()
+	return gate.state == roundTripStartEntered
 }
 
 func clonePreparedUploadBatch(prepared preparedUploadBatch) preparedUploadBatch {

@@ -1280,6 +1280,63 @@ func TestPauseCleanupCallerHeldBarrierSyncFailurePreventsDeletion(t *testing.T) 
 	}
 }
 
+func TestPauseCleanupPurgesSpawnThrottleBeforeCompleting(t *testing.T) {
+	home := newMetricsTestHome(t)
+	paused := enabledState(9, 2, testInstallationID, "")
+	paused.CleanupKind = cleanupPause
+	paused.CleanupEpoch = 3
+	paused.PausedThroughMetricsEpoch = 1
+	writeStateFixture(t, home, paused)
+
+	root := mustOpenMutableRoot(t, home)
+	defer func() { _ = root.Close() }()
+	if err := persistSpoolQuota(root, spoolQuota{}); err != nil {
+		t.Fatal(err)
+	}
+	throttle, err := encodeSpawnThrottle(spawnThrottleRecord{
+		attemptToken: testSpawnTokenOne,
+		attemptedAt:  testRecordHour,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := root.writeFileAtomic(spawnThrottleFileName, throttle); err != nil {
+		t.Fatal(err)
+	}
+
+	service := mustOpenTestService(t, defaultTestServiceDependencies(home, 2))
+	uploader, err := service.lockUploader(context.Background(), root)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = uploader.Close() }()
+	state, err := uploader.lockState(context.Background(), service)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = state.Close() }()
+	token, _, pending, err := service.pauseCleanupLocked(state)
+	if err != nil || !pending {
+		t.Fatalf("load pause-cleanup authority: pending=%v err=%v", pending, err)
+	}
+	defer func() { _ = token.Close() }()
+	complete, cleanupErr := service.finishPauseCleanupLocked(state, token, defaultSpoolWorkBudget())
+	if cleanupErr != nil || !complete {
+		t.Fatalf("pause cleanup with spawn throttle = complete:%v err:%v", complete, cleanupErr)
+	}
+	if _, err := os.Lstat(filepath.Join(home.Root(), spawnThrottleFileName)); !errors.Is(err, fs.ErrNotExist) {
+		t.Fatalf("completed pause cleanup retained spawn throttle: %v", err)
+	}
+	if err := proveCleanMetricsTree(root, defaultSpoolWorkBudget()); err != nil {
+		t.Fatalf("completed pause cleanup did not prove a clean root: %v", err)
+	}
+	clean := readStateFixture(t, home)
+	if clean.CleanupKind != cleanupNone || clean.Preference != preferenceEnabled || clean.SpoolGeneration != "" ||
+		clean.InstallationID != testInstallationID || clean.PausedThroughMetricsEpoch != 1 {
+		t.Fatalf("pause cleanup successor state = %#v", clean)
+	}
+}
+
 func TestGreaterEpochResumeWaitsForUploaderLockBeforeCleanup(t *testing.T) {
 	home := newMetricsTestHome(t)
 	paused := enabledState(9, 2, testInstallationID, "")

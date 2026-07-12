@@ -50,8 +50,8 @@ var allowedGCExitBypassSites = map[string]func(gcExitBypassSite) error{
 		if !ok || function.Name.Name != "main" || function.Body == nil {
 			return fmt.Errorf("main exit owner is not a function declaration")
 		}
-		if got := expressionShape(site.call.Args); got != "run(os.Args[1:], os.Stdout, os.Stderr)" {
-			return fmt.Errorf("exit argument = %q, want the central run funnel", got)
+		if got := expressionShape(site.call.Args); got != "mainExitCode(os.Args[1:], os.Stdout, os.Stderr)" {
+			return fmt.Errorf("exit argument = %q, want the central process-entry funnel", got)
 		}
 		expression, ok := site.parent.(*ast.ExprStmt)
 		if !ok || expression.X != site.call || !hasExactExitAncestors(site, expression, function.Body, function) {
@@ -688,7 +688,7 @@ func TestExitBypassCensusPinsMainAndWatchdogAncestry(t *testing.T) {
 			source: `package main
 import "os"
 func main() {
-	func() { os.Exit(run(os.Args[1:], os.Stdout, os.Stderr)) }()
+	func() { os.Exit(mainExitCode(os.Args[1:], os.Stdout, os.Stderr)) }()
 }
 `,
 		},
@@ -697,7 +697,7 @@ func main() {
 			source: `package main
 import "os"
 func main() {
-	go func() { os.Exit(run(os.Args[1:], os.Stdout, os.Stderr)) }()
+	go func() { os.Exit(mainExitCode(os.Args[1:], os.Stdout, os.Stderr)) }()
 }
 `,
 		},
@@ -707,7 +707,7 @@ func main() {
 import "os"
 func main() {
 	beforeExit()
-	os.Exit(run(os.Args[1:], os.Stdout, os.Stderr))
+	os.Exit(mainExitCode(os.Args[1:], os.Stdout, os.Stderr))
 }
 `,
 		},

@@ -23,6 +23,7 @@ var (
 	errStorageExchangeSameEntry   = errors.New("productmetrics: exchange source and target are the same entry")
 	errStorageExchangeUnsupported = errors.New("productmetrics: atomic directory exchange is unsupported")
 	errStorageClosed              = errors.New("productmetrics: storage handle is closed")
+	errStorageReadLimit           = errors.New("productmetrics: storage read limit exceeded")
 )
 
 const (
@@ -435,6 +436,10 @@ type storageIterator struct {
 
 func openStorageRootReadOnly(home gchome.ProductUsageHome) (*storageRoot, error) {
 	return openStorageRoot(home, false, storageTestHooks{})
+}
+
+func openStorageRootReadOnlyWithHooks(home gchome.ProductUsageHome, hooks storageTestHooks) (*storageRoot, error) {
+	return openStorageRoot(home, false, hooks)
 }
 
 func openStorageRootMutable(home gchome.ProductUsageHome) (*storageRoot, error) {

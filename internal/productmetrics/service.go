@@ -163,22 +163,25 @@ type serviceRelease struct {
 // serviceDependencies is package-private by design. Unit tests can exercise a
 // marked synthetic release; normal binaries can only call OpenProduction.
 type serviceDependencies struct {
-	home                      gchome.ProductUsageHome
-	homeErr                   error
-	homeReason                StateReason
-	release                   serviceRelease
-	notice                    noticeDefinition
-	getenv                    func(string) string
-	newUUID                   func() (string, error)
-	now                       func() time.Time
-	beforeRecordOperation     func(recordOperation)
-	verifyTTY                 func(io.Writer) bool
-	storageHooks              storageTestHooks
-	disableUploaderWait       time.Duration
-	disableStateWait          time.Duration
-	disableCleanupBudget      spoolWorkBudget
-	beforeDisableUploaderLock func()
-	controlCloseError         func(controlCloseTarget) error
+	home                        gchome.ProductUsageHome
+	homeErr                     error
+	homeReason                  StateReason
+	release                     serviceRelease
+	notice                      noticeDefinition
+	getenv                      func(string) string
+	newUUID                     func() (string, error)
+	now                         func() time.Time
+	beforeRecordOperation       func(recordOperation)
+	verifyTTY                   func(io.Writer) bool
+	storageHooks                storageTestHooks
+	disableUploaderWait         time.Duration
+	disableStateWait            time.Duration
+	disableCleanupBudget        spoolWorkBudget
+	beforeDisableUploaderLock   func()
+	controlCloseError           func(controlCloseTarget) error
+	spawn                       spawnDependencies
+	privateUploaderStart        uploadStartFunc
+	privateUploaderStartFactory func() (uploadStartFunc, error)
 }
 
 // Service owns the lazy consent and identity state machine.
@@ -359,6 +362,12 @@ func OpenProduction(options ProductionOptions) (*Service, error) {
 		},
 		now:       time.Now,
 		verifyTTY: productionNoticeWriterIsTTY,
+		spawn: spawnDependencies{
+			executable: os.Executable,
+			environ:    os.Environ,
+			start:      platformStartPrivateUploader,
+		},
+		privateUploaderStartFactory: productionUploaderStartFactory,
 	}
 	return openWithDependencies(deps)
 }
@@ -568,10 +577,14 @@ func (service *Service) project(invocation InvocationContext, loaded loadedState
 }
 
 func (service *Service) readStateReadOnly() loadedState {
+	return service.readStateReadOnlyWithHooks(storageTestHooks{})
+}
+
+func (service *Service) readStateReadOnlyWithHooks(hooks storageTestHooks) loadedState {
 	if service.deps.homeErr != nil {
 		return loadedState{err: service.deps.homeErr, reason: service.deps.homeReason}
 	}
-	root, err := openStorageRootReadOnly(service.deps.home)
+	root, err := openStorageRootReadOnlyWithHooks(service.deps.home, hooks)
 	if errors.Is(err, fs.ErrNotExist) {
 		return loadedState{}
 	}

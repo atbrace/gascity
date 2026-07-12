@@ -988,7 +988,7 @@ func (directory *unixStorageDirectory) readFileLeaseWithHooks(name string, maxim
 	}
 	lease := &unixStorageRecordLease{fd: fileFD}
 	if metadata.size < 0 || metadata.size > maximumBytes {
-		return nil, lease, metadata, fmt.Errorf("productmetrics: file %q exceeds the read limit", path)
+		return nil, lease, metadata, fmt.Errorf("%w: file %q", errStorageReadLimit, path)
 	}
 	hooks.startingRead(path)
 	data, physicalReadBytes, err := readFDWithLimit(fileFD, maximumBytes, path, hooks)
@@ -1132,7 +1132,7 @@ func readFDWithLimit(fd int, maximumBytes int64, path string, hooks storageTestH
 		if read > 0 {
 			physicalReadBytes += uint64(read)
 			if int64(len(result))+int64(read) > maximumBytes {
-				return nil, physicalReadBytes, errors.New("productmetrics: file exceeds the read limit")
+				return nil, physicalReadBytes, errStorageReadLimit
 			}
 			result = append(result, buffer[:read]...)
 		}

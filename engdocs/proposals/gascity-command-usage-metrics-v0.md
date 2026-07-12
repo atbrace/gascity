@@ -1213,35 +1213,70 @@ and downgrades remain paused.
 
 ### Detached uploader
 
-- Reserve at most one attempt per effective home per 60 seconds through the
-  bounded `spawn-throttle` record. Under `state.lock`, the parent draws a fresh
-  UUIDv4 token, commits `{attempt_token, attempted_at}`, and passes it to the
-  child. After bounded/nonblocking acquisition of `uploader.lock`, the child
-  proceeds only if the record still names its exact token; a delayed stale or
-  losing child exits without network work. Missing/corrupt/future records are
-  replaced with a new token, never a reused counter value, can suppress for at
-  most 60 seconds, and are never proof of a live child. Entropy failure skips
-  this spawn attempt only.
+- Reserve at most one attempt per effective home per exact 60-second interval
+  through the schema-closed, at-most-4-KiB `spawn-throttle` record. Immediately
+  after the foreground event is durable and while retaining its root and
+  `state.lock`, the parent draws a fresh canonical lowercase UUIDv4 token and
+  durably commits `throttle_schema=1`, `attempt_token`, and a canonical UTC
+  `attempted_at`. Only an applied-and-directory-synced write authorizes a
+  process start. Missing, malformed, oversized, future/clock-rollback, and
+  expired records may be replaced once; other read or write uncertainty fails
+  conservatively. Every canonical UUIDv4 visible in a bounded malformed record
+  participates in the equality guard; a generated token equal to any such
+  recoverable prior token does not spawn, so replacement cannot create token
+  ABA. Entropy, reservation, capability-close, or start failure never changes
+  the already-durable event result.
+- Before resolving the executable/environment or calling `Start`, the parent
+  closes every queue, generation, config-lease, state-lock, and root
+  capability retained by the foreground transaction. Process start is
+  suppressed unless every reservation and transaction-capability close
+  succeeds. The child then opens one root once, acquires its `uploader.lock`
+  once, and retains both through claim, request initiation, and settlement. It
+  validates exact throttle-token equality under `state.lock` both before
+  claiming and immediately before the upload `Start` boundary. A replaced
+  child, including one delayed until after replacement, and a losing-lock child
+  exit with zero network work; token
+  validation is never followed by an uploader-lock release/reacquisition. A
+  marker-valid child whose token is stale or that finds no batch exits
+  successfully before constructing the production transport. The 60-second
+  timestamp controls parent replacement rather than expiring an otherwise
+  exact current token.
 - The child has a cooperative 10-second work budget and a hard five-second HTTP
   deadline. Context cancellation cannot guarantee termination during an
   uninterruptible filesystem or kernel wait, so ten seconds is not a hard
   process-lifetime promise. If such a child still owns `uploader.lock`, `off`
   times out nonzero with durable cleanup-pending state rather than claiming
   quiescence.
-- Enter through a private argv sentinel checked before normal CLI setup plus a
-  recursion marker. Do not build Cobra, discover packs, initialize OTel,
-  record an event, or spawn recursively.
+- Enter only through the exact argv pair
+  `__gc-product-metrics-uploader-v1 <canonical-lowercase-UUIDv4>` plus
+  `GC_PRODUCT_METRICS_PRIVATE_UPLOADER=1`. Every argv beginning with the
+  sentinel is consumed, including malformed forms, before normal CLI setup;
+  the marker is checked before storage or network. The child does not build
+  Cobra, discover packs, initialize OTel, record an event, write normal command
+  streams, or spawn recursively.
 - Use the absolute current executable and a new session/process group on Linux
-  and Darwin. Unsupported-platform builds never spawn.
-- Pass an allowlisted environment only: platform-required variables, effective
-  HOME/GC_HOME, relevant XDG roots, `LANG`, and `LC_*`. Production uploader
-  children do not inherit proxy variables, custom CA variables, `OTEL_*`,
-  `GC_OTEL_*`, `BD_OTEL_*`, usage/cost variables, or arbitrary parent env.
+  and Darwin, set cwd to `/`, point all three standard descriptors at the null
+  device, and give exactly one asynchronous owner responsibility for `Wait`,
+  including a parent-descriptor close failure after successful `Start`. Do not
+  use `Process.Release`. Unsupported-platform process entry returns before its
+  selected runner can inspect home/root state, resolve executable/environment,
+  reserve throttle, or start a process.
+- Pass a sorted positive-allowlist environment only: pinned `GC_HOME`, the
+  recursion marker, safe absolute `HOME`, `TMPDIR`, and reviewed XDG path
+  values, plus `LANG`, `LC_ALL`, and the explicit standard locale-category
+  names. Production uploader children do not inherit `PATH`, proxy variables,
+  custom CA variables, loader injection, `GODEBUG`, `OTEL_*`, `GC_OTEL_*`,
+  `BD_OTEL_*`, usage/cost variables, credentials, or arbitrary parent env.
   Production transport obtains system roots through Go/OS APIs rather than
   inherited CA variables. Tests inject clients and trust roots only through
-  the test-tagged constructor.
-- Redirect stdin/stdout/stderr to the platform null device rather than merely
-  closing descriptors. Surface only bounded status through `gc metrics status`.
+  the test-tagged constructor, and normal artifacts contain neither those
+  constructors nor their endpoint/CA literals.
+- The production sender's split `Start` phase returns only after its wrapper
+  enters the actual HTTP `RoundTrip` boundary while `state.lock` remains held.
+  A pre-entry error or cancellation closes the gate permanently so delayed
+  work cannot initiate a request; after entry, the returned `Wait` owns only
+  completion and settlement proceeds under the S6 rules.
+- Surface only bounded status through `gc metrics status`.
 
 ## Transport and Gas City Backend
 

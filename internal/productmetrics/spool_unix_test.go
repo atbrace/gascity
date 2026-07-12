@@ -2550,7 +2550,7 @@ func TestPurgeSpoolWithinBudgetKeepsCumulativeEventCapAcrossPasses(t *testing.T)
 }
 
 func TestPurgeSpoolTreatsFutureControlFilesAsUnrecognizedResidue(t *testing.T) {
-	for _, name := range []string{"status.toml", "spawn-throttle"} {
+	for _, name := range []string{"status.toml"} {
 		t.Run(name, func(t *testing.T) {
 			home := newMetricsTestHome(t)
 			writeStateFixture(t, home, disabledState(7, 2, cleanupDisable))
@@ -2592,7 +2592,7 @@ func TestPurgeSpoolTreatsFutureControlFilesAsUnrecognizedResidue(t *testing.T) {
 }
 
 func TestPurgeSpoolPreservesFutureControlResidueShapesWithoutDescent(t *testing.T) {
-	for _, name := range []string{"status.toml", "spawn-throttle"} {
+	for _, name := range []string{"status.toml"} {
 		for _, shape := range []string{"regular", "symlink", "cross-device"} {
 			t.Run(name+"/"+shape, func(t *testing.T) {
 				home := newMetricsTestHome(t)
@@ -2657,6 +2657,113 @@ func TestPurgeSpoolPreservesFutureControlResidueShapesWithoutDescent(t *testing.
 				}
 			})
 		}
+	}
+}
+
+func TestPurgeSpawnThrottleRemovesSafeCorruptAndOversizedRecords(t *testing.T) {
+	for _, test := range []struct {
+		name string
+		body []byte
+	}{
+		{name: "corrupt", body: []byte("throttle_schema = [\n")},
+		{name: "oversized", body: bytes.Repeat([]byte("x"), maximumSpawnThrottleBytes+1)},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			home := newMetricsTestHome(t)
+			writeStateFixture(t, home, disabledState(7, 2, cleanupDisable))
+			plainRoot := mustOpenMutableRoot(t, home)
+			if err := persistSpoolQuota(plainRoot, spoolQuota{}); err != nil {
+				t.Fatal(err)
+			}
+			if err := plainRoot.Close(); err != nil {
+				t.Fatal(err)
+			}
+			path := filepath.Join(home.Root(), spawnThrottleFileName)
+			if err := os.WriteFile(path, test.body, 0o600); err != nil {
+				t.Fatal(err)
+			}
+
+			root := mustOpenMutableRoot(t, home)
+			defer func() { _ = root.Close() }()
+			result, err := purgeSpoolWithinBudget(root, defaultSpoolWorkBudget())
+			if err != nil || !result.complete {
+				t.Fatalf("purge safe %s spawn throttle = result:%+v err:%v", test.name, result, err)
+			}
+			if _, err := os.Lstat(path); !errors.Is(err, fs.ErrNotExist) {
+				t.Fatalf("purge retained safe %s spawn throttle: %v", test.name, err)
+			}
+			if err := proveCleanMetricsTree(root, defaultSpoolWorkBudget()); err != nil {
+				t.Fatalf("clean proof after %s spawn-throttle purge: %v", test.name, err)
+			}
+		})
+	}
+}
+
+func TestPurgeSpawnThrottlePreservesUnsafeFilesystemShapes(t *testing.T) {
+	for _, shape := range []string{"symlink", "cross-device"} {
+		t.Run(shape, func(t *testing.T) {
+			home := newMetricsTestHome(t)
+			writeStateFixture(t, home, disabledState(7, 2, cleanupDisable))
+			plainRoot := mustOpenMutableRoot(t, home)
+			if err := persistSpoolQuota(plainRoot, spoolQuota{}); err != nil {
+				t.Fatal(err)
+			}
+			if err := plainRoot.Close(); err != nil {
+				t.Fatal(err)
+			}
+
+			path := filepath.Join(home.Root(), spawnThrottleFileName)
+			const sentinel = "outside spawn-throttle authority"
+			var target string
+			if shape == "symlink" {
+				target = filepath.Join(t.TempDir(), "outside-sentinel")
+				if err := os.WriteFile(target, []byte(sentinel), 0o600); err != nil {
+					t.Fatal(err)
+				}
+				if err := os.Symlink(target, path); err != nil {
+					t.Fatal(err)
+				}
+			} else if err := os.WriteFile(path, []byte(sentinel), 0o600); err != nil {
+				t.Fatal(err)
+			}
+
+			mutations := 0
+			root, err := openStorageRootMutableWithHooks(home, storageTestHooks{
+				metadata: func(observed string, metadata storageMetadata) storageMetadata {
+					if shape == "cross-device" && observed == path {
+						metadata.dev ^= 1 << 63
+					}
+					return metadata
+				},
+				beforeMutation: func(_ storageStep, observed string) {
+					if observed == path {
+						mutations++
+					}
+				},
+			})
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer func() { _ = root.Close() }()
+			result, purgeErr := purgeSpoolWithinBudget(root, defaultSpoolWorkBudget())
+			if purgeErr == nil || result.complete || mutations != 0 {
+				t.Fatalf("purge unsafe %s spawn throttle = result:%+v mutations:%d err:%v",
+					shape, result, mutations, purgeErr)
+			}
+			if shape == "cross-device" && !errors.Is(purgeErr, syscall.EXDEV) {
+				t.Fatalf("cross-device spawn-throttle purge error = %v, want EXDEV", purgeErr)
+			}
+			if shape == "symlink" {
+				if info, err := os.Lstat(path); err != nil || info.Mode()&fs.ModeSymlink == 0 {
+					t.Fatalf("unsafe spawn-throttle symlink changed: info=%v err=%v", info, err)
+				}
+				if data, err := os.ReadFile(target); err != nil || string(data) != sentinel {
+					t.Fatalf("spawn-throttle purge followed symlink: data=%q err=%v", data, err)
+				}
+			} else if data, err := os.ReadFile(path); err != nil || string(data) != sentinel {
+				t.Fatalf("cross-device spawn throttle changed: data=%q err=%v", data, err)
+			}
+		})
 	}
 }
 
@@ -10575,7 +10682,7 @@ func TestDirectoryOpenExpiryStopsSafeValidationAndRecoverySync(t *testing.T) {
 
 func TestFixedControlReadEnvelopeIncludesLimitProbeAndInventoriesCallsites(t *testing.T) {
 	wantReadEnvelope := uint64(3*maximumQuotaBytes+4*maximumRelocationBytes+4) +
-		3*maximumStorageTempAttempts*rootTempJournalMarkerReadLimit
+		3*maximumStorageTempAttempts*rootTempJournalMarkerReadLimit + maximumSpawnThrottleBytes + 1
 	if spoolFixedReadEnvelope != wantReadEnvelope {
 		t.Fatalf("fixed read envelope = %d, want %d including marker and control limit probes", spoolFixedReadEnvelope, wantReadEnvelope)
 	}
@@ -10616,7 +10723,7 @@ func TestFixedControlReadEnvelopeIncludesLimitProbeAndInventoriesCallsites(t *te
 		return true
 	})
 	wantCalls := map[string]int{
-		"chargeFixedEntry": 24, "chargeFixedRead": 9, "chargeFixedDirectory": 7, "chargeFixedTraversalDirectory": 2,
+		"chargeFixedEntry": 26, "chargeFixedRead": 10, "chargeFixedDirectory": 7, "chargeFixedTraversalDirectory": 2,
 		"availableFixedSlots": 2, "claimFixedWorkEnvelope": 5,
 	}
 	if fmt.Sprint(calls) != fmt.Sprint(wantCalls) || limitReads["maximumQuotaBytes"] != 2 || limitReads["maximumRelocationBytes"] != 2 {

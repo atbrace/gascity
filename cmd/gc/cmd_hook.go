@@ -149,6 +149,7 @@ func cmdHookRun(args []string, opts hookRunOptions, stdin io.Reader, stdout, std
 	cmd.Stderr = stderr
 	cmd.WaitDelay = 2 * time.Second
 	prepareProviderOpCommand(cmd)
+	disableProductMetricsForChild(cmd)
 
 	err = cmd.Run()
 	// A clean exit wins even if the deadline fired in the same instant: the
@@ -620,6 +621,7 @@ func shellWorkQueryWithEnv(command, dir string, env []string) (string, error) {
 		cmd.Dir = dir
 	}
 	cmd.Env = workQueryEnvForDir(env, dir)
+	disableProductMetricsForChild(cmd)
 	var stderr bytes.Buffer
 	cmd.Stderr = &stderr
 	out, err := cmd.Output()

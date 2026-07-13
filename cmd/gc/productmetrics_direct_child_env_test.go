@@ -25,6 +25,7 @@ var productMetricsDirectChildObservedKeys = []string{
 	execenv.UsageMetricsDisableEnv,
 	"BD_DISABLE_METRICS",
 	"OTEL_SERVICE_NAME",
+	"PWD",
 }
 
 // maybeRunProductMetricsDirectChildEnvSpy turns a re-executed cmd/gc test
@@ -139,10 +140,10 @@ func captureProductMetricsDirectChildEnv(t *testing.T, invoke func() error) []st
 	deadline := time.Now().Add(testutil.ExecRaceTimeout)
 	for {
 		data, err := os.ReadFile(snapshot)
-		if err == nil {
+		if err == nil && bytes.HasSuffix(data, []byte("\n")) {
 			return splitProductMetricsDirectChildEnv(data)
 		}
-		if !os.IsNotExist(err) {
+		if err != nil && !os.IsNotExist(err) {
 			t.Fatalf("read direct-child environment snapshot: %v", err)
 		}
 		if time.Now().After(deadline) {

@@ -23,12 +23,13 @@ import (
 )
 
 const (
-	productMetricsTesthookEndpointEnvironment = "GC_PRODUCT_METRICS_TESTHOOK_ENDPOINT"
-	productMetricsTesthookCAFileEnvironment   = "GC_PRODUCT_METRICS_TESTHOOK_CA_FILE"
-	productMetricsTestReleaseVersion          = "0.31.0"
-	productMetricsTestInstallationID          = "3cf9fd4e-3337-4c29-a0ab-2858cd8a1f21"
-	productMetricsTestSpoolGeneration         = "22222222-2222-4222-8222-222222222222"
-	productMetricsTestEventID                 = "8c4f4128-a6e8-4f66-bd1b-1fcf1298b124"
+	productMetricsTesthookEndpointEnvironment  = "GC_PRODUCT_METRICS_TESTHOOK_ENDPOINT"
+	productMetricsTesthookCAFileEnvironment    = "GC_PRODUCT_METRICS_TESTHOOK_CA_FILE"
+	productMetricsTestReleaseVersion           = "0.31.0"
+	productMetricsTestInstallationID           = "3cf9fd4e-3337-4c29-a0ab-2858cd8a1f21"
+	productMetricsTestSpoolGeneration          = "22222222-2222-4222-8222-222222222222"
+	productMetricsTestEventID                  = "8c4f4128-a6e8-4f66-bd1b-1fcf1298b124"
+	productMetricsTestRecordHelpCommandFixture = "__testhook-record-help"
 )
 
 type capturedProductMetricsRequest struct {
@@ -50,6 +51,7 @@ func TestProductMetricsPrivateUploaderUsesTaggedBinaryAndBypassesNormalStartup(t
 	if runtime.GOOS != "linux" && runtime.GOOS != "darwin" {
 		t.Skip("detached product-metrics uploader is supported only on Linux and Darwin")
 	}
+	configureProductMetricsTrustedProcessTempRoot(t)
 
 	buildDir := t.TempDir()
 	taggedBinary := filepath.Join(buildDir, "gc-productmetrics-tagged")
@@ -206,6 +208,20 @@ func TestProductMetricsPrivateUploaderUsesTaggedBinaryAndBypassesNormalStartup(t
 	}
 }
 
+func configureProductMetricsTrustedProcessTempRoot(t *testing.T) {
+	t.Helper()
+	trustedTempRoot := "/tmp"
+	if runtime.GOOS == "darwin" {
+		trustedTempRoot = "/private/tmp"
+	}
+	// Go 1.26's testing.T.TempDir prefers GOTMPDIR over TMPDIR. Product
+	// metrics deliberately reject a user-owned writable ancestor, so keep
+	// these process trust-boundary fixtures below the root-owned sticky
+	// directory even when repository build scratch lives below /data.
+	t.Setenv("GOTMPDIR", trustedTempRoot)
+	t.Setenv("TMPDIR", trustedTempRoot)
+}
+
 func TestProductMetricsNormalBinaryContainsNoTesthookSymbols(t *testing.T) {
 	skipSlowCmdGCTest(t, "builds and scans a normal gc binary")
 	buildDir := t.TempDir()
@@ -219,6 +235,7 @@ func TestProductMetricsNormalBinaryContainsNoTesthookSymbols(t *testing.T) {
 	}
 	for _, forbidden := range []string{
 		"main.runProductMetricsTesthookChild",
+		"main.newProductMetricsTesthookRecordHelpCommand",
 		"internal/productmetrics.OpenTesthook",
 		"internal/productmetrics.testhookLoopbackHost",
 	} {
@@ -233,16 +250,34 @@ func TestProductMetricsNormalBinaryContainsNoTesthookSymbols(t *testing.T) {
 	for _, forbidden := range []string{
 		productMetricsTesthookEndpointEnvironment,
 		productMetricsTesthookCAFileEnvironment,
+		productMetricsTestRecordHelpCommandFixture,
 	} {
 		if bytes.Contains(binary, []byte(forbidden)) {
 			t.Fatalf("normal gc binary contains tag-only literal %q", forbidden)
 		}
+	}
+	help := exec.Command(normalBinary, "metrics", "--help")
+	helpOutput, err := help.CombinedOutput()
+	if err != nil {
+		t.Fatalf("normal gc metrics --help: %v\n%s", err, helpOutput)
+	}
+	if bytes.Contains(helpOutput, []byte(productMetricsTestRecordHelpCommandFixture)) {
+		t.Fatalf("normal gc metrics help exposes tagged command:\n%s", helpOutput)
 	}
 
 	normalFiles := goListProductMetricsFiles(t, "")
 	taggedFiles := goListProductMetricsFiles(t, "productmetrics_testhook")
 	if strings.Contains(normalFiles, "productmetrics_testhook.go") {
 		t.Fatalf("normal go file set contains tagged adapter:\n%s", normalFiles)
+	}
+	if strings.Contains(normalFiles, "productmetrics_controls_testhook.go") {
+		t.Fatalf("normal go file set contains tagged control registrar:\n%s", normalFiles)
+	}
+	if !strings.Contains(normalFiles, "productmetrics_controls_production.go") {
+		t.Fatalf("normal go file set omits production control registrar:\n%s", normalFiles)
+	}
+	if !strings.Contains(taggedFiles, "productmetrics_controls_testhook.go") || strings.Contains(taggedFiles, "productmetrics_controls_production.go") {
+		t.Fatalf("tagged go file set selected the wrong control registrar:\n%s", taggedFiles)
 	}
 	if count := strings.Count(taggedFiles, "productmetrics_testhook.go"); count != 2 {
 		t.Fatalf("tagged go file set contains %d testhook adapters, want cmd and internal:\n%s", count, taggedFiles)

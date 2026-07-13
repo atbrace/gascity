@@ -497,7 +497,10 @@ TDD sequence and acceptance:
 - Root clean-name policy follows implemented ownership. S6 explicitly treats
   future `status.toml` and `spawn-throttle` files as unknown preserved residue;
   S8 and S7 may add each name only with its landed handler and exact cleanup/
-  proof tests.
+  proof tests. Once handled, a declared control name with a non-authorizing
+  filesystem shape remains preserved but maps to existing unrecognized-root
+  manual-cleanup guidance; transient I/O and replacement failures remain
+  retry-only.
 - Main and peer-successor success run the same bounded, namespace-read-only
   settled-journal/root proof. After that proof, the peer path reloads and
   identity-leases the exact expected clean-disabled successor; the main path

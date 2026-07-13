@@ -1,5 +1,7 @@
 package productmetrics
 
+import "net/url"
+
 // BuildKind classifies the provenance of a Gas City binary.
 type BuildKind uint8
 
@@ -50,6 +52,7 @@ type ReleaseIdentity struct {
 	buildKind      BuildKind
 	releaseVersion string
 	endpoint       string
+	privacyURL     string
 	metricsEpoch   uint64
 	rollout        RolloutMode
 }
@@ -58,6 +61,7 @@ const (
 	compiledBuildKind      = BuildDevelopment
 	compiledReleaseVersion = ""
 	compiledEndpoint       = ""
+	compiledPrivacyURL     = ""
 	compiledMetricsEpoch   = uint64(0)
 	compiledRollout        = RolloutDefaultOff
 )
@@ -69,6 +73,7 @@ func CurrentReleaseIdentity() ReleaseIdentity {
 		buildKind:      compiledBuildKind,
 		releaseVersion: compiledReleaseVersion,
 		endpoint:       compiledEndpoint,
+		privacyURL:     compiledPrivacyURL,
 		metricsEpoch:   compiledMetricsEpoch,
 		rollout:        compiledRollout,
 	}
@@ -83,8 +88,20 @@ func (identity ReleaseIdentity) ReleaseVersion() string { return identity.releas
 // Endpoint returns the compiled ingest endpoint, or empty for an inert build.
 func (identity ReleaseIdentity) Endpoint() string { return identity.endpoint }
 
+// PrivacyURL returns the compiled privacy-policy URL, or empty for an inert
+// artifact without approved production notice material.
+func (identity ReleaseIdentity) PrivacyURL() string { return identity.privacyURL }
+
 // MetricsEpoch returns the compiled privacy-generation epoch.
 func (identity ReleaseIdentity) MetricsEpoch() uint64 { return identity.metricsEpoch }
 
 // Rollout returns the compiled rollout mode.
 func (identity ReleaseIdentity) Rollout() RolloutMode { return identity.rollout }
+
+func endpointHostnameForPolicy(raw string) string {
+	parsed, err := url.Parse(raw)
+	if err != nil || parsed.Scheme != "https" || parsed.Host == "" || parsed.Hostname() == "" || parsed.User != nil {
+		return ""
+	}
+	return parsed.Hostname()
+}

@@ -6,7 +6,6 @@ import (
 	"crypto/ed25519"
 	"crypto/rand"
 	"errors"
-	"io"
 	"net"
 	"net/http"
 	"net/url"
@@ -33,6 +32,7 @@ type TesthookOptions struct {
 	NoticeVersion  uint64
 	NoticeText     []byte
 	Endpoint       string
+	PrivacyURL     string
 	Client         *http.Client
 	PauseKeys      []TesthookPauseKey
 	Now            func() time.Time
@@ -104,12 +104,14 @@ func OpenTesthook(options TesthookOptions) (*Service, error) {
 			rollout:            RolloutDefaultOn,
 			releaseVersion:     options.ReleaseVersion,
 			metricsEpoch:       options.MetricsEpoch,
+			endpointHostname:   endpoint.Hostname(),
+			privacyURL:         options.PrivacyURL,
 		},
 		notice:               noticeDefinition{testOnly: true, version: options.NoticeVersion, text: append([]byte(nil), options.NoticeText...)},
 		getenv:               os.Getenv,
 		newUUID:              newUUID,
 		now:                  now,
-		verifyTTY:            func(io.Writer) bool { return true },
+		verifyTTY:            productionNoticeWriterIsTTY,
 		privateUploaderStart: asynchronousUploadStart(transport),
 	})
 }

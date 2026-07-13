@@ -54,7 +54,8 @@ func TestDisableAndPurgeInvalidAbsentAndUnavailableState(t *testing.T) {
 		home := newMetricsTestHome(t)
 		service := mustOpenTestService(t, defaultTestServiceDependencies(home, 2))
 		result, err := service.DisableAndPurge(context.Background())
-		if err != nil || result.Outcome != PurgeCompleted || !result.DisabledDurable {
+		if err != nil || result.Outcome != PurgeCompleted || !result.DisabledDurable ||
+			result.IncompletePhase != PurgeIncompleteNone || result.ManualCleanupRequired || result.ManualCleanupReason != PurgeManualCleanupNone {
 			t.Fatalf("absent-state result = %+v err=%v", result, err)
 		}
 		requireCleanDisabledTree(t, home)
@@ -125,6 +126,10 @@ func TestDisableAndPurgeCommitsBeforeUploaderWaitWithoutHoldingStateLock(t *test
 	if outcome.result.Outcome != PurgeCleanupPending || !outcome.result.DisabledDurable {
 		t.Fatalf("uploader timeout result = %+v", outcome.result)
 	}
+	if outcome.result.IncompletePhase != PurgeIncompleteUploaderQuiescence ||
+		outcome.result.ManualCleanupRequired || outcome.result.ManualCleanupReason != PurgeManualCleanupNone {
+		t.Fatalf("uploader timeout guidance = %+v", outcome.result)
+	}
 	if after := readStateFixture(t, home); after != pending {
 		t.Fatalf("uploader timeout changed disable owner:\nbefore=%#v\nafter=%#v", pending, after)
 	}
@@ -145,6 +150,10 @@ func TestDisableAndPurgeBoundsInitialAndPostUploaderStateLocks(t *testing.T) {
 		requirePurgeErrorClass(t, err, PurgeErrorDisableWrite)
 		if result.Outcome != PurgeFailed || result.DisabledDurable {
 			t.Fatalf("initial state timeout = %+v err=%v", result, err)
+		}
+		if result.IncompletePhase != PurgeIncompleteDisableWrite || result.ManualCleanupRequired ||
+			result.ManualCleanupReason != PurgeManualCleanupNone {
+			t.Fatalf("initial state timeout guidance = %+v", result)
 		}
 		if after := readStateFixture(t, home); after != before {
 			t.Fatalf("initial state timeout mutated state:\nbefore=%#v\nafter=%#v", before, after)
@@ -183,6 +192,10 @@ func TestDisableAndPurgeBoundsInitialAndPostUploaderStateLocks(t *testing.T) {
 		requirePurgeErrorClass(t, outcome.err, PurgeErrorStorage)
 		if outcome.result.Outcome != PurgeCleanupPending || !outcome.result.DisabledDurable {
 			t.Fatalf("post-uploader state timeout = %+v err=%v", outcome.result, outcome.err)
+		}
+		if outcome.result.IncompletePhase != PurgeIncompleteLocalCleanup || outcome.result.ManualCleanupRequired ||
+			outcome.result.ManualCleanupReason != PurgeManualCleanupNone {
+			t.Fatalf("post-uploader state timeout guidance = %+v", outcome.result)
 		}
 		if after := readStateFixture(t, home); after != pending {
 			t.Fatalf("post-uploader timeout changed owner:\nbefore=%#v\nafter=%#v", pending, after)
@@ -342,6 +355,10 @@ func TestDisableAndPurgeUnknownRootResidueStaysPendingUntilManualRemoval(t *test
 		first.RemovedEvents != 0 || first.RemovedBytes != 0 {
 		t.Fatalf("unknown-residue off = %+v err=%v", first, err)
 	}
+	if first.IncompletePhase != PurgeIncompleteLocalCleanup || !first.ManualCleanupRequired ||
+		first.ManualCleanupReason != PurgeManualCleanupUnrecognizedRootEntry {
+		t.Fatalf("unknown-residue guidance = %+v", first)
+	}
 	owner := readStateFixture(t, home)
 	if owner.Preference != preferenceDisabled || owner.CleanupKind != cleanupDisable {
 		t.Fatalf("unknown-residue off lost cleanup owner: %#v", owner)
@@ -358,6 +375,10 @@ func TestDisableAndPurgeUnknownRootResidueStaysPendingUntilManualRemoval(t *test
 		second.RemovedEvents != 0 || second.RemovedBytes != 0 {
 		t.Fatalf("unknown-residue retry = %+v err=%v", second, secondErr)
 	}
+	if second.IncompletePhase != PurgeIncompleteLocalCleanup || !second.ManualCleanupRequired ||
+		second.ManualCleanupReason != PurgeManualCleanupUnrecognizedRootEntry {
+		t.Fatalf("unknown-residue retry guidance = %+v", second)
+	}
 	if retryOwner := readStateFixture(t, home); retryOwner != owner {
 		t.Fatalf("unknown-residue retry replaced owner:\nfirst=%#v\nretry=%#v", owner, retryOwner)
 	}
@@ -372,6 +393,228 @@ func TestDisableAndPurgeUnknownRootResidueStaysPendingUntilManualRemoval(t *test
 		t.Fatalf("manual-residue-removal retry = %+v err=%v", completed, completeErr)
 	}
 	requireCleanDisabledTree(t, home)
+}
+
+func TestDisableAndPurgeUnsafeKnownControlShapeRequiresManualCleanup(t *testing.T) {
+	tests := []struct {
+		name        string
+		controlName string
+		shape       string
+	}{
+		{name: "status symlink", controlName: statusFileName, shape: "symlink"},
+		{name: "status directory", controlName: statusFileName, shape: "directory"},
+		{name: "status hardlink", controlName: statusFileName, shape: "hardlink"},
+		{name: "spawn throttle symlink", controlName: spawnThrottleFileName, shape: "symlink"},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			home, service, _ := newRecordServiceFixture(t, testEventIDThree)
+			root := mustOpenMutableRoot(t, home)
+			if err := persistSpoolQuota(root, spoolQuota{}); err != nil {
+				t.Fatal(err)
+			}
+			if err := root.Close(); err != nil {
+				t.Fatal(err)
+			}
+
+			path := filepath.Join(home.Root(), test.controlName)
+			const sentinel = "outside fixed-control cleanup authority"
+			var verifyPreserved func()
+			verifyExternalTarget := func() {}
+			removeUnsafeEntry := func() error { return os.Remove(path) }
+			switch test.shape {
+			case "symlink":
+				target := filepath.Join(filepath.Dir(home.Root()), strings.ReplaceAll(test.controlName, ".", "-")+"-outside")
+				if err := os.WriteFile(target, []byte(sentinel), 0o600); err != nil {
+					t.Fatal(err)
+				}
+				if err := os.Symlink(target, path); err != nil {
+					t.Fatal(err)
+				}
+				verifyExternalTarget = func() {
+					if data, err := os.ReadFile(target); err != nil || string(data) != sentinel {
+						t.Fatalf("symlink target changed: data=%q err=%v", data, err)
+					}
+				}
+				verifyPreserved = func() {
+					info, err := os.Lstat(path)
+					if err != nil || info.Mode()&os.ModeSymlink == 0 {
+						t.Fatalf("unsafe control symlink changed: info=%v err=%v", info, err)
+					}
+					verifyExternalTarget()
+				}
+			case "directory":
+				nested := filepath.Join(path, "nested", "keep")
+				if err := os.MkdirAll(filepath.Dir(nested), 0o700); err != nil {
+					t.Fatal(err)
+				}
+				if err := os.WriteFile(nested, []byte(sentinel), 0o600); err != nil {
+					t.Fatal(err)
+				}
+				verifyPreserved = func() {
+					if data, err := os.ReadFile(nested); err != nil || string(data) != sentinel {
+						t.Fatalf("unsafe control directory changed: data=%q err=%v", data, err)
+					}
+				}
+				removeUnsafeEntry = func() error { return os.RemoveAll(path) }
+			case "hardlink":
+				target := filepath.Join(filepath.Dir(home.Root()), "status-hardlink-outside")
+				if err := os.WriteFile(target, []byte(sentinel), 0o600); err != nil {
+					t.Fatal(err)
+				}
+				if err := os.Link(target, path); err != nil {
+					t.Fatal(err)
+				}
+				verifyExternalTarget = func() {
+					if data, err := os.ReadFile(target); err != nil || string(data) != sentinel {
+						t.Fatalf("hardlink target changed: data=%q err=%v", data, err)
+					}
+				}
+				verifyPreserved = func() {
+					entryInfo, entryErr := os.Stat(path)
+					targetInfo, targetErr := os.Stat(target)
+					if entryErr != nil || targetErr != nil || !os.SameFile(entryInfo, targetInfo) {
+						t.Fatalf("unsafe control hardlink changed: entry=%v target=%v entryErr=%v targetErr=%v",
+							entryInfo, targetInfo, entryErr, targetErr)
+					}
+					verifyExternalTarget()
+				}
+			default:
+				t.Fatalf("unknown unsafe control shape %q", test.shape)
+			}
+
+			first, err := service.DisableAndPurge(context.Background())
+			requirePurgeErrorClass(t, err, PurgeErrorCleanupIncomplete)
+			if first.Outcome != PurgeCleanupPending || !first.DisabledDurable ||
+				first.RemovedEvents != 0 || first.RemovedBytes != 0 {
+				t.Fatalf("unsafe %s %s off = %+v err=%v", test.controlName, test.shape, first, err)
+			}
+			verifyPreserved()
+			if first.IncompletePhase != PurgeIncompleteLocalCleanup || !first.ManualCleanupRequired ||
+				first.ManualCleanupReason != PurgeManualCleanupUnrecognizedRootEntry {
+				t.Fatalf("unsafe %s %s guidance = %+v", test.controlName, test.shape, first)
+			}
+			owner := readStateFixture(t, home)
+			if owner.Preference != preferenceDisabled || owner.CleanupKind != cleanupDisable {
+				t.Fatalf("unsafe %s %s off lost cleanup owner: %#v", test.controlName, test.shape, owner)
+			}
+
+			second, secondErr := service.DisableAndPurge(context.Background())
+			requirePurgeErrorClass(t, secondErr, PurgeErrorCleanupIncomplete)
+			if second.Outcome != PurgeCleanupPending || !second.DisabledDurable ||
+				second.IncompletePhase != PurgeIncompleteLocalCleanup || !second.ManualCleanupRequired ||
+				second.ManualCleanupReason != PurgeManualCleanupUnrecognizedRootEntry {
+				t.Fatalf("unsafe %s %s retry guidance = %+v err=%v", test.controlName, test.shape, second, secondErr)
+			}
+			if retryOwner := readStateFixture(t, home); retryOwner != owner {
+				t.Fatalf("unsafe %s %s retry replaced owner:\nfirst=%#v\nretry=%#v",
+					test.controlName, test.shape, owner, retryOwner)
+			}
+			verifyPreserved()
+
+			if err := removeUnsafeEntry(); err != nil {
+				t.Fatal(err)
+			}
+			verifyExternalTarget()
+			completed, completeErr := service.DisableAndPurge(context.Background())
+			if completeErr != nil || completed.Outcome != PurgeCompleted || !completed.DisabledDurable {
+				t.Fatalf("unsafe %s %s manual-removal retry = %+v err=%v",
+					test.controlName, test.shape, completed, completeErr)
+			}
+			verifyExternalTarget()
+			if _, err := os.Lstat(path); !errors.Is(err, fs.ErrNotExist) {
+				t.Fatalf("manual removal left unsafe %s %s: %v", test.controlName, test.shape, err)
+			}
+			requireCleanDisabledTree(t, home)
+		})
+	}
+}
+
+func TestDisableAndPurgeTransientDiagnosticStatusFailureRemainsRetryable(t *testing.T) {
+	home, _, _ := newRecordServiceFixture(t, testEventIDThree)
+	root := mustOpenMutableRoot(t, home)
+	if err := persistSpoolQuota(root, spoolQuota{}); err != nil {
+		t.Fatal(err)
+	}
+	writeDiagnosticStatusToRoot(t, root, diagnosticStatus{droppedEvents: 2})
+	if err := root.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	statusPath := filepath.Join(home.Root(), statusFileName)
+	injected := errors.New("injected transient diagnostic-status metadata failure")
+	injectedOnce := false
+	deps := defaultTestServiceDependencies(home, 2)
+	deps.storageHooks.beforeMetadataAttempt = func(path string) error {
+		if path == statusPath && !injectedOnce {
+			injectedOnce = true
+			return injected
+		}
+		return nil
+	}
+	service := mustOpenTestService(t, deps)
+
+	first, err := service.DisableAndPurge(context.Background())
+	requirePurgeErrorClass(t, err, PurgeErrorCleanupIncomplete)
+	if !injectedOnce || !errors.Is(err, injected) || first.Outcome != PurgeCleanupPending || !first.DisabledDurable ||
+		first.IncompletePhase != PurgeIncompleteLocalCleanup || first.ManualCleanupRequired ||
+		first.ManualCleanupReason != PurgeManualCleanupNone {
+		t.Fatalf("transient diagnostic-status failure = injected:%v result:%+v err=%v", injectedOnce, first, err)
+	}
+	owner := readStateFixture(t, home)
+	if _, err := os.Lstat(statusPath); err != nil {
+		t.Fatalf("transient diagnostic-status failure removed the safe record: %v", err)
+	}
+
+	retry, retryErr := service.DisableAndPurge(context.Background())
+	if retryErr != nil || retry.Outcome != PurgeCompleted || !retry.DisabledDurable {
+		t.Fatalf("transient diagnostic-status retry = %+v err=%v", retry, retryErr)
+	}
+	if retryOwner := readStateFixture(t, home); retryOwner == owner || retryOwner.CleanupKind != cleanupNone {
+		t.Fatalf("transient diagnostic-status retry did not complete owner:\nfirst=%#v\nretry=%#v", owner, retryOwner)
+	}
+	if _, err := os.Lstat(statusPath); !errors.Is(err, fs.ErrNotExist) {
+		t.Fatalf("transient diagnostic-status retry left the safe record: %v", err)
+	}
+	requireCleanDisabledTree(t, home)
+}
+
+func TestDisableAndPurgeIntentWithMappedTempRequiresManualCleanup(t *testing.T) {
+	home, service, _ := newRecordServiceFixture(t, testEventIDThree)
+	root := mustOpenMutableRoot(t, home)
+	if err := persistSpoolQuota(root, spoolQuota{}); err != nil {
+		t.Fatal(err)
+	}
+	backend, ok := root.backend.(*unixStorageDirectory)
+	if !ok {
+		t.Fatal("root-temp journal test requires Unix storage")
+	}
+	journal, err := backend.openRootTempJournal()
+	if err != nil {
+		t.Fatal(err)
+	}
+	name := fmt.Sprintf(".pm-tmp-%x-%x", os.Getpid(), uint64(0xc01))
+	marker, err := createRootTempJournalMarker(backend, journal, name)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := errors.Join(marker.close(), journal.close()); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(home.Root(), name), nil, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := root.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	result, purgeErr := service.DisableAndPurge(context.Background())
+	requirePurgeErrorClass(t, purgeErr, PurgeErrorCleanupIncomplete)
+	if result.Outcome != PurgeCleanupPending || !result.DisabledDurable ||
+		result.IncompletePhase != PurgeIncompleteLocalCleanup || !result.ManualCleanupRequired ||
+		result.ManualCleanupReason != PurgeManualCleanupUnsettledRootTempJournal {
+		t.Fatalf("INTENT manual cleanup guidance = %+v err=%v", result, purgeErr)
+	}
 }
 
 func TestDisableAndPurgeJournalPreemptsOverBudgetUnknownRootStarvation(t *testing.T) {
@@ -988,6 +1231,10 @@ func TestDisableAndPurgeCleanupCompletionFailureRequiresRetry(t *testing.T) {
 			requirePurgeErrorClass(t, err, PurgeErrorCleanupIncomplete)
 			if result.Outcome != PurgeCleanupPending || !result.DisabledDurable || !errors.Is(err, injected) {
 				t.Fatalf("completion failure = %+v err=%v", result, err)
+			}
+			if result.IncompletePhase != PurgeIncompleteFinalProof || result.ManualCleanupRequired ||
+				result.ManualCleanupReason != PurgeManualCleanupNone {
+				t.Fatalf("completion failure guidance = %+v", result)
 			}
 			visible := readStateFixture(t, home)
 			if failure == "not-applied" && visible.CleanupKind != cleanupDisable {

@@ -242,6 +242,10 @@ func (service *Service) uploadOneBatchLocked(
 		settleErr := restoreSpoolClaim(root, claim)
 		return uploadRunResult{outcome: uploadRunRestored, events: len(claim.records)}, errors.Join(startErr, settleErr, state.Close())
 	}
+	attemptedAt := dependencies.now()
+	service.bestEffortUpdateDiagnosticStatusLocked(root, diagnosticStatusUpdate{
+		lastUploadAttempt: attemptedAt,
+	}, nil)
 	stateCloseErr := state.Close()
 
 	response, waitErr := wait()
@@ -264,9 +268,26 @@ func (service *Service) uploadOneBatchLocked(
 	switch response.kind {
 	case uploadResponseAccepted, uploadResponseDuplicate:
 		settleErr := deleteSpoolClaim(root, claim)
+		if settleErr == nil && waitErr == nil {
+			service.bestEffortUpdateDiagnosticStatusLocked(root, diagnosticStatusUpdate{
+				lastUploadSuccess: dependencies.now(),
+				clearLastError:    true,
+			}, nil)
+		} else {
+			class := diagnosticClassForUpload(response, waitErr)
+			if settleErr != nil {
+				class = diagnosticClassForStorageError(settleErr)
+			}
+			service.bestEffortUpdateDiagnosticStatusLocked(root, diagnosticStatusUpdate{lastErrorClass: class}, nil)
+		}
 		return uploadRunResult{outcome: uploadRunDeleted, events: len(claim.records)}, errors.Join(waitErr, stateCloseErr, settleErr, state.Close())
 	case uploadResponseRetry:
 		settleErr := restoreSpoolClaim(root, claim)
+		class := diagnosticClassForUpload(response, waitErr)
+		if settleErr != nil {
+			class = diagnosticClassForStorageError(settleErr)
+		}
+		service.bestEffortUpdateDiagnosticStatusLocked(root, diagnosticStatusUpdate{lastErrorClass: class}, nil)
 		return uploadRunResult{outcome: uploadRunRestored, events: len(claim.records)}, errors.Join(waitErr, stateCloseErr, settleErr, state.Close())
 	case uploadResponsePause:
 		if response.pause.releaseVersion != prepared.releaseVersion || response.pause.metricsEpoch != permit.metricsEpoch {
@@ -284,6 +305,11 @@ func (service *Service) uploadOneBatchLocked(
 			return uploadRunResult{outcome: outcome, events: len(claim.records)}, errors.Join(stateCloseErr, pauseErr, state.Close())
 		}
 		defer func() { returnErr = errors.Join(returnErr, token.Close()) }()
+		// Keep the diagnostic write behind the durable pause barrier but before
+		// cleanup installs its clean successor. A crash in this best-effort
+		// atomic write is then recoverable pause-cleanup residue; no diagnostic
+		// write can introduce a fresh journal after cleanup has completed.
+		service.bestEffortUpdateDiagnosticStatusLocked(root, diagnosticStatusUpdate{lastErrorClass: DiagnosticErrorServerPaused}, nil)
 		complete, cleanupErr := service.finishPauseCleanupLocked(state, token, dependencies.budget)
 		outcome := uploadRunPausePending
 		if complete {
@@ -292,6 +318,11 @@ func (service *Service) uploadOneBatchLocked(
 		return uploadRunResult{outcome: outcome, events: len(claim.records)}, errors.Join(stateCloseErr, cleanupErr, state.Close())
 	default:
 		settleErr := restoreSpoolClaim(root, claim)
+		class := DiagnosticErrorInvalidResponse
+		if settleErr != nil {
+			class = diagnosticClassForStorageError(settleErr)
+		}
+		service.bestEffortUpdateDiagnosticStatusLocked(root, diagnosticStatusUpdate{lastErrorClass: class}, nil)
 		return uploadRunResult{outcome: uploadRunRestored, events: len(claim.records)}, errors.Join(waitErr, stateCloseErr, settleErr, state.Close(), errors.New("productmetrics: unknown upload response kind"))
 	}
 }
@@ -373,7 +404,7 @@ func (service *Service) finishPauseCleanupAndResume(ctx context.Context) (transi
 		return false, closeErr
 	}
 	if !cleanupProved {
-		if err := proveCleanMetricsTree(root, defaultSpoolWorkBudget()); err != nil {
+		if err := proveCleanMetricsTreeAllowDiagnosticStatus(root, defaultSpoolWorkBudget()); err != nil {
 			return false, err
 		}
 	}

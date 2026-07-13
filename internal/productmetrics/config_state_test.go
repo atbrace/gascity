@@ -237,6 +237,8 @@ func TestStatusDTOHasOnlyApprovedRedactedFields(t *testing.T) {
 	want := []string{
 		"State",
 		"Reason",
+		"HomeStable",
+		"HomeReason",
 		"ConfigPath",
 		"ConfigPresent",
 		"StateSchema",
@@ -245,6 +247,18 @@ func TestStatusDTOHasOnlyApprovedRedactedFields(t *testing.T) {
 		"InstallationIDPresent",
 		"SpoolGenerationPresent",
 		"CleanupPending",
+		"QueueEvents",
+		"QueueBytes",
+		"QueueDiagnosticsAvailable",
+		"OldestQueuedEventAge",
+		"OldestQueuedEventPresent",
+		"DroppedEvents",
+		"LastUploadAttemptHourUTC",
+		"LastUploadSuccessHourUTC",
+		"LastErrorClass",
+		"StatusDiagnosticsAvailable",
+		"SpawnThrottleAge",
+		"SpawnThrottlePresent",
 	}
 	statusType := reflect.TypeOf(Status{})
 	got := make([]string, 0, statusType.NumField())

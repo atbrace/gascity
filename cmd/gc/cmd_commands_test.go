@@ -136,22 +136,30 @@ type packCommandProcessInvocation struct {
 	args     []string
 }
 
+func packCommandScenarioRootOptions(t *testing.T, scenario string, args []string) rootCommandOptions {
+	t.Helper()
+	options := rootCommandOptionsForArgs(args)
+	options.discoverPackCommands = true
+	switch scenario {
+	case "eager":
+		options.eagerPackCommandDiscovery = true
+	case "lazy":
+		options.eagerPackCommandDiscovery = false
+	default:
+		t.Fatalf("unknown pack-command scenario %q", scenario)
+	}
+	return options
+}
+
+func runPackCommandScenario(t *testing.T, scenario string, args []string, stdout, stderr io.Writer) int {
+	t.Helper()
+	return runWithRootCommandOptions(args, stdout, stderr, packCommandScenarioRootOptions(t, scenario, args))
+}
+
 func TestPackCommandExitHelper(t *testing.T) {
 	invocation, ok := parsePackCommandProcessInvocation(os.Args)
 	if !ok {
 		return
-	}
-
-	switch invocation.scenario {
-	case "eager":
-		os.Args = []string{"gc"}
-	case "lazy":
-		// Pack discovery still consults ambient os.Args. Making it look like the
-		// credential helper skips eager discovery while injected run args drive
-		// the lazy fallback.
-		os.Args = []string{"gc", "git-credential", "get"}
-	default:
-		t.Fatalf("unknown pack-command helper scenario %q", invocation.scenario)
 	}
 
 	code := func() int {
@@ -160,7 +168,7 @@ func TestPackCommandExitHelper(t *testing.T) {
 				_, _ = os.Stderr.WriteString("write post-run marker: " + err.Error() + "\n")
 			}
 		}()
-		return run(invocation.args, os.Stdout, os.Stderr)
+		return runPackCommandScenario(t, invocation.scenario, invocation.args, os.Stdout, os.Stderr)
 	}()
 	os.Exit(code)
 }
@@ -341,8 +349,6 @@ func TestE1Final3MalformedBooleanHelpBeforeLeafNeverExecutesAmbient(t *testing.T
 		{name: "intermediate no scope", args: []string{"backstage", "repo", "-h=maybe", "sync"}},
 	}
 
-	oldArgs := os.Args
-	t.Cleanup(func() { os.Args = oldArgs })
 	oldWD, err := os.Getwd()
 	if err != nil {
 		t.Fatal(err)
@@ -352,11 +358,9 @@ func TestE1Final3MalformedBooleanHelpBeforeLeafNeverExecutesAmbient(t *testing.T
 	for _, lazy := range []bool{false, true} {
 		scenario := "eager"
 		cwd := cityA
-		os.Args = []string{"gc"}
 		if lazy {
 			scenario = "lazy"
 			cwd = t.TempDir()
-			os.Args = []string{"gc", "git-credential", "get"}
 		}
 		if err := os.Chdir(cwd); err != nil {
 			t.Fatal(err)
@@ -365,7 +369,7 @@ func TestE1Final3MalformedBooleanHelpBeforeLeafNeverExecutesAmbient(t *testing.T
 		for _, test := range tests {
 			t.Run(scenario+"/"+test.name, func(t *testing.T) {
 				var stdout, stderr bytes.Buffer
-				code := run(test.args, &stdout, &stderr)
+				code := runPackCommandScenario(t, scenario, test.args, &stdout, &stderr)
 				for _, sentinel := range []string{"ambient-hello args:", "ambient-sync args:", "selected-hello args:", "selected-sync args:"} {
 					if strings.Contains(stdout.String(), sentinel) {
 						t.Fatalf("malformed group help executed pack sentinel %q: code=%d stdout=%q stderr=%q", sentinel, code, stdout.String(), stderr.String())
@@ -397,8 +401,6 @@ func TestE1PreLeafBooleanHelpSemantics(t *testing.T) {
 		{name: "rig intermediate short zero", args: []string{"backstage", "repo", "-h=0", "--rig=" + targetRig, "sync", "payload"}, wantStdout: "selected-sync args:<payload>\n"},
 	}
 
-	oldArgs := os.Args
-	t.Cleanup(func() { os.Args = oldArgs })
 	oldWD, err := os.Getwd()
 	if err != nil {
 		t.Fatal(err)
@@ -408,11 +410,9 @@ func TestE1PreLeafBooleanHelpSemantics(t *testing.T) {
 	for _, lazy := range []bool{false, true} {
 		scenario := "eager"
 		cwd := cityA
-		os.Args = []string{"gc"}
 		if lazy {
 			scenario = "lazy"
 			cwd = t.TempDir()
-			os.Args = []string{"gc", "git-credential", "get"}
 		}
 		if err := os.Chdir(cwd); err != nil {
 			t.Fatal(err)
@@ -422,7 +422,7 @@ func TestE1PreLeafBooleanHelpSemantics(t *testing.T) {
 		for _, test := range tests {
 			t.Run(scenario+"/"+test.name, func(t *testing.T) {
 				var stdout, stderr bytes.Buffer
-				code := run(test.args, &stdout, &stderr)
+				code := runPackCommandScenario(t, scenario, test.args, &stdout, &stderr)
 				if code != 0 || stderr.Len() != 0 {
 					t.Fatalf("pre-leaf help outcome failed: code=%d stdout=%q stderr=%q", code, stdout.String(), stderr.String())
 				}
@@ -450,9 +450,6 @@ func TestE1PreLeafBooleanHelpSemantics(t *testing.T) {
 
 func TestE1PreLeafBooleanHelpNoScopeEager(t *testing.T) {
 	cityA, _, _ := setupE1PreLeafHelpFixture(t)
-	oldArgs := os.Args
-	os.Args = []string{"gc"}
-	t.Cleanup(func() { os.Args = oldArgs })
 	oldWD, err := os.Getwd()
 	if err != nil {
 		t.Fatal(err)
@@ -515,8 +512,6 @@ func TestE1ScopeAfterGroupHelpUsesSelectedTree(t *testing.T) {
 		{name: "rig intermediate lone dash before later scope", args: []string{"backstage", "repo", "-", "--rig=" + targetRig, "--help"}},
 	}
 
-	oldArgs := os.Args
-	t.Cleanup(func() { os.Args = oldArgs })
 	oldWD, err := os.Getwd()
 	if err != nil {
 		t.Fatal(err)
@@ -526,11 +521,9 @@ func TestE1ScopeAfterGroupHelpUsesSelectedTree(t *testing.T) {
 	for _, lazy := range []bool{false, true} {
 		scenario := "eager"
 		cwd := cityA
-		os.Args = []string{"gc"}
 		if lazy {
 			scenario = "lazy"
 			cwd = t.TempDir()
-			os.Args = []string{"gc", "git-credential", "get"}
 		}
 		if err := os.Chdir(cwd); err != nil {
 			t.Fatal(err)
@@ -539,7 +532,7 @@ func TestE1ScopeAfterGroupHelpUsesSelectedTree(t *testing.T) {
 		for _, test := range tests {
 			t.Run(scenario+"/"+test.name, func(t *testing.T) {
 				var stdout, stderr bytes.Buffer
-				code := run(test.args, &stdout, &stderr)
+				code := runPackCommandScenario(t, scenario, test.args, &stdout, &stderr)
 				if code != 0 || !strings.Contains(stdout.String(), "city-b-only") || stderr.Len() != 0 {
 					t.Fatalf("scope after group help used wrong tree: code=%d stdout=%q stderr=%q", code, stdout.String(), stderr.String())
 				}
@@ -551,8 +544,6 @@ func TestE1ScopeAfterGroupHelpUsesSelectedTree(t *testing.T) {
 func TestE1LoneDashIsTransparentToEagerLazyDiscovery(t *testing.T) {
 	t.Setenv("OTEL_SDK_DISABLED", "true")
 	cityA, cityB, targetRig := setupE1PreLeafHelpFixture(t)
-	oldArgs := os.Args
-	t.Cleanup(func() { os.Args = oldArgs })
 	oldWD, err := os.Getwd()
 	if err != nil {
 		t.Fatal(err)
@@ -599,14 +590,9 @@ func TestE1LoneDashIsTransparentToEagerLazyDiscovery(t *testing.T) {
 		t.Run(test.name, func(t *testing.T) {
 			results := make(map[string]packCommandProcessResult, 2)
 			for _, scenario := range []string{"eager", "lazy"} {
-				if scenario == "eager" {
-					os.Args = []string{"gc"}
-				} else {
-					os.Args = []string{"gc", "git-credential", "get"}
-				}
 				var stdout, stderr bytes.Buffer
 				results[scenario] = packCommandProcessResult{
-					exitCode: run(test.args, &stdout, &stderr),
+					exitCode: runPackCommandScenario(t, scenario, test.args, &stdout, &stderr),
 					stdout:   stdout.String(),
 					stderr:   stderr.String(),
 				}
@@ -646,8 +632,6 @@ func TestE1GlobalJSONControlDoesNotBlockScopedPackResolution(t *testing.T) {
 		}
 	}
 
-	oldArgs := os.Args
-	t.Cleanup(func() { os.Args = oldArgs })
 	oldWD, err := os.Getwd()
 	if err != nil {
 		t.Fatal(err)
@@ -688,14 +672,9 @@ func TestE1GlobalJSONControlDoesNotBlockScopedPackResolution(t *testing.T) {
 		t.Run(test.name, func(t *testing.T) {
 			results := make(map[string]packCommandProcessResult, 2)
 			for _, scenario := range []string{"eager", "lazy"} {
-				if scenario == "eager" {
-					os.Args = []string{"gc"}
-				} else {
-					os.Args = []string{"gc", "git-credential", "get"}
-				}
 				var stdout, stderr bytes.Buffer
 				results[scenario] = packCommandProcessResult{
-					exitCode: run(test.args, &stdout, &stderr),
+					exitCode: runPackCommandScenario(t, scenario, test.args, &stdout, &stderr),
 					stdout:   stdout.String(),
 					stderr:   stderr.String(),
 				}
@@ -767,8 +746,6 @@ func TestE1BooleanHelpValueAfterGroupUsesSelectedTree(t *testing.T) {
 		{name: "rig invalid short", args: []string{"backstage", "repo", "-h=maybe", "--rig=" + targetRig}},
 	}
 
-	oldArgs := os.Args
-	t.Cleanup(func() { os.Args = oldArgs })
 	oldWD, err := os.Getwd()
 	if err != nil {
 		t.Fatal(err)
@@ -778,11 +755,9 @@ func TestE1BooleanHelpValueAfterGroupUsesSelectedTree(t *testing.T) {
 	for _, lazy := range []bool{false, true} {
 		scenario := "eager"
 		cwd := cityA
-		os.Args = []string{"gc"}
 		if lazy {
 			scenario = "lazy"
 			cwd = t.TempDir()
-			os.Args = []string{"gc", "git-credential", "get"}
 		}
 		if err := os.Chdir(cwd); err != nil {
 			t.Fatal(err)
@@ -791,7 +766,7 @@ func TestE1BooleanHelpValueAfterGroupUsesSelectedTree(t *testing.T) {
 		for _, test := range valid {
 			t.Run(scenario+"/valid/"+test.name, func(t *testing.T) {
 				var stdout, stderr bytes.Buffer
-				code := run(test.args, &stdout, &stderr)
+				code := runPackCommandScenario(t, scenario, test.args, &stdout, &stderr)
 				if code != 0 || !strings.Contains(stdout.String(), "city-b-only") || stderr.Len() != 0 {
 					t.Fatalf("boolean help value used wrong scope: code=%d stdout=%q stderr=%q", code, stdout.String(), stderr.String())
 				}
@@ -800,7 +775,7 @@ func TestE1BooleanHelpValueAfterGroupUsesSelectedTree(t *testing.T) {
 		for _, test := range invalid {
 			t.Run(scenario+"/invalid/"+test.name, func(t *testing.T) {
 				var stdout, stderr bytes.Buffer
-				code := run(test.args, &stdout, &stderr)
+				code := runPackCommandScenario(t, scenario, test.args, &stdout, &stderr)
 				if code == 0 || strings.Contains(stdout.String(), "city-b-only") || strings.Contains(stdout.String(), "pack-before-exit") {
 					t.Fatalf("invalid boolean help value did not preserve Cobra error behavior: code=%d stdout=%q stderr=%q", code, stdout.String(), stderr.String())
 				}
@@ -1015,9 +990,6 @@ func TestE1LazyInheritedCityMaterializesGroupHelpAndSchema(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	oldArgs := os.Args
-	os.Args = []string{"gc", "git-credential", "get"}
-	t.Cleanup(func() { os.Args = oldArgs })
 	oldWD, err := os.Getwd()
 	if err != nil {
 		t.Fatal(err)
@@ -1029,14 +1001,16 @@ func TestE1LazyInheritedCityMaterializesGroupHelpAndSchema(t *testing.T) {
 
 	t.Run("group help", func(t *testing.T) {
 		var stdout, stderr bytes.Buffer
-		code := run([]string{"backstage", "--city", city, "--help"}, &stdout, &stderr)
+		args := []string{"backstage", "--city", city, "--help"}
+		code := runPackCommandScenario(t, "lazy", args, &stdout, &stderr)
 		if code != 0 || !strings.Contains(stdout.String(), "city-b-only") || stderr.Len() != 0 {
 			t.Fatalf("lazy scoped group help did not use selected pack tree: code=%d stdout=%q stderr=%q", code, stdout.String(), stderr.String())
 		}
 	})
 	t.Run("schema", func(t *testing.T) {
 		var stdout, stderr bytes.Buffer
-		code := run([]string{"backstage", "--city", city, "--json-schema", "result", "hello"}, &stdout, &stderr)
+		args := []string{"backstage", "--city", city, "--json-schema", "result", "hello"}
+		code := runPackCommandScenario(t, "lazy", args, &stdout, &stderr)
 		if code != 0 || !strings.Contains(stdout.String(), `"const":"lazy-city"`) || stderr.Len() != 0 {
 			t.Fatalf("lazy scoped schema did not use selected pack tree: code=%d stdout=%q stderr=%q", code, stdout.String(), stderr.String())
 		}
@@ -1084,9 +1058,6 @@ func TestE1LazyInheritedScopeCoversGroupsAndAllSchemaRoles(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	oldArgs := os.Args
-	os.Args = []string{"gc", "git-credential", "get"}
-	t.Cleanup(func() { os.Args = oldArgs })
 	oldWD, err := os.Getwd()
 	if err != nil {
 		t.Fatal(err)
@@ -1109,7 +1080,7 @@ func TestE1LazyInheritedScopeCoversGroupsAndAllSchemaRoles(t *testing.T) {
 	for _, test := range helpTests {
 		t.Run("help "+test.name, func(t *testing.T) {
 			var stdout, stderr bytes.Buffer
-			code := run(test.args, &stdout, &stderr)
+			code := runPackCommandScenario(t, "lazy", test.args, &stdout, &stderr)
 			if code != 0 || !strings.Contains(stdout.String(), test.want) || stderr.Len() != 0 {
 				t.Fatalf("lazy scoped group help used wrong tree: code=%d stdout=%q stderr=%q", code, stdout.String(), stderr.String())
 			}
@@ -1131,7 +1102,7 @@ func TestE1LazyInheritedScopeCoversGroupsAndAllSchemaRoles(t *testing.T) {
 	for _, test := range schemaTests {
 		t.Run("schema "+test.name, func(t *testing.T) {
 			var stdout, stderr bytes.Buffer
-			code := run(test.args, &stdout, &stderr)
+			code := runPackCommandScenario(t, "lazy", test.args, &stdout, &stderr)
 			if code != 0 || !strings.Contains(stdout.String(), test.want) || stderr.Len() != 0 {
 				t.Fatalf("lazy scoped schema used wrong tree: code=%d stdout=%q stderr=%q", code, stdout.String(), stderr.String())
 			}
@@ -1390,9 +1361,6 @@ func TestE1LazyMissingTreeMatchesEagerFlagOwnership(t *testing.T) {
 		t.Fatal(err)
 	}
 	t.Cleanup(func() { _ = os.Chdir(oldWD) })
-	oldArgs := os.Args
-	t.Cleanup(func() { os.Args = oldArgs })
-
 	tests := []struct {
 		name string
 		args []string
@@ -1449,14 +1417,9 @@ func TestE1LazyMissingTreeMatchesEagerFlagOwnership(t *testing.T) {
 		t.Run(test.name, func(t *testing.T) {
 			results := make(map[string]packCommandProcessResult, 2)
 			for _, scenario := range []string{"eager", "lazy"} {
-				if scenario == "eager" {
-					os.Args = []string{"gc"}
-				} else {
-					os.Args = []string{"gc", "git-credential", "get"}
-				}
 				var stdout, stderr bytes.Buffer
 				results[scenario] = packCommandProcessResult{
-					exitCode: run(test.args, &stdout, &stderr),
+					exitCode: runPackCommandScenario(t, scenario, test.args, &stdout, &stderr),
 					stdout:   stdout.String(),
 					stderr:   stderr.String(),
 				}
@@ -1476,8 +1439,6 @@ func TestE1LazyMissingTreeMatchesEagerFlagOwnership(t *testing.T) {
 func TestE1EagerLazyControlDifferentialMatrix(t *testing.T) {
 	t.Setenv("OTEL_SDK_DISABLED", "true")
 	cityA, cityB, targetRig := setupE1PreLeafHelpFixture(t)
-	oldArgs := os.Args
-	t.Cleanup(func() { os.Args = oldArgs })
 	oldWD, err := os.Getwd()
 	if err != nil {
 		t.Fatal(err)
@@ -1518,14 +1479,9 @@ func TestE1EagerLazyControlDifferentialMatrix(t *testing.T) {
 		t.Run(test.name, func(t *testing.T) {
 			results := make(map[string]packCommandProcessResult, 2)
 			for _, scenario := range []string{"eager", "lazy"} {
-				if scenario == "eager" {
-					os.Args = []string{"gc"}
-				} else {
-					os.Args = []string{"gc", "git-credential", "get"}
-				}
 				var stdout, stderr bytes.Buffer
 				results[scenario] = packCommandProcessResult{
-					exitCode: run(test.args, &stdout, &stderr),
+					exitCode: runPackCommandScenario(t, scenario, test.args, &stdout, &stderr),
 					stdout:   stdout.String(),
 					stderr:   stderr.String(),
 				}
@@ -1550,9 +1506,6 @@ func TestE1EagerLazyControlDifferentialMatrix(t *testing.T) {
 func TestE1LazyExplicitScopeBeforeLeafWinsOutsideAmbientCity(t *testing.T) {
 	t.Setenv("OTEL_SDK_DISABLED", "true")
 	cityA, cityB, targetRig := setupE1PreLeafHelpFixture(t)
-	oldArgs := os.Args
-	os.Args = []string{"gc", "git-credential", "get"}
-	t.Cleanup(func() { os.Args = oldArgs })
 	oldWD, err := os.Getwd()
 	if err != nil {
 		t.Fatal(err)
@@ -1600,7 +1553,7 @@ func TestE1LazyExplicitScopeBeforeLeafWinsOutsideAmbientCity(t *testing.T) {
 	} {
 		t.Run(test.name, func(t *testing.T) {
 			var stdout, stderr bytes.Buffer
-			code := run(test.args, &stdout, &stderr)
+			code := runPackCommandScenario(t, "lazy", test.args, &stdout, &stderr)
 			if code != 0 || stdout.String() != test.want || stderr.Len() != 0 {
 				t.Fatalf("explicit pre-leaf scope lost outside ambient city: code=%d stdout=%q stderr=%q want=%q", code, stdout.String(), stderr.String(), test.want)
 			}
@@ -1623,20 +1576,12 @@ func TestE1ScopeTopologyCycleFailsClosed(t *testing.T) {
 		t.Fatal(err)
 	}
 	t.Cleanup(func() { _ = os.Chdir(oldWD) })
-	oldArgs := os.Args
-	t.Cleanup(func() { os.Args = oldArgs })
-
 	args := []string{"backstage", "--city", cityB, "pivot", "--city", cityA, "hello", "payload"}
 	results := make(map[string]packCommandProcessResult, 2)
 	for _, scenario := range []string{"eager", "lazy"} {
-		if scenario == "eager" {
-			os.Args = []string{"gc"}
-		} else {
-			os.Args = []string{"gc", "git-credential", "get"}
-		}
 		var stdout, stderr bytes.Buffer
 		results[scenario] = packCommandProcessResult{
-			exitCode: run(args, &stdout, &stderr),
+			exitCode: runPackCommandScenario(t, scenario, args, &stdout, &stderr),
 			stdout:   stdout.String(),
 			stderr:   stderr.String(),
 		}

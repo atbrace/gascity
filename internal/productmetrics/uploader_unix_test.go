@@ -725,6 +725,64 @@ func TestUploaderSignedPausePersistsBarrierAndCompletesBoundedLocalCleanup(t *te
 	}
 }
 
+func TestSignedPauseDiagnosticWritePrecedesCleanupSuccessor(t *testing.T) {
+	home, service, permit := newRecordServiceFixture(t, testEventIDThree)
+	defer func() { _ = permit.Close() }()
+	root := mustOpenMutableRoot(t, home)
+	event := testSpoolEvent(testEventIDOne, permit.releaseVersion, testRecordHour, CommandHelp)
+	data := writeSpoolEventFixture(t, root, queueDirectoryName, testSpoolGeneration, event)
+	if err := persistSpoolQuota(root, spoolQuota{Events: 1, Bytes: uint64(len(data))}); err != nil {
+		t.Fatal(err)
+	}
+	if err := root.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	pauseReceived := false
+	var pauseWrites []string
+	service.deps.storageHooks.beforeMutation = func(step storageStep, path string) {
+		if !pauseReceived || step != storageStepRename {
+			return
+		}
+		switch name := filepath.Base(path); name {
+		case configFileName, statusFileName:
+			pauseWrites = append(pauseWrites, name)
+		}
+	}
+	result, err := service.uploadOneBatch(context.Background(), uploaderDependencies{
+		now: func() time.Time { return testRecordHour },
+		start: immediateUploadStart(func(_ context.Context, prepared preparedUploadBatch, epoch uint64) (uploadResponse, error) {
+			pauseReceived = true
+			return uploadResponse{kind: uploadResponsePause, statusCode: 410, pause: verifiedPause{
+				releaseVersion: prepared.releaseVersion,
+				metricsEpoch:   epoch,
+				keyID:          "test-key",
+			}}, nil
+		}),
+	})
+	if err != nil || result.outcome != uploadRunPaused {
+		t.Fatalf("signed pause = %+v err=%v", result, err)
+	}
+	paused := readStateFixture(t, home)
+	if paused.CleanupKind != cleanupNone || paused.PausedThroughMetricsEpoch != permit.metricsEpoch || paused.SpoolGeneration != "" {
+		t.Fatalf("signed-pause successor = %#v", paused)
+	}
+	statusIndex, successorIndex := -1, -1
+	for index, name := range pauseWrites {
+		switch name {
+		case statusFileName:
+			if statusIndex < 0 {
+				statusIndex = index
+			}
+		case configFileName:
+			successorIndex = index
+		}
+	}
+	if statusIndex < 0 || successorIndex < 0 || statusIndex >= successorIndex {
+		t.Fatalf("post-barrier writes = %v; diagnostic status must precede the clean pause successor", pauseWrites)
+	}
+}
+
 func TestUploaderSignedPauseBudgetExhaustionReplaysLocallyWithoutNetwork(t *testing.T) {
 	home, service, permit := newRecordServiceFixture(t, testEventIDThree)
 	root := mustOpenMutableRoot(t, home)

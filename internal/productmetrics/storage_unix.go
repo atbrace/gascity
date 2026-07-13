@@ -974,7 +974,7 @@ func (directory *unixStorageDirectory) readFileLeaseWithHooks(name string, maxim
 		requireCleanupSameDevice(parentMetadata, preOpen),
 		validatePrivateRegularFile(preOpen, path, directory.euid, false),
 	); err != nil {
-		return nil, nil, storageMetadata{}, err
+		return nil, nil, storageMetadata{}, errors.Join(errStorageUnsafeRecordShape, err)
 	}
 	fileFD, err := openFileAtGated(directoryFD, name, unixFileReadFlags, 0, hooks)
 	if err != nil {

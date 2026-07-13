@@ -24,6 +24,7 @@ var (
 	errStorageExchangeUnsupported = errors.New("productmetrics: atomic directory exchange is unsupported")
 	errStorageClosed              = errors.New("productmetrics: storage handle is closed")
 	errStorageReadLimit           = errors.New("productmetrics: storage read limit exceeded")
+	errStorageUnsafeRecordShape   = errors.New("productmetrics: storage record has an unsafe filesystem shape")
 )
 
 const (

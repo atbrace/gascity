@@ -38,19 +38,34 @@ func runProductMetricsTaggedChild(ctx context.Context, invocation productmetrics
 }
 
 func runProductMetricsTesthookChild(ctx context.Context, invocation productmetrics.PrivateUploaderInvocation) error {
-	endpoint := os.Getenv(taggedProductMetricsEndpointEnvironment)
-	if err := validateProductMetricsTesthookEndpoint(endpoint); err != nil {
-		return err
-	}
-	certificatePEM, err := readProductMetricsTesthookCA(os.Getenv(taggedProductMetricsCAFileEnvironment))
+	service, err := openProductMetricsTesthookService()
 	if err != nil {
 		return err
 	}
+	return service.RunPrivateUploader(ctx, invocation)
+}
+
+func configuredProductMetricsControlService() (*productmetrics.Service, error) {
+	if os.Getenv(taggedProductMetricsEndpointEnvironment) == "" {
+		return openProductionProductMetricsService()
+	}
+	return openProductMetricsTesthookService()
+}
+
+func openProductMetricsTesthookService() (*productmetrics.Service, error) {
+	endpoint := os.Getenv(taggedProductMetricsEndpointEnvironment)
+	if err := validateProductMetricsTesthookEndpoint(endpoint); err != nil {
+		return nil, err
+	}
+	certificatePEM, err := readProductMetricsTesthookCA(os.Getenv(taggedProductMetricsCAFileEnvironment))
+	if err != nil {
+		return nil, err
+	}
 	roots := x509.NewCertPool()
 	if !roots.AppendCertsFromPEM(certificatePEM) {
-		return errors.New("product metrics testhook CA file has no certificate")
+		return nil, errors.New("product metrics testhook CA file has no certificate")
 	}
-	service, err := productmetrics.OpenTesthook(productmetrics.TesthookOptions{
+	return productmetrics.OpenTesthook(productmetrics.TesthookOptions{
 		Home:           gchome.ResolveReadOnly(),
 		ReleaseVersion: taggedProductMetricsReleaseVersion,
 		MetricsEpoch:   1,
@@ -62,10 +77,6 @@ func runProductMetricsTesthookChild(ctx context.Context, invocation productmetri
 			RootCAs:    roots,
 		}}},
 	})
-	if err != nil {
-		return err
-	}
-	return service.RunPrivateUploader(ctx, invocation)
 }
 
 func validateProductMetricsTesthookEndpoint(raw string) error {

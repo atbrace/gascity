@@ -10,7 +10,10 @@ import (
 	"github.com/BurntSushi/toml"
 )
 
-var errRecordDecisionWindowExpired = errors.New("productmetrics: foreground record decision window expired")
+var (
+	errRecordDecisionWindowExpired = errors.New("productmetrics: foreground record decision window expired")
+	errSpoolQuotaFull              = errors.New("productmetrics: root-global spool quota is full")
+)
 
 const (
 	quotaFileName                = "quota.toml"
@@ -195,7 +198,7 @@ func (quota spoolQuota) reserve(eventBytes uint64) (spoolQuota, error) {
 		return spoolQuota{}, fmt.Errorf("productmetrics: event size %d is outside the spool limit", eventBytes)
 	}
 	if quota.Events >= maximumSpoolEvents || quota.Bytes > maximumSpoolBytes-eventBytes {
-		return spoolQuota{}, errors.New("productmetrics: root-global spool quota is full")
+		return spoolQuota{}, errSpoolQuotaFull
 	}
 	events, ok := checkedAddUint64(quota.Events, 1)
 	if !ok {

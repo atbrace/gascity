@@ -132,6 +132,13 @@ var rigFlag string
 // run executes the gc CLI with the given args, writing output to stdout and
 // errors to stderr. Returns the exit code.
 func run(args []string, stdout, stderr io.Writer) int {
+	return runWithRootCommandOptions(args, stdout, stderr, rootCommandOptionsForArgs(args))
+}
+
+// runWithRootCommandOptions preserves an explicit eager/lazy construction
+// seam for package tests while production always derives options from its
+// injected args. It must never fill options from ambient os.Args.
+func runWithRootCommandOptions(args []string, stdout, stderr io.Writer, options rootCommandOptions) int {
 	prevCityFlag, prevRigFlag := cityFlag, rigFlag
 	prevContextFlag, prevCityURLFlag, prevCityNameFlag := contextFlag, cityURLFlag, cityNameFlag
 	cityFlag, rigFlag = "", ""
@@ -159,14 +166,17 @@ func run(args []string, stdout, stderr io.Writer) int {
 	execStdout := &switchableWriter{target: stdout}
 	var jsonStdout bytes.Buffer
 	var observedStdout *countingWriter
-	root := newRootCmd(execStdout, stderr)
 	if args == nil {
 		args = []string{}
 	}
+	options.invocationArgs = append([]string(nil), args...)
+	root := newRootCmdWithOptions(execStdout, stderr, options)
 	root.SetArgs(args)
 	root.SetOut(execStdout)
 	root.SetErr(stderr)
-	materializePackCommandTreeForArgs(root, args, execStdout, stderr)
+	if options.discoverPackCommands {
+		materializePackCommandTreeForArgs(root, args, execStdout, stderr)
+	}
 	bufferJSONExecution := shouldBufferJSONExecution(root, args)
 	reportJSONFailure := shouldReportJSONExecutionError(root, args)
 	if bufferJSONExecution {
@@ -217,6 +227,15 @@ func commandFailureMessage(err error) string {
 
 // newRootCmd creates the root cobra command with all subcommands.
 func newRootCmd(stdout, stderr io.Writer) *cobra.Command {
+	return newRootCmdWithOptions(stdout, stderr, rootCommandOptions{
+		discoverPackCommands:      true,
+		eagerPackCommandDiscovery: true,
+	})
+}
+
+// newRootCmdWithOptions constructs the built-in command tree and optionally
+// performs city/pack discovery selected from injected invocation arguments.
+func newRootCmdWithOptions(stdout, stderr io.Writer, options rootCommandOptions) *cobra.Command {
 	root := &cobra.Command{
 		Use:           "gc",
 		Short:         "Gas City CLI — orchestration-builder for multi-agent workflows",
@@ -300,6 +319,7 @@ func newRootCmd(stdout, stderr io.Writer) *cobra.Command {
 		newSkillCmd(stdout, stderr),
 		newMcpCmd(stdout, stderr),
 		newInternalCmd(stdout, stderr),
+		newMetricsCmd(stdout, stderr),
 		newPerfCmd(stdout, stderr),
 		newVersionCmd(stdout, stderr),
 		newDashboardCmd(stdout, stderr),
@@ -331,7 +351,9 @@ func newRootCmd(stdout, stderr io.Writer) *cobra.Command {
 	root.AddCommand(newGenDocCmd(stdout, stderr, root))
 
 	// Best-effort: discover pack CLI commands if we're inside a city.
-	registerPackCommands(root, stdout, stderr)
+	if options.discoverPackCommands && options.eagerPackCommandDiscovery {
+		registerPackCommands(root, options.invocationArgs, stdout, stderr)
+	}
 
 	installArgUsageErrors(root, stderr)
 	installFlagGroupUsageErrors(root, stderr)

@@ -133,16 +133,30 @@ func (permit RecordingPermit) Close() error {
 
 // Status is a bounded, redacted, read-only projection of local consent state.
 type Status struct {
-	State                  EffectiveState
-	Reason                 StateReason
-	ConfigPath             string
-	ConfigPresent          bool
-	StateSchema            uint64
-	RequiredNoticeVersion  uint64
-	AcceptedNoticeVersion  uint64
-	InstallationIDPresent  bool
-	SpoolGenerationPresent bool
-	CleanupPending         bool
+	State                      EffectiveState
+	Reason                     StateReason
+	HomeStable                 bool
+	HomeReason                 StateReason
+	ConfigPath                 string
+	ConfigPresent              bool
+	StateSchema                uint64
+	RequiredNoticeVersion      uint64
+	AcceptedNoticeVersion      uint64
+	InstallationIDPresent      bool
+	SpoolGenerationPresent     bool
+	CleanupPending             bool
+	QueueEvents                uint64
+	QueueBytes                 uint64
+	QueueDiagnosticsAvailable  bool
+	OldestQueuedEventAge       time.Duration
+	OldestQueuedEventPresent   bool
+	DroppedEvents              uint64
+	LastUploadAttemptHourUTC   string
+	LastUploadSuccessHourUTC   string
+	LastErrorClass             DiagnosticErrorClass
+	StatusDiagnosticsAvailable bool
+	SpawnThrottleAge           time.Duration
+	SpawnThrottlePresent       bool
 }
 
 // ErrStateChangedConcurrently identifies a lost state-generation or cleanup
@@ -155,6 +169,8 @@ type serviceRelease struct {
 	platformSupported  bool
 	official           bool
 	endpointConfigured bool
+	endpointHostname   string
+	privacyURL         string
 	rollout            RolloutMode
 	releaseVersion     string
 	metricsEpoch       uint64
@@ -409,6 +425,8 @@ func productionServiceRelease(identity ReleaseIdentity) serviceRelease {
 		platformSupported:  runtime.GOOS == "linux" || runtime.GOOS == "darwin",
 		official:           identity.BuildKind() != BuildDevelopment && identity.BuildKind().String() != "unknown",
 		endpointConfigured: identity.Endpoint() != "",
+		endpointHostname:   endpointHostnameForPolicy(identity.Endpoint()),
+		privacyURL:         identity.PrivacyURL(),
 		rollout:            identity.Rollout(),
 		releaseVersion:     identity.ReleaseVersion(),
 		metricsEpoch:       identity.MetricsEpoch(),
@@ -428,16 +446,33 @@ func randomUUIDv4(reader io.Reader) (string, error) {
 func (service *Service) Status(_ context.Context) Status {
 	loaded := service.readStateReadOnly()
 	defer func() { _ = loaded.Close() }()
+	diagnostics := service.readDiagnosticsReadOnly()
 	invocation := InvocationContext{
 		DoNotTrack:          service.deps.getenv(envDoNotTrack),
 		DisableUsageMetrics: service.deps.getenv(envDisableUsageMetrics),
 	}
 	projection := service.project(invocation, loaded)
 	status := Status{
-		State:         projection.state,
-		Reason:        projection.reason,
-		ConfigPath:    service.configPath(),
-		ConfigPresent: loaded.present,
+		State:                      projection.state,
+		Reason:                     projection.reason,
+		HomeStable:                 service.deps.homeErr == nil,
+		ConfigPath:                 service.configPath(),
+		ConfigPresent:              loaded.present,
+		QueueEvents:                diagnostics.queueEvents,
+		QueueBytes:                 diagnostics.queueBytes,
+		QueueDiagnosticsAvailable:  diagnostics.queueAvailable,
+		OldestQueuedEventAge:       nonnegativeAge(service.deps.now(), diagnostics.oldestQueuedAt),
+		OldestQueuedEventPresent:   diagnostics.oldestQueuedPresent,
+		DroppedEvents:              diagnostics.status.droppedEvents,
+		LastUploadAttemptHourUTC:   diagnostics.status.lastUploadAttemptHourUTC,
+		LastUploadSuccessHourUTC:   diagnostics.status.lastUploadSuccessHourUTC,
+		LastErrorClass:             diagnostics.status.lastErrorClass,
+		StatusDiagnosticsAvailable: diagnostics.statusAvailable,
+		SpawnThrottleAge:           nonnegativeAge(service.deps.now(), diagnostics.spawnThrottleAttemptedAt),
+		SpawnThrottlePresent:       diagnostics.spawnThrottlePresent,
+	}
+	if service.deps.homeErr != nil {
+		status.HomeReason = service.deps.homeReason
 	}
 	if loaded.err == nil && loaded.present {
 		state := loaded.state

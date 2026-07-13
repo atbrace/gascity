@@ -2593,7 +2593,7 @@ func TestPurgeSpoolTreatsFutureControlFilesAsUnrecognizedResidue(t *testing.T) {
 
 func TestPurgeSpoolPreservesFutureControlResidueShapesWithoutDescent(t *testing.T) {
 	for _, name := range []string{"status.toml"} {
-		for _, shape := range []string{"regular", "symlink", "cross-device"} {
+		for _, shape := range []string{"hardlink", "symlink", "cross-device"} {
 			t.Run(name+"/"+shape, func(t *testing.T) {
 				home := newMetricsTestHome(t)
 				writeStateFixture(t, home, disabledState(7, 2, cleanupDisable))
@@ -2606,12 +2606,16 @@ func TestPurgeSpoolPreservesFutureControlResidueShapesWithoutDescent(t *testing.
 				}
 				path := filepath.Join(home.Root(), name)
 				want := "future owner residue"
-				if shape == "symlink" {
+				if shape == "symlink" || shape == "hardlink" {
 					target := filepath.Join(t.TempDir(), "sentinel")
 					if err := os.WriteFile(target, []byte(want), 0o600); err != nil {
 						t.Fatal(err)
 					}
-					if err := os.Symlink(target, path); err != nil {
+					if shape == "symlink" {
+						if err := os.Symlink(target, path); err != nil {
+							t.Fatal(err)
+						}
+					} else if err := os.Link(target, path); err != nil {
 						t.Fatal(err)
 					}
 				} else if err := os.WriteFile(path, []byte(want), 0o600); err != nil {
@@ -10681,8 +10685,16 @@ func TestDirectoryOpenExpiryStopsSafeValidationAndRecoverySync(t *testing.T) {
 }
 
 func TestFixedControlReadEnvelopeIncludesLimitProbeAndInventoriesCallsites(t *testing.T) {
+	wantEntryEnvelope := uint64(9*maximumStorageTempAttempts + 32*maximumRelocationSlots + 64 + 1 + 2 + 2)
+	if spoolFixedEntryEnvelope != wantEntryEnvelope ||
+		spoolFixedNameEnvelope != wantEntryEnvelope*maximumStorageNameBytes {
+		t.Fatalf("fixed entry/name envelopes = %d/%d, want %d/%d including journal sentinel, spawn throttle, and diagnostic status",
+			spoolFixedEntryEnvelope, spoolFixedNameEnvelope,
+			wantEntryEnvelope, wantEntryEnvelope*maximumStorageNameBytes)
+	}
 	wantReadEnvelope := uint64(3*maximumQuotaBytes+4*maximumRelocationBytes+4) +
-		3*maximumStorageTempAttempts*rootTempJournalMarkerReadLimit + maximumSpawnThrottleBytes + 1
+		3*maximumStorageTempAttempts*rootTempJournalMarkerReadLimit +
+		maximumSpawnThrottleBytes + maximumDiagnosticStatusBytes + 2
 	if spoolFixedReadEnvelope != wantReadEnvelope {
 		t.Fatalf("fixed read envelope = %d, want %d including marker and control limit probes", spoolFixedReadEnvelope, wantReadEnvelope)
 	}
@@ -10717,17 +10729,19 @@ func TestFixedControlReadEnvelopeIncludesLimitProbeAndInventoriesCallsites(t *te
 		identifier, ok := binary.X.(*ast.Ident)
 		literal, literalOK := binary.Y.(*ast.BasicLit)
 		if ok && literalOK && literal.Value == "1" &&
-			(identifier.Name == "maximumQuotaBytes" || identifier.Name == "maximumRelocationBytes") {
+			(identifier.Name == "maximumQuotaBytes" || identifier.Name == "maximumRelocationBytes" ||
+				identifier.Name == "maximumDiagnosticStatusBytes") {
 			limitReads[identifier.Name]++
 		}
 		return true
 	})
 	wantCalls := map[string]int{
-		"chargeFixedEntry": 26, "chargeFixedRead": 10, "chargeFixedDirectory": 7, "chargeFixedTraversalDirectory": 2,
+		"chargeFixedEntry": 28, "chargeFixedRead": 11, "chargeFixedDirectory": 7, "chargeFixedTraversalDirectory": 2,
 		"availableFixedSlots": 2, "claimFixedWorkEnvelope": 5,
 	}
-	if fmt.Sprint(calls) != fmt.Sprint(wantCalls) || limitReads["maximumQuotaBytes"] != 2 || limitReads["maximumRelocationBytes"] != 2 {
-		t.Fatalf("fixed work callsite inventory = calls:%v limitReads:%v, want calls:%v quota probes:2 relocation probes:2",
+	if fmt.Sprint(calls) != fmt.Sprint(wantCalls) || limitReads["maximumQuotaBytes"] != 2 ||
+		limitReads["maximumRelocationBytes"] != 2 || limitReads["maximumDiagnosticStatusBytes"] != 1 {
+		t.Fatalf("fixed work callsite inventory = calls:%v limitReads:%v, want calls:%v quota probes:2 relocation probes:2 status probes:1",
 			calls, limitReads, wantCalls)
 	}
 }

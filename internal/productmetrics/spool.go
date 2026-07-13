@@ -44,16 +44,20 @@ const (
 	// marker inspect/revalidation/unlink. Reserve nine per possible attempt so
 	// one additional operation cannot silently escape the shared cap, plus
 	// 32 per relocation candidate and 64 for control/quota/cursor bookkeeping.
-	// Spawn-throttle cleanup spends two additional exact-name operations: one
-	// bounded identity-leased read and one identity-bound unlink.
-	spoolFixedEntryEnvelope = uint64(9*maximumStorageTempAttempts + 32*maximumRelocationSlots + 64 + 1 + 2)
+	// The root-temp journal proof reserves one enumeration sentinel entry.
+	// Spawn-throttle and diagnostic-status cleanup each spend two additional
+	// exact-name operations: one bounded identity-leased read and one
+	// identity-bound unlink.
+	spoolFixedEntryEnvelope = uint64(9*maximumStorageTempAttempts + 32*maximumRelocationSlots + 64 + 1 + 2 + 2)
 	spoolFixedNameEnvelope  = spoolFixedEntryEnvelope * maximumStorageNameBytes
 	// The relocation envelope covers quota read + conflict replay + quota
 	// stage, followed by the control and root-fallback cursor read/stage pairs.
 	// Writes share the same byte dimension as reads so neither direction can
-	// escape the cap.
+	// escape the cap. The final terms cover bounded spawn-throttle and
+	// diagnostic-status reads, including their one-byte limit probes.
 	spoolFixedReadEnvelope = uint64(3*maximumQuotaBytes+4*maximumRelocationBytes+4) +
-		3*maximumStorageTempAttempts*rootTempJournalMarkerReadLimit + maximumSpawnThrottleBytes + 1
+		3*maximumStorageTempAttempts*rootTempJournalMarkerReadLimit +
+		maximumSpawnThrottleBytes + maximumDiagnosticStatusBytes + 2
 
 	defaultRecordDecisionBudget = 50 * time.Millisecond
 	canonicalHourLayout         = "2006-01-02T15:04:05Z"
@@ -96,6 +100,8 @@ const (
 	recordOperationQueueOpen          recordOperation = "queue-open"
 	recordOperationGenerationOpen     recordOperation = "generation-open"
 	recordOperationEventWrite         recordOperation = "event-write"
+	recordOperationStatusRead         recordOperation = "status-read"
+	recordOperationStatusWrite        recordOperation = "status-write"
 	recordOperationSpawnThrottleRead  recordOperation = "spawn-throttle-read"
 	recordOperationSpawnToken         recordOperation = "spawn-token"
 	recordOperationSpawnThrottleWrite recordOperation = "spawn-throttle-write"
@@ -224,9 +230,6 @@ func (service *Service) RecordOnce(permit RecordingPermit, commandID CommandID) 
 		service.project(InvocationContext{}, loaded).state != StateEnabled {
 		return RecordDropped
 	}
-	if _, ok := window.remaining(); !ok {
-		return RecordDropped
-	}
 	canStart := func(operation recordOperation) bool {
 		if service.deps.beforeRecordOperation != nil {
 			service.deps.beforeRecordOperation(operation)
@@ -234,43 +237,64 @@ func (service *Service) RecordOnce(permit RecordingPermit, commandID CommandID) 
 		_, ok := window.remaining()
 		return ok
 	}
-	quota, present, err := loadForegroundSpoolQuota(root, canStart)
-	if err != nil {
-		return RecordDropped
-	}
-	reserved, err := quota.reserve(uint64(len(encoded)))
-	if err != nil {
+	diagnosticStorageSafe := false
+	authorizedDrop := func(class DiagnosticErrorClass) RecordResult {
+		if diagnosticStorageSafe {
+			service.bestEffortUpdateDiagnosticStatusLocked(root, diagnosticStatusUpdate{
+				incrementDroppedEvents: true,
+				lastErrorClass:         class,
+			}, canStart)
+		}
 		return RecordDropped
 	}
 	if _, ok := window.remaining(); !ok {
-		return RecordDropped
+		return authorizedDrop(DiagnosticErrorLockTimeout)
+	}
+	quota, present, err := loadForegroundSpoolQuota(root, canStart)
+	if err != nil {
+		return authorizedDrop(diagnosticClassForStorageError(err))
+	}
+	// Conservative quota markers and control/cursor residue are cleanup
+	// barriers, not ordinary capacity failures. Never create status.toml while
+	// that evidence is active: doing so can make bounded cleanup alternate
+	// forever between removing the status record and repairing the barrier.
+	diagnosticStorageSafe = quota.Events <= maximumSpoolEvents && quota.Bytes <= maximumSpoolBytes
+	reserved, err := quota.reserve(uint64(len(encoded)))
+	if err != nil {
+		return authorizedDrop(diagnosticClassForStorageError(err))
+	}
+	if _, ok := window.remaining(); !ok {
+		return authorizedDrop(DiagnosticErrorLockTimeout)
 	}
 	if err := persistForegroundSpoolQuota(root, reserved, !present, canStart); err != nil {
-		return RecordDropped
+		// Failed quota persistence may leave fail-closed control evidence. Do not
+		// add a second root mutation until reconciliation has made it safe.
+		diagnosticStorageSafe = false
+		return authorizedDrop(diagnosticClassForStorageError(err))
 	}
 	if !canStart(recordOperationQueueOpen) {
-		return RecordDropped
+		return authorizedDrop(DiagnosticErrorLockTimeout)
 	}
 	queueRoot, err := root.openDir([]string{queueDirectoryName}, true)
 	if err != nil {
-		return RecordDropped
+		return authorizedDrop(diagnosticClassForStorageError(err))
 	}
 	defer func() { _ = queueRoot.Close() }()
 	if !canStart(recordOperationGenerationOpen) {
-		return RecordDropped
+		return authorizedDrop(DiagnosticErrorLockTimeout)
 	}
 	queue, err := queueRoot.openDir([]string{permit.spoolGeneration}, true)
 	if err != nil {
-		return RecordDropped
+		return authorizedDrop(diagnosticClassForStorageError(err))
 	}
 	defer func() { _ = queue.Close() }()
 	if !canStart(recordOperationEventWrite) {
-		return RecordDropped
+		return authorizedDrop(DiagnosticErrorLockTimeout)
 	}
 	if err := queue.writeFileAtomicNoReplace(eventFileName(eventID), encoded); err != nil {
 		// The durable reservation deliberately remains. This crash/failure
 		// window can overcount but can never admit an event past the cap.
-		return RecordDropped
+		return authorizedDrop(diagnosticClassForStorageError(err))
 	}
 	spawnDependencies := service.deps.spawn
 	if spawnDependencies.executable == nil || spawnDependencies.environ == nil || spawnDependencies.start == nil {
@@ -927,6 +951,10 @@ func runSpoolSweepWithMeter(root *storageRoot, policy spoolPolicy, now time.Time
 		if state.mutated || state.operation != nil || state.meter.exhausted {
 			return state
 		}
+		state.cleanupDiagnosticStatus()
+		if state.mutated || state.operation != nil || state.meter.exhausted {
+			return state
+		}
 	}
 	for _, tree := range []string{queueDirectoryName, inflightDirectoryName} {
 		if state.meter.exhausted {
@@ -976,6 +1004,9 @@ func (state *spoolSweepState) cleanupSpawnThrottle() {
 		if errors.Is(err, fs.ErrNotExist) {
 			return
 		}
+		if errors.Is(err, errStorageUnsafeRecordShape) {
+			err = errors.Join(err, errUnrecognizedMetricsRootEntry)
+		}
 		state.operation = errors.Join(state.operation, err)
 		return
 	}
@@ -992,6 +1023,46 @@ func (state *spoolSweepState) cleanupSpawnThrottle() {
 		return
 	}
 	if err := state.root.removeFileMatchingLease(spawnThrottleFileName, lease); err != nil {
+		state.operation = errors.Join(state.operation, err)
+		return
+	}
+	state.mutated = true
+}
+
+// cleanupDiagnosticStatus removes only the exact identity-leased,
+// owner-private regular status record. Its bounded contents never grant
+// deletion authority, so corrupt and oversized records are removable while
+// unsafe filesystem shapes remain preserved and keep cleanup pending.
+func (state *spoolSweepState) cleanupDiagnosticStatus() {
+	if state == nil || state.root == nil || state.meter == nil {
+		return
+	}
+	if !state.meter.chargeFixedEntry(statusFileName) ||
+		!state.meter.chargeFixedRead(maximumDiagnosticStatusBytes+1) {
+		state.operation = errors.Join(state.operation, errors.New("productmetrics: cleanup budget cannot inspect diagnostic status"))
+		return
+	}
+	_, _, lease, err := state.root.readFileMeasured(statusFileName, maximumDiagnosticStatusBytes)
+	if lease == nil {
+		if errors.Is(err, fs.ErrNotExist) {
+			return
+		}
+		if errors.Is(err, errStorageUnsafeRecordShape) {
+			err = errors.Join(err, errUnrecognizedMetricsRootEntry)
+		}
+		state.operation = errors.Join(state.operation, err)
+		return
+	}
+	defer func() { state.operation = errors.Join(state.operation, lease.Close()) }()
+	if err != nil && !errors.Is(err, errStorageReadLimit) {
+		state.operation = errors.Join(state.operation, err)
+		return
+	}
+	if !state.meter.chargeFixedEntry(statusFileName) {
+		state.operation = errors.Join(state.operation, errors.New("productmetrics: cleanup budget cannot remove diagnostic status"))
+		return
+	}
+	if err := state.root.removeFileMatchingLease(statusFileName, lease); err != nil {
 		state.operation = errors.Join(state.operation, err)
 		return
 	}

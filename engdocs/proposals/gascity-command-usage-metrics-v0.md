@@ -445,6 +445,11 @@ Successful opt-out text should be explicit:
 | Corrupt but safely writable state | 0 after full barrier | `off` replaces it with a fresh disabled schema, purges, and reports recovery; corrupt input is never treated as enabled. |
 | Unsafe root or permission failure | nonzero | Fails closed; stderr names a bounded class and does not expose paths beyond the metrics root. |
 
+At a declared control basename such as `status.toml` or `spawn-throttle`, a
+non-authorizing filesystem shape is preserved and classified as unrecognized
+root residue for same-UID manual-cleanup guidance. Transient I/O and
+replacement failures remain retry-only.
+
 Any nonzero result after the disable linearization point explicitly says that
 collection and new uploads are already disabled; the retry is only to prove
 uploader quiescence and finish local deletion. It never tells the user that

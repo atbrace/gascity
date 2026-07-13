@@ -27,13 +27,40 @@ const (
 	PurgeFailed PurgeOutcome = "failed"
 )
 
+// PurgeIncompletePhase is the closed stage at which an opt-out attempt could
+// not finish. The zero value means no incomplete work was reported.
+type PurgeIncompletePhase string
+
+// Purge incomplete phases identify the bounded stage that did not finish.
+const (
+	PurgeIncompleteNone               PurgeIncompletePhase = ""
+	PurgeIncompleteDisableWrite       PurgeIncompletePhase = "disable-write"
+	PurgeIncompleteUploaderQuiescence PurgeIncompletePhase = "uploader-quiescence"
+	PurgeIncompleteLocalCleanup       PurgeIncompletePhase = "local-cleanup"
+	PurgeIncompleteFinalProof         PurgeIncompletePhase = "final-proof"
+)
+
+// PurgeManualCleanupReason is the closed, path-free reason that same-UID
+// manual inspection/removal is required before a later opt-out can finish.
+type PurgeManualCleanupReason string
+
+// Purge manual-cleanup reasons describe preserved local residue without paths.
+const (
+	PurgeManualCleanupNone                     PurgeManualCleanupReason = ""
+	PurgeManualCleanupUnsettledRootTempJournal PurgeManualCleanupReason = "unsettled-root-temp-journal"
+	PurgeManualCleanupUnrecognizedRootEntry    PurgeManualCleanupReason = "unrecognized-root-entry"
+)
+
 // PurgeResult contains only bounded aggregate facts about local cleanup.
 type PurgeResult struct {
-	Outcome         PurgeOutcome
-	RemovedEvents   uint64
-	RemovedBytes    uint64
-	RecoveredState  bool
-	DisabledDurable bool
+	Outcome               PurgeOutcome
+	RemovedEvents         uint64
+	RemovedBytes          uint64
+	RecoveredState        bool
+	DisabledDurable       bool
+	IncompletePhase       PurgeIncompletePhase
+	ManualCleanupRequired bool
+	ManualCleanupReason   PurgeManualCleanupReason
 }
 
 // PurgeErrorClass is a closed, path-free failure classification.
@@ -95,9 +122,16 @@ const (
 // exact local cleanup before returning a successful result.
 func (service *Service) DisableAndPurge(ctx context.Context) (result PurgeResult, returnErr error) {
 	result.Outcome = PurgeFailed
+	incompletePhase := PurgeIncompleteNone
+	defer func() {
+		if returnErr != nil {
+			markPurgeIncomplete(&result, incompletePhase, returnErr)
+		}
+	}()
 	if service == nil || ctx == nil {
 		return result, newPurgeError(PurgeErrorInvalidRequest, errors.New("productmetrics: invalid disable-and-purge request"))
 	}
+	incompletePhase = PurgeIncompleteDisableWrite
 	if service.deps.homeErr != nil {
 		return result, newPurgeError(PurgeErrorStorage, service.deps.homeErr)
 	}
@@ -153,6 +187,7 @@ func (service *Service) DisableAndPurge(ctx context.Context) (result PurgeResult
 		result.DisabledDurable = true
 		result.RecoveredState = recoveringState
 	}
+	incompletePhase = PurgeIncompleteLocalCleanup
 	if observedCloseErr != nil {
 		tokenCloseErr := token.Close()
 		result.Outcome = PurgeCleanupPending
@@ -169,6 +204,7 @@ func (service *Service) DisableAndPurge(ctx context.Context) (result PurgeResult
 		wait = defaultDisableUploaderWait
 	}
 	waitContext, cancel := context.WithTimeout(ctx, wait)
+	incompletePhase = PurgeIncompleteUploaderQuiescence
 	if service.deps.beforeDisableUploaderLock != nil {
 		service.deps.beforeDisableUploaderLock()
 	}
@@ -188,6 +224,7 @@ func (service *Service) DisableAndPurge(ctx context.Context) (result PurgeResult
 			markPurgeCloseFailure(&result, &returnErr, closeErr)
 		}
 	}()
+	incompletePhase = PurgeIncompleteLocalCleanup
 	stateContext, cancelState := context.WithTimeout(ctx, stateWait)
 	state, err := uploader.lockState(stateContext, service)
 	cancelState()
@@ -221,6 +258,7 @@ func (service *Service) DisableAndPurge(ctx context.Context) (result PurgeResult
 			return result, newPurgeError(class, errors.Join(err, peerErr))
 		}
 		peerCloseErr := peer.Close()
+		incompletePhase = PurgeIncompleteFinalProof
 		if proofErr := proveCleanMetricsTree(root, budget); proofErr != nil || peerCloseErr != nil {
 			result.Outcome = PurgeCleanupPending
 			class := PurgeErrorStorage
@@ -260,6 +298,7 @@ func (service *Service) DisableAndPurge(ctx context.Context) (result PurgeResult
 		}
 		return result, newPurgeError(PurgeErrorCleanupIncomplete, sweepErr)
 	}
+	incompletePhase = PurgeIncompleteFinalProof
 	if err := service.completeCleanupLockedWithJournalProof(state, token, sweep.meter); err != nil {
 		result.Outcome = PurgeCleanupPending
 		class := PurgeErrorCleanupIncomplete
@@ -309,6 +348,24 @@ func markPurgeCloseFailure(result *PurgeResult, returnErr *error, closeErr error
 	*returnErr = newPurgeError(PurgeErrorStorage, errors.Join(*returnErr, closeErr))
 }
 
+func markPurgeIncomplete(result *PurgeResult, phase PurgeIncompletePhase, err error) {
+	if result == nil || err == nil {
+		return
+	}
+	result.IncompletePhase = phase
+	switch {
+	case errors.Is(err, errUnsettledRootTempJournal):
+		result.ManualCleanupRequired = true
+		result.ManualCleanupReason = PurgeManualCleanupUnsettledRootTempJournal
+	case errors.Is(err, errUnrecognizedMetricsRootEntry):
+		result.ManualCleanupRequired = true
+		result.ManualCleanupReason = PurgeManualCleanupUnrecognizedRootEntry
+	default:
+		result.ManualCleanupRequired = false
+		result.ManualCleanupReason = PurgeManualCleanupNone
+	}
+}
+
 func cleanDisabledState(state persistedState) bool {
 	return state.Preference == preferenceDisabled && state.CleanupKind == cleanupNone &&
 		state.InstallationID == "" && state.SpoolGeneration == "" && state.PausedThroughMetricsEpoch == 0
@@ -356,6 +413,14 @@ func loadDurableExactStateLocked(locked *lockedState, expected persistedState) (
 }
 
 func proveCleanMetricsTree(root *storageRoot, budget spoolWorkBudget) error {
+	return proveCleanMetricsTreeWithOptions(root, budget, false)
+}
+
+func proveCleanMetricsTreeAllowDiagnosticStatus(root *storageRoot, budget spoolWorkBudget) error {
+	return proveCleanMetricsTreeWithOptions(root, budget, true)
+}
+
+func proveCleanMetricsTreeWithOptions(root *storageRoot, budget spoolWorkBudget, allowDiagnosticStatus bool) error {
 	if root == nil || root.storageDir == nil || root.backend == nil {
 		return errStorageClosed
 	}
@@ -372,6 +437,11 @@ func proveCleanMetricsTree(root *storageRoot, budget spoolWorkBudget) error {
 	defer restore()
 	if !meter.claimFixedWorkEnvelope() {
 		return ErrStateChangedConcurrently
+	}
+	if allowDiagnosticStatus {
+		if err := proveDiagnosticStatusReadOnly(root, meter); err != nil {
+			return err
+		}
 	}
 	quota, present, err := loadSpoolQuota(root)
 	if err != nil {
@@ -440,7 +510,7 @@ func proveCleanMetricsTree(root *storageRoot, budget spoolWorkBudget) error {
 		if !ok {
 			break
 		}
-		if peerCleanRootEntry(entry.name) {
+		if peerCleanRootEntry(entry.name, allowDiagnosticStatus) {
 			continue
 		}
 		return ErrStateChangedConcurrently
@@ -456,13 +526,15 @@ func proveCleanMetricsTree(root *storageRoot, budget spoolWorkBudget) error {
 	return err
 }
 
-func peerCleanRootEntry(name string) bool {
+func peerCleanRootEntry(name string, allowDiagnosticStatus bool) bool {
 	if isStorageLockName(name) {
 		return true
 	}
 	switch name {
 	case configFileName, quotaFileName, queueDirectoryName, inflightDirectoryName, rootTempJournalDirectoryName:
 		return true
+	case statusFileName:
+		return allowDiagnosticStatus
 	default:
 		return false
 	}

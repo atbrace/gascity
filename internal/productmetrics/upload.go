@@ -65,9 +65,10 @@ const (
 )
 
 type uploadResponse struct {
-	kind       uploadResponseKind
-	statusCode int
-	pause      verifiedPause
+	kind            uploadResponseKind
+	statusCode      int
+	pause           verifiedPause
+	diagnosticError DiagnosticErrorClass
 }
 
 type uploadTransport struct {
@@ -350,28 +351,39 @@ func (transport *uploadTransport) upload(ctx context.Context, prepared preparedU
 		}
 		retry.statusCode = statusCode
 		if errors.Is(err, errUploadRedirect) {
+			retry.diagnosticError = DiagnosticErrorInvalidResponse
 			return retry, errUploadRedirect
+		}
+		var networkError net.Error
+		if errors.Is(err, context.DeadlineExceeded) || errors.As(err, &networkError) && networkError.Timeout() {
+			retry.diagnosticError = DiagnosticErrorNetworkTimeout
+		} else {
+			retry.diagnosticError = DiagnosticErrorNetworkFailure
 		}
 		return retry, fmt.Errorf("productmetrics: upload request failed")
 	}
 	retry.statusCode = response.StatusCode
 	body, err := readBoundedUploadResponse(response)
 	if err != nil {
+		retry.diagnosticError = DiagnosticErrorInvalidResponse
 		return retry, err
 	}
 
 	switch {
 	case response.StatusCode >= 200 && response.StatusCode <= 299, response.StatusCode == http.StatusConflict:
 		if !exactJSONResponseHeaders(response.Header) {
+			retry.diagnosticError = DiagnosticErrorInvalidResponse
 			return retry, fmt.Errorf("productmetrics: acknowledgement response headers are invalid")
 		}
 		kind, err := decodeUploadAcknowledgement(response.StatusCode, response.Header.Get("Content-Type"), body, prepared.eventIDs)
 		if err != nil {
+			retry.diagnosticError = DiagnosticErrorInvalidResponse
 			return retry, err
 		}
 		return uploadResponse{kind: kind, statusCode: response.StatusCode}, nil
 	case response.StatusCode == http.StatusGone:
 		if !exactJSONResponseHeaders(response.Header) {
+			retry.diagnosticError = DiagnosticErrorInvalidResponse
 			return retry, fmt.Errorf("productmetrics: signed pause response headers are invalid")
 		}
 		pause, err := verifySignedPauseWithKeySet(body, pauseExpectation{
@@ -379,10 +391,12 @@ func (transport *uploadTransport) upload(ctx context.Context, prepared preparedU
 			metricsEpoch:   metricsEpoch,
 		}, dependencies.pauseKeys)
 		if err != nil {
+			retry.diagnosticError = DiagnosticErrorInvalidResponse
 			return retry, err
 		}
 		return uploadResponse{kind: uploadResponsePause, statusCode: response.StatusCode, pause: pause}, nil
 	case response.StatusCode >= 300 && response.StatusCode <= 399:
+		retry.diagnosticError = DiagnosticErrorInvalidResponse
 		return retry, errUploadRedirect
 	default:
 		return retry, nil

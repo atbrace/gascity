@@ -5,7 +5,6 @@ import (
 	"io"
 	"os"
 	"runtime"
-	"strings"
 	"time"
 
 	"github.com/gastownhall/gascity/internal/gchome"
@@ -25,11 +24,20 @@ type (
 	productMetricsStatus            = productmetrics.Status
 	productMetricsPolicyMetadata    = productmetrics.PolicyMetadata
 	productMetricsInvocationContext = productmetrics.InvocationContext
+	productMetricsRecordingPermit   = productmetrics.RecordingPermit
+	productMetricsNoticeResult      = productmetrics.NoticeResult
+	productMetricsRecordResult      = productmetrics.RecordResult
 	productMetricsPurgeResult       = productmetrics.PurgeResult
 	productMetricsPurgeError        = productmetrics.PurgeError
 	productMetricsPurgeClass        = productmetrics.PurgeErrorClass
 	productMetricsCommandID         = productmetrics.CommandID
 )
+
+type productMetricsInvocationService interface {
+	RecordingPermit(productMetricsInvocationContext) productMetricsRecordingPermit
+	MaybeActivateNotice(productMetricsInvocationContext, io.Writer) productMetricsNoticeResult
+	RecordOnce(productMetricsRecordingPermit, productMetricsCommandID) productMetricsRecordResult
+}
 
 const (
 	productMetricsCommandHelp        = productmetrics.CommandHelp
@@ -77,25 +85,11 @@ var productMetricsControlServiceFactory = func() (productMetricsControlService, 
 }
 
 func productMetricsExplicitEnableInvocation() productMetricsInvocationContext {
-	managed := false
-	for _, key := range []string{
-		"GC_SESSION_ID",
-		"GC_SESSION_NAME",
-		"GC_AGENT",
-		"GC_TEMPLATE",
-		"GC_MANAGED_SESSION_HOOK",
-		"GC_HOOK_EVENT_NAME",
-		"BEADS_ACTOR",
-	} {
-		if strings.TrimSpace(os.Getenv(key)) != "" {
-			managed = true
-			break
-		}
-	}
+	environment, policy := captureProductMetricsInvocationEnvironment()
 	return productMetricsInvocationContext{
-		DoNotTrack:          os.Getenv("DO_NOT_TRACK"),
-		DisableUsageMetrics: os.Getenv("GC_DISABLE_USAGE_METRICS"),
-		ManagedAutomation:   managed,
+		DoNotTrack:          environment.doNotTrack,
+		DisableUsageMetrics: environment.disableUsageMetrics,
+		ManagedAutomation:   policy.ManagedAutomation || policy.ProviderHook,
 		NoticeEligible:      true,
 	}
 }

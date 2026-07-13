@@ -129,16 +129,44 @@ var cityFlag string
 // Empty means "discover from cwd or omit."
 var rigFlag string
 
+type cliTelemetryShutdowner interface {
+	Shutdown(context.Context) error
+}
+
+var initializeCLITelemetry = func(ctx context.Context, serviceName, serviceVersion string) (cliTelemetryShutdowner, error) {
+	provider, err := telemetry.Init(ctx, serviceName, serviceVersion)
+	if provider == nil {
+		return nil, err
+	}
+	return provider, err
+}
+
+var setCLIProcessOTELAttrs = telemetry.SetProcessOTELAttrs
+
 // run executes the gc CLI with the given args, writing output to stdout and
 // errors to stderr. Returns the exit code.
 func run(args []string, stdout, stderr io.Writer) int {
-	return runWithRootCommandOptions(args, stdout, stderr, rootCommandOptionsForArgs(args))
+	if args == nil {
+		args = []string{}
+	}
+	lifecycle := openProductMetricsInvocationLifecycle(args)
+	defer lifecycle.Close()
+	return runWithRootCommandOptionsAndLifecycle(args, stdout, stderr, rootCommandOptionsForArgs(args), lifecycle)
 }
 
 // runWithRootCommandOptions preserves an explicit eager/lazy construction
 // seam for package tests while production always derives options from its
 // injected args. It must never fill options from ambient os.Args.
 func runWithRootCommandOptions(args []string, stdout, stderr io.Writer, options rootCommandOptions) int {
+	if args == nil {
+		args = []string{}
+	}
+	lifecycle := openProductMetricsInvocationLifecycle(args)
+	defer lifecycle.Close()
+	return runWithRootCommandOptionsAndLifecycle(args, stdout, stderr, options, lifecycle)
+}
+
+func runWithRootCommandOptionsAndLifecycle(args []string, stdout, stderr io.Writer, options rootCommandOptions, lifecycle *productMetricsInvocationLifecycle) int {
 	prevCityFlag, prevRigFlag := cityFlag, rigFlag
 	prevContextFlag, prevCityURLFlag, prevCityNameFlag := contextFlag, cityURLFlag, cityNameFlag
 	cityFlag, rigFlag = "", ""
@@ -150,7 +178,7 @@ func runWithRootCommandOptions(args []string, stdout, stderr io.Writer, options 
 	}()
 
 	// Initialize OTel telemetry (opt-in via GC_OTEL_METRICS_URL / GC_OTEL_LOGS_URL).
-	provider, err := telemetry.Init(context.Background(), "gascity", version)
+	provider, err := initializeCLITelemetry(context.Background(), "gascity", version)
 	if err != nil {
 		fmt.Fprintf(stderr, "gc: telemetry init: %v\n", err) //nolint:errcheck // best-effort stderr
 	}
@@ -160,15 +188,11 @@ func runWithRootCommandOptions(args []string, stdout, stderr io.Writer, options 
 			defer cancel()
 			_ = provider.Shutdown(ctx)
 		}()
-		telemetry.SetProcessOTELAttrs()
+		setCLIProcessOTELAttrs()
 	}
-
 	execStdout := &switchableWriter{target: stdout}
 	var jsonStdout bytes.Buffer
 	var observedStdout *countingWriter
-	if args == nil {
-		args = []string{}
-	}
 	options.invocationArgs = append([]string(nil), args...)
 	root := newRootCmdWithOptions(execStdout, stderr, options)
 	root.SetArgs(args)
@@ -177,6 +201,9 @@ func runWithRootCommandOptions(args []string, stdout, stderr io.Writer, options 
 	if options.discoverPackCommands {
 		materializePackCommandTreeForArgs(root, args, execStdout, stderr)
 	}
+	lifecycleBinding := bindProductMetricsInvocationLifecycle(root, args, lifecycle)
+	classification := lifecycleBinding.classification
+	lifecycle.prepareNotice(classification, stderr)
 	bufferJSONExecution := shouldBufferJSONExecution(root, args)
 	reportJSONFailure := shouldReportJSONExecutionError(root, args)
 	if bufferJSONExecution {
@@ -185,24 +212,27 @@ func runWithRootCommandOptions(args []string, stdout, stderr io.Writer, options 
 		observedStdout = &countingWriter{target: stdout}
 		execStdout.target = observedStdout
 	}
-	if handled, code := handleJSONSchemaRequest(root, args, stdout); handled {
-		return code
+	if earlyAction, ok := prepareJSONEarlyAction(root, args); ok {
+		earlyOutcome := resolveProductMetricsEarlyOutcome(earlyAction, classification)
+		lifecycle.attemptEarlyOutcome(earlyOutcome)
+		if handled, code := executeProductMetricsEarlyOutcome(earlyOutcome, earlyAction, stdout, stderr); handled {
+			return code
+		}
 	}
-	if handled, code := handleJSONContractRequest(root, args, stdout, stderr); handled {
-		return code
-	}
-	if err := root.Execute(); err != nil {
-		code := commandExitCode(err)
+	executedCommand, executeErr := root.ExecuteC()
+	lifecycle.attemptFinalOutcome(resolveProductMetricsFinalOutcome(executedCommand, classification))
+	if executeErr != nil {
+		code := commandExitCode(executeErr)
 		if bufferJSONExecution {
 			if len(bytes.TrimSpace(jsonStdout.Bytes())) > 0 {
 				if _, copyErr := io.Copy(stdout, &jsonStdout); copyErr != nil {
 					return 1
 				}
 			} else {
-				_ = writeJSONFailure(stdout, "command_failed", commandFailureMessage(err), code)
+				_ = writeJSONFailure(stdout, "command_failed", commandFailureMessage(executeErr), code)
 			}
 		} else if reportJSONFailure && observedStdout.BytesWritten() == 0 {
-			_ = writeJSONFailure(stdout, "command_failed", commandFailureMessage(err), code)
+			_ = writeJSONFailure(stdout, "command_failed", commandFailureMessage(executeErr), code)
 		}
 		return code
 	}
@@ -244,6 +274,7 @@ func newRootCmdWithOptions(stdout, stderr io.Writer, options rootCommandOptions)
 		Args:          cobra.ArbitraryArgs,
 		RunE: func(cmd *cobra.Command, args []string) error {
 			if packCommandFlagsHaveEmptyExplicitScope(cmd) {
+				attemptProductMetricsForCommand(cmd)
 				fmt.Fprintln(stderr, "gc: --city and --rig require non-empty values") //nolint:errcheck // best-effort stderr
 				printCommandUsage(stderr, cmd)
 				return errExit
@@ -254,8 +285,9 @@ func newRootCmdWithOptions(stdout, stderr io.Writer, options rootCommandOptions)
 			// Lazy fallback: if eager discovery missed a pack command
 			// (e.g. config changed after binary started), try one more time.
 			packAction := resolvePackCommandFallback(args, stdout, stderr)
+			packOutcome := executeProductMetricsPackAction(cmd, packAction)
 			if packAction.selected {
-				return packAction.execute().err()
+				return packOutcome.err()
 			}
 			fmt.Fprintf(stderr, "gc: unknown command %q\n\n", args[0]) //nolint:errcheck // best-effort stderr
 			printCommandUsage(stderr, cmd)
@@ -413,6 +445,7 @@ func installFlagGroupUsageErrors(cmd *cobra.Command, stderr io.Writer) {
 }
 
 func printCommandUsageError(stderr io.Writer, cmd *cobra.Command, err error) {
+	attemptProductMetricsForCommand(cmd)
 	if err != nil {
 		fmt.Fprintf(stderr, "gc: %v\n\n", err) //nolint:errcheck // best-effort stderr
 	}

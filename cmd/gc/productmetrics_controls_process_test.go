@@ -8,6 +8,7 @@ import (
 	"encoding/json"
 	"encoding/pem"
 	"errors"
+	"fmt"
 	"io"
 	"net/http"
 	"net/http/httptest"
@@ -181,6 +182,7 @@ func TestProductMetricsControlFlowUsesTaggedBinaryWithoutCityOrPackState(t *test
 
 func runProductMetricsTaggedControlFlow(t *testing.T, binary, workingDir, home string) {
 	t.Helper()
+	const privacySentinel = "s10-private-ordinary-help-sentinel"
 	if err := os.Chmod(home, 0o700); err != nil {
 		t.Fatalf("make product-metrics control home private: %v", err)
 	}
@@ -204,10 +206,12 @@ func runProductMetricsTaggedControlFlow(t *testing.T, binary, workingDir, home s
 		"LANG=C",
 		productMetricsTesthookEndpointEnvironment + "=" + server.URL + "/v1/command-usage",
 		productMetricsTesthookCAFileEnvironment + "=" + caFile,
+		"S10_PRIVATE_SENTINEL=" + privacySentinel,
 	}
 	productUsageRoot := filepath.Join(home, "product-usage")
 
 	initial := runProductMetricsControlProcess(t, binary, workingDir, environment, "metrics", "status", "--json")
+	assertProductMetricsProcessOmits(t, privacySentinel, initial)
 	if len(initial.stderr) != 0 {
 		t.Fatalf("initial metrics status wrote stderr: %q", initial.stderr)
 	}
@@ -222,12 +226,13 @@ func runProductMetricsTaggedControlFlow(t *testing.T, binary, workingDir, home s
 	if _, err := os.Stat(productUsageRoot); !errors.Is(err, os.ErrNotExist) {
 		t.Fatalf("read-only status created product state: %v", err)
 	}
-	assertProductMetricsExampleProcess(t, binary, workingDir, environment)
+	assertProductMetricsExampleProcess(t, binary, workingDir, environment, privacySentinel)
 	if _, err := os.Stat(productUsageRoot); !errors.Is(err, os.ErrNotExist) {
 		t.Fatalf("example created product state: %v", err)
 	}
 
 	rejected := runProductMetricsControlProcessExpectFailure(t, binary, workingDir, environment, "metrics", "on")
+	assertProductMetricsProcessOmits(t, privacySentinel, rejected)
 	if len(rejected.stdout) != 0 || bytes.Contains(rejected.stderr, []byte("Gas City product metrics test-only notice.")) ||
 		!bytes.Contains(rejected.stderr, []byte("cannot enable while state is pending-notice (preference-unset)")) {
 		t.Fatalf("non-TTY metrics on = stdout %q stderr %q, want bounded rejection without notice", rejected.stdout, rejected.stderr)
@@ -235,8 +240,18 @@ func runProductMetricsTaggedControlFlow(t *testing.T, binary, workingDir, home s
 	if _, err := os.Stat(productUsageRoot); !errors.Is(err, os.ErrNotExist) {
 		t.Fatalf("non-TTY metrics on created product state: %v", err)
 	}
+	ordinaryWorkingDir := filepath.Join(t.TempDir(), privacySentinel)
+	if err := os.MkdirAll(ordinaryWorkingDir, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	helpBaseline := runProductMetricsControlProcess(t, binary, ordinaryWorkingDir, environment, "help")
+	assertProductMetricsProcessOmits(t, privacySentinel, helpBaseline)
+	if len(helpBaseline.stdout) == 0 || len(helpBaseline.stderr) != 0 {
+		t.Fatalf("pending ordinary help baseline = stdout %q stderr %q, want help and no metrics notice", helpBaseline.stdout, helpBaseline.stderr)
+	}
 
 	on := runProductMetricsControlProcessTTY(t, binary, workingDir, environment, "metrics", "on")
+	assertProductMetricsProcessOmits(t, privacySentinel, on)
 	if !bytes.Contains(on.stderr, []byte("Gas City product metrics test-only notice.")) {
 		t.Fatalf("metrics on stderr = %q, want complete tagged notice", on.stderr)
 	}
@@ -246,12 +261,19 @@ func runProductMetricsTaggedControlFlow(t *testing.T, binary, workingDir, home s
 	}
 	assertProductMetricsProcessRedacted(t, on, installationID)
 
-	recorded := runProductMetricsControlProcess(t, binary, workingDir, environment, "metrics", productMetricsTestRecordHelpCommandFixture)
-	if len(recorded.stdout) != 0 || len(recorded.stderr) != 0 {
-		t.Fatalf("tagged record command wrote output: stdout=%q stderr=%q", recorded.stdout, recorded.stderr)
+	recorded := runProductMetricsControlProcess(t, binary, ordinaryWorkingDir, environment, "help")
+	assertProductMetricsProcessOmits(t, privacySentinel, recorded)
+	if !bytes.Equal(recorded.stdout, helpBaseline.stdout) || !bytes.Equal(recorded.stderr, helpBaseline.stderr) {
+		t.Fatalf("enabled ordinary help changed output:\nrecorded stdout=%q stderr=%q\nbaseline stdout=%q stderr=%q", recorded.stdout, recorded.stderr, helpBaseline.stdout, helpBaseline.stderr)
+	}
+	for _, stream := range [][]byte{helpBaseline.stdout, helpBaseline.stderr, recorded.stdout, recorded.stderr} {
+		if bytes.Contains(stream, []byte(privacySentinel)) {
+			t.Fatalf("ordinary help process stream leaked privacy sentinel %q: %q", privacySentinel, stream)
+		}
 	}
 
 	enabled := runProductMetricsControlProcess(t, binary, workingDir, environment, "metrics", "status", "--json")
+	assertProductMetricsProcessOmits(t, privacySentinel, enabled)
 	assertProductMetricsProcessRedacted(t, enabled, installationID)
 	if len(enabled.stderr) != 0 {
 		t.Fatalf("enabled metrics status wrote stderr: %q", enabled.stderr)
@@ -262,9 +284,19 @@ func runProductMetricsTaggedControlFlow(t *testing.T, binary, workingDir, home s
 		enabledStatus.Queue.Events != 1 || enabledStatus.Queue.Bytes == 0 || enabledStatus.Queue.OldestAgeSeconds == nil {
 		t.Fatalf("enabled metrics status = %#v", enabledStatus)
 	}
-	assertProductMetricsExampleProcess(t, binary, workingDir, environment)
+	queuedEvents, rawQueuedEvents := readProductMetricsControlQueuedEvents(t, productUsageRoot, privacySentinel)
+	if len(queuedEvents) != 1 || queuedEvents[0].CommandID != productmetrics.CommandHelp {
+		t.Fatalf("ordinary help queued events = %+v, want exactly one help event", queuedEvents)
+	}
+	for _, raw := range rawQueuedEvents {
+		if bytes.Contains(raw, []byte(privacySentinel)) {
+			t.Fatalf("raw queued help event leaked privacy sentinel %q: %s", privacySentinel, raw)
+		}
+	}
+	assertProductMetricsExampleProcess(t, binary, workingDir, environment, privacySentinel)
 
 	off := runProductMetricsControlProcess(t, binary, workingDir, environment, "metrics", "off")
+	assertProductMetricsProcessOmits(t, privacySentinel, off)
 	assertProductMetricsProcessRedacted(t, off, installationID)
 	if len(off.stderr) != 0 {
 		t.Fatalf("successful metrics off wrote stderr: %q", off.stderr)
@@ -272,11 +304,18 @@ func runProductMetricsTaggedControlFlow(t *testing.T, binary, workingDir, home s
 	if !bytes.Contains(bytes.ToLower(off.stdout), []byte("disabled")) {
 		t.Fatalf("metrics off stdout = %q, want disabled summary", off.stdout)
 	}
+	if !bytes.Contains(off.stdout, []byte("Removed 1 queued events")) {
+		t.Fatalf("metrics off stdout = %q, want one purged ordinary-help event", off.stdout)
+	}
+	if queuedAfterOff, rawAfterOff := readProductMetricsControlQueuedEvents(t, productUsageRoot, privacySentinel); len(queuedAfterOff) != 0 || len(rawAfterOff) != 0 {
+		t.Fatalf("metrics off retained queued events: decoded=%+v raw=%q", queuedAfterOff, rawAfterOff)
+	}
 	if got := readProductMetricsControlInstallationID(t, filepath.Join(productUsageRoot, "config.toml")); got != "" {
 		t.Fatalf("metrics off retained installation ID %q", got)
 	}
 
 	disabled := runProductMetricsControlProcess(t, binary, workingDir, environment, "metrics", "status", "--json")
+	assertProductMetricsProcessOmits(t, privacySentinel, disabled)
 	assertProductMetricsProcessRedacted(t, disabled, installationID)
 	if len(disabled.stderr) != 0 {
 		t.Fatalf("disabled metrics status wrote stderr: %q", disabled.stderr)
@@ -287,7 +326,7 @@ func runProductMetricsTaggedControlFlow(t *testing.T, binary, workingDir, home s
 		disabledStatus.Queue.Events != 0 || disabledStatus.Queue.Bytes != 0 {
 		t.Fatalf("disabled metrics status = %#v", disabledStatus)
 	}
-	assertProductMetricsExampleProcess(t, binary, workingDir, environment)
+	assertProductMetricsExampleProcess(t, binary, workingDir, environment, privacySentinel)
 
 	if got := requests.Load(); got != 0 {
 		t.Fatalf("metrics control flow made %d HTTP requests, want zero", got)
@@ -395,13 +434,14 @@ func assertProductMetricsProcessRedacted(t *testing.T, result productMetricsCont
 	}
 }
 
-func assertProductMetricsExampleProcess(t *testing.T, binary, workingDir string, environment []string) {
+func assertProductMetricsExampleProcess(t *testing.T, binary, workingDir string, environment []string, privacySentinel string) {
 	t.Helper()
 	want, err := productmetrics.EncodeBatch(productmetrics.ExampleBatch())
 	if err != nil {
 		t.Fatal(err)
 	}
 	result := runProductMetricsControlProcess(t, binary, workingDir, environment, "metrics", "example", "--json")
+	assertProductMetricsProcessOmits(t, privacySentinel, result)
 	if !bytes.Equal(result.stdout, want) || len(result.stderr) != 0 {
 		t.Fatalf("metrics example --json = stdout %q stderr %q, want exact encoder bytes %q and empty stderr", result.stdout, result.stderr, want)
 	}
@@ -416,6 +456,47 @@ func readProductMetricsControlInstallationID(t *testing.T, path string) string {
 		t.Fatalf("decode product metrics config: %v", err)
 	}
 	return config.InstallationID
+}
+
+func readProductMetricsControlQueuedEvents(t *testing.T, productUsageRoot, privacySentinel string) ([]productmetrics.Event, [][]byte) {
+	t.Helper()
+	var events []productmetrics.Event
+	var rawEvents [][]byte
+	err := filepath.WalkDir(productUsageRoot, func(path string, entry os.DirEntry, walkErr error) error {
+		if walkErr != nil {
+			return walkErr
+		}
+		if entry.IsDir() || !strings.HasSuffix(entry.Name(), ".json") {
+			return nil
+		}
+		data, err := os.ReadFile(path)
+		if err != nil {
+			return err
+		}
+		if bytes.Contains(data, []byte(privacySentinel)) {
+			return fmt.Errorf("queued event contains privacy sentinel")
+		}
+		event, err := productmetrics.DecodeEvent(data)
+		if err != nil {
+			return err
+		}
+		events = append(events, event)
+		rawEvents = append(rawEvents, append([]byte(nil), data...))
+		return nil
+	})
+	if err != nil {
+		t.Fatalf("read queued product-metrics events: %v", err)
+	}
+	return events, rawEvents
+}
+
+func assertProductMetricsProcessOmits(t *testing.T, privacySentinel string, results ...productMetricsControlProcessResult) {
+	t.Helper()
+	for _, result := range results {
+		if bytes.Contains(result.stdout, []byte(privacySentinel)) || bytes.Contains(result.stderr, []byte(privacySentinel)) {
+			t.Fatalf("product-metrics process stream leaked privacy sentinel %q: stdout=%q stderr=%q", privacySentinel, result.stdout, result.stderr)
+		}
+	}
 }
 
 func holdProductMetricsPackCacheLock(t *testing.T, home string) {

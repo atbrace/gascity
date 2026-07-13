@@ -81,7 +81,14 @@ func selectedUnknownPackCommandAction(invoke func() int) packCommandAction {
 }
 
 func (action packCommandAction) execute() packCommandOutcome {
+	return action.executeReporting(nil)
+}
+
+func (action packCommandAction) executeReporting(report func(packCommandOutcome)) packCommandOutcome {
 	outcome := action.outcome
+	if report != nil {
+		report(outcome)
+	}
 	if !action.selected || action.invoke == nil {
 		return outcome
 	}
@@ -195,7 +202,7 @@ func addDiscoveredLeaf(root *cobra.Command, entry config.DiscoveredCommand, city
 			action := resolveDiscoveredLeafAction(cmd, args, func() int {
 				return runDiscoveredCommand(entry, cityPath, cityName, args, stdin(), stdout, stderr)
 			})
-			return action.execute().err()
+			return executeProductMetricsPackAction(cmd, action).err()
 		},
 	}
 	parent.AddCommand(leaf)
@@ -228,10 +235,10 @@ func configureDiscoveredGroup(cmd *cobra.Command) {
 			renderHelp(helpCmd, args)
 			return
 		}
-		_ = helpAction(helpCmd, args).execute()
+		_ = executeProductMetricsPackAction(helpCmd, helpAction(helpCmd, args))
 	})
 	cmd.RunE = func(runCmd *cobra.Command, args []string) error {
-		return helpAction(runCmd, args).execute().err()
+		return executeProductMetricsPackAction(runCmd, helpAction(runCmd, args)).err()
 	}
 }
 

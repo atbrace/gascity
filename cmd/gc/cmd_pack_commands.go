@@ -228,7 +228,7 @@ func failClosedPackCommandTree(root *cobra.Command, binding string, stderr io.Wr
 	root.DisableFlagParsing = true
 	root.SetArgs([]string{binding})
 	root.RunE = func(cmd *cobra.Command, _ []string) error {
-		return resolvedPackCommandUnknownAction(cmd, binding, stderr).execute().err()
+		return executeProductMetricsPackAction(cmd, resolvedPackCommandUnknownAction(cmd, binding, stderr)).err()
 	}
 }
 

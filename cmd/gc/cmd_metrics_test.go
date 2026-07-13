@@ -255,6 +255,17 @@ func TestMetricsOnCapturesDisableAndManagedEnvironment(t *testing.T) {
 			return invocation.ManagedAutomation
 		}})
 	}
+	for _, key := range []string{"GC_HOOK_SOURCE", "GC_PROVIDER_SESSION_ID", "GC_PROVIDER_SESSION_ID_REQUIRED"} {
+		key := key
+		tests = append(tests, struct {
+			name  string
+			key   string
+			value string
+			check func(productmetrics.InvocationContext) bool
+		}{name: "provider hook " + key, key: key, value: "set", check: func(invocation productmetrics.InvocationContext) bool {
+			return invocation.ManagedAutomation
+		}})
+	}
 
 	for _, test := range tests {
 		t.Run(test.name, func(t *testing.T) {

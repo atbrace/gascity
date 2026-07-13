@@ -81,30 +81,19 @@ func handleJSONSchemaRequest(root *cobra.Command, args []string, stdout io.Write
 }
 
 func handleJSONContractRequest(root *cobra.Command, args []string, stdout, stderr io.Writer) (bool, int) {
-	request, ok := resolveJSONRequest(root, args)
-	if !ok {
+	request, disposition := resolveJSONContractDisposition(root, args)
+	switch disposition {
+	case jsonContractNotRequested, jsonContractPassthrough:
 		return false, 0
-	}
-
-	cmd := request.cmd
-	if request.findErr != nil || cmd == nil {
+	case jsonContractPassthroughWithWarning:
+		commandPath := commandPathWords(request.cmd)
+		fmt.Fprintf(stderr, "gc: warning: command %q does not declare JSON support; allowing --json pass-through during schema rollout (set GC_JSON_CONTRACT_STRICT=1 to enforce)\n", strings.Join(commandPath, " ")) //nolint:errcheck
+		return false, 0
+	case jsonContractCommandNotFound:
 		return true, writeJSONSchemaUnavailable(stdout, "json_command_not_found",
 			fmt.Sprintf("command %q was not found", strings.Join(request.commandArgs, " ")))
-	}
-	if cmd == root && len(request.commandArgs) > 0 {
-		return true, writeJSONSchemaUnavailable(stdout, "json_command_not_found",
-			fmt.Sprintf("command %q was not found", strings.Join(request.commandArgs, " ")))
-	}
-
-	commandPath := commandPathWords(cmd)
-	if isBDCommandPath(commandPath) {
-		return false, 0
-	}
-	if _, err := readCommandSchema(cmd, commandPath, jsonSchemaResultRole); err != nil {
-		if allowMissingLocalJSONSchemaPassthrough(cmd, err) {
-			fmt.Fprintf(stderr, "gc: warning: command %q does not declare JSON support; allowing --json pass-through during schema rollout (set GC_JSON_CONTRACT_STRICT=1 to enforce)\n", strings.Join(commandPath, " ")) //nolint:errcheck
-			return false, 0
-		}
+	case jsonContractUnsupported:
+		commandPath := commandPathWords(request.cmd)
 		return true, writeJSONSchemaUnavailable(stdout, "json_unsupported",
 			fmt.Sprintf("command %q does not declare JSON support", strings.Join(commandPath, " ")))
 	}
@@ -157,6 +146,38 @@ type jsonRequest struct {
 	cmd         *cobra.Command
 	commandArgs []string
 	findErr     error
+}
+
+type jsonContractDisposition uint8
+
+const (
+	jsonContractNotRequested jsonContractDisposition = iota
+	jsonContractPassthrough
+	jsonContractPassthroughWithWarning
+	jsonContractCommandNotFound
+	jsonContractUnsupported
+)
+
+func resolveJSONContractDisposition(root *cobra.Command, args []string) (jsonRequest, jsonContractDisposition) {
+	request, ok := resolveJSONRequest(root, args)
+	if !ok {
+		return jsonRequest{}, jsonContractNotRequested
+	}
+	cmd := request.cmd
+	if request.findErr != nil || cmd == nil || (cmd == root && len(request.commandArgs) > 0) {
+		return request, jsonContractCommandNotFound
+	}
+	commandPath := commandPathWords(cmd)
+	if isBDCommandPath(commandPath) {
+		return request, jsonContractPassthrough
+	}
+	if _, err := readCommandSchema(cmd, commandPath, jsonSchemaResultRole); err != nil {
+		if allowMissingLocalJSONSchemaPassthrough(cmd, err) {
+			return request, jsonContractPassthroughWithWarning
+		}
+		return request, jsonContractUnsupported
+	}
+	return request, jsonContractPassthrough
 }
 
 func resolveJSONRequest(root *cobra.Command, args []string) (jsonRequest, bool) {

@@ -258,7 +258,7 @@ func TestDecodeRejectsInvalidValuesAndBatchBounds(t *testing.T) {
 
 	twentySixEvents := append(append([]string(nil), twentyFiveEvents...), fixedEventJSON)
 	invalidUUID := strings.Replace(fixedEventJSON, "8c4f4128-a6e8-4f66-bd1b-1fcf1298b124", "8C4F4128-A6E8-4F66-BD1B-1FCF1298B124", 1)
-	unknownCommand := strings.Replace(fixedEventJSON, `"command_id":"help"`, `"command_id":"status"`, 1)
+	unknownCommand := strings.Replace(fixedEventJSON, `"command_id":"help"`, `"command_id":"definitely-not-a-command"`, 1)
 	for name, raw := range map[string]string{
 		"null event":      `null`,
 		"missing fields":  `{}`,
@@ -350,20 +350,20 @@ func TestInjectedImmutableCommandCatalogRoundTripsWithoutExpandingProduction(t *
 
 	generatedCount := 0
 	generatedCommandIDCatalog(func(commandIDEntry) { generatedCount++ })
-	if generatedCount != 0 {
-		t.Fatalf("S1 generated production catalog has %d entries, want zero", generatedCount)
+	if generatedCount != 181 {
+		t.Fatalf("generated production catalog has %d entries, want 181", generatedCount)
 	}
 
 	injected := func(yield func(commandIDEntry)) {
 		productionCommandIDCatalog(yield)
-		yield(commandIDEntry{id: injectedID, wire: "status"})
+		yield(commandIDEntry{id: injectedID, wire: "injected-only"})
 	}
 	encoded, err := encodeEventWithCommandIDCatalog(event, injected)
 	if err != nil {
 		t.Fatalf("encodeEventWithCommandIDCatalog: %v", err)
 	}
-	if !strings.Contains(string(encoded), `"command_id":"status"`) {
-		t.Fatalf("injected encoding = %s, want status wire ID", encoded)
+	if !strings.Contains(string(encoded), `"command_id":"injected-only"`) {
+		t.Fatalf("injected encoding = %s, want injected-only wire ID", encoded)
 	}
 	decoded, err := decodeEventWithCommandIDCatalog(encoded, injected)
 	if err != nil {

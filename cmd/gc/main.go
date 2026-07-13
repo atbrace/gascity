@@ -350,6 +350,15 @@ func newRootCmdWithOptions(stdout, stderr io.Writer, options rootCommandOptions)
 	// gen-doc needs the root command to walk the tree; add after construction.
 	root.AddCommand(newGenDocCmd(stdout, stderr, root))
 
+	// Cobra materializes its public help and completion commands lazily. Force
+	// them while pack discovery is still disabled so the finite built-in
+	// product-metrics census sees the same tree on every machine. Set the
+	// writers first: Cobra captures them in the generated handlers.
+	root.SetOut(stdout)
+	root.SetErr(stderr)
+	materializeProductMetricsCobraDefaults(root)
+	applyProductionProductMetricsCommandCensus(root)
+
 	// Best-effort: discover pack CLI commands if we're inside a city.
 	if options.discoverPackCommands && options.eagerPackCommandDiscovery {
 		registerPackCommands(root, options.invocationArgs, stdout, stderr)
@@ -362,7 +371,7 @@ func newRootCmdWithOptions(stdout, stderr io.Writer, options rootCommandOptions)
 }
 
 func installArgUsageErrors(cmd *cobra.Command, stderr io.Writer) {
-	if cmd.Args != nil {
+	if cmd.Args != nil && cmd.Annotations[cobraForcedDefaultAnnotation] != "true" {
 		argsValidator := cmd.Args
 		cmd.Args = func(cmd *cobra.Command, args []string) error {
 			if err := argsValidator(cmd, args); err != nil {

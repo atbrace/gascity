@@ -28,6 +28,14 @@ type (
 	productMetricsPurgeResult       = productmetrics.PurgeResult
 	productMetricsPurgeError        = productmetrics.PurgeError
 	productMetricsPurgeClass        = productmetrics.PurgeErrorClass
+	productMetricsCommandID         = productmetrics.CommandID
+)
+
+const (
+	productMetricsCommandHelp        = productmetrics.CommandHelp
+	productMetricsCommandVersion     = productmetrics.CommandVersion
+	productMetricsCommandUnknown     = productmetrics.CommandUnknown
+	productMetricsCommandPackCommand = productmetrics.CommandPackCommand
 )
 
 const (

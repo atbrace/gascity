@@ -55,6 +55,7 @@ orphan-sessions
 bd-split-store
 beads-store
 v2-routed-to-namespace
+census-owner-liveness
 run-target-routed-to-backfill
 work-option-metadata-migration
 backlog-depth

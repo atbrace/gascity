@@ -1,6 +1,6 @@
 {
   "schema_version": 1,
-  "next_id": 186,
+  "next_id": 195,
   "permanent_ids": [
     {
       "name": "help",
@@ -490,6 +490,116 @@
       "classification": "config-show",
       "owner": "immediate",
       "id": 22
+    },
+    {
+      "path": "gc context",
+      "aliases": [],
+      "conditional_modes": [],
+      "hidden": false,
+      "effective_hidden": false,
+      "disable_flag_parsing": false,
+      "shape": "runnable-group",
+      "recording_policy": "recordable",
+      "mode": "standard",
+      "notice_policy": "eligible",
+      "classification": "help",
+      "canonical_target": "@help",
+      "owner": "immediate",
+      "id": 1
+    },
+    {
+      "path": "gc context add",
+      "aliases": [],
+      "conditional_modes": [],
+      "hidden": false,
+      "effective_hidden": false,
+      "disable_flag_parsing": false,
+      "shape": "runnable",
+      "recording_policy": "recordable",
+      "mode": "standard",
+      "notice_policy": "eligible",
+      "classification": "context-add",
+      "owner": "immediate",
+      "id": 186
+    },
+    {
+      "path": "gc context current",
+      "aliases": [],
+      "conditional_modes": [],
+      "hidden": false,
+      "effective_hidden": false,
+      "disable_flag_parsing": false,
+      "shape": "runnable",
+      "recording_policy": "recordable",
+      "mode": "standard",
+      "notice_policy": "eligible",
+      "classification": "context-current",
+      "owner": "immediate",
+      "id": 187
+    },
+    {
+      "path": "gc context list",
+      "aliases": [
+        "ls"
+      ],
+      "conditional_modes": [],
+      "hidden": false,
+      "effective_hidden": false,
+      "disable_flag_parsing": false,
+      "shape": "runnable",
+      "recording_policy": "recordable",
+      "mode": "standard",
+      "notice_policy": "eligible",
+      "classification": "context-list",
+      "owner": "immediate",
+      "id": 188
+    },
+    {
+      "path": "gc context remove",
+      "aliases": [
+        "rm"
+      ],
+      "conditional_modes": [],
+      "hidden": false,
+      "effective_hidden": false,
+      "disable_flag_parsing": false,
+      "shape": "runnable",
+      "recording_policy": "recordable",
+      "mode": "standard",
+      "notice_policy": "eligible",
+      "classification": "context-remove",
+      "owner": "immediate",
+      "id": 189
+    },
+    {
+      "path": "gc context show",
+      "aliases": [],
+      "conditional_modes": [],
+      "hidden": false,
+      "effective_hidden": false,
+      "disable_flag_parsing": false,
+      "shape": "runnable",
+      "recording_policy": "recordable",
+      "mode": "standard",
+      "notice_policy": "eligible",
+      "classification": "context-show",
+      "owner": "immediate",
+      "id": 190
+    },
+    {
+      "path": "gc context use",
+      "aliases": [],
+      "conditional_modes": [],
+      "hidden": false,
+      "effective_hidden": false,
+      "disable_flag_parsing": false,
+      "shape": "runnable",
+      "recording_policy": "recordable",
+      "mode": "standard",
+      "notice_policy": "eligible",
+      "classification": "context-use",
+      "owner": "immediate",
+      "id": 191
     },
     {
       "path": "gc converge",
@@ -1965,6 +2075,36 @@
       "classification": "lint",
       "owner": "immediate",
       "id": 75
+    },
+    {
+      "path": "gc login",
+      "aliases": [],
+      "conditional_modes": [],
+      "hidden": false,
+      "effective_hidden": false,
+      "disable_flag_parsing": false,
+      "shape": "runnable",
+      "recording_policy": "recordable",
+      "mode": "standard",
+      "notice_policy": "eligible",
+      "classification": "login",
+      "owner": "immediate",
+      "id": 192
+    },
+    {
+      "path": "gc logout",
+      "aliases": [],
+      "conditional_modes": [],
+      "hidden": false,
+      "effective_hidden": false,
+      "disable_flag_parsing": false,
+      "shape": "runnable",
+      "recording_policy": "recordable",
+      "mode": "standard",
+      "notice_policy": "eligible",
+      "classification": "logout",
+      "owner": "immediate",
+      "id": 193
     },
     {
       "path": "gc mail",
@@ -4097,6 +4237,21 @@
       "classification": "wait-ready",
       "owner": "immediate",
       "id": 185
+    },
+    {
+      "path": "gc whoami",
+      "aliases": [],
+      "conditional_modes": [],
+      "hidden": false,
+      "effective_hidden": false,
+      "disable_flag_parsing": false,
+      "shape": "runnable",
+      "recording_policy": "recordable",
+      "mode": "standard",
+      "notice_policy": "eligible",
+      "classification": "whoami",
+      "owner": "immediate",
+      "id": 194
     },
     {
       "path": "gc wisp",

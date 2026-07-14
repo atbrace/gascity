@@ -334,6 +334,8 @@ func TestProductMetricsLifecycleMetricsControlBypassesCentralService(t *testing.
 		{name: "help", args: []string{"metrics", "--help"}},
 		{name: "scoped city status", args: []string{"--city", "/private/city", "metrics", "status"}, wantFactory: 1},
 		{name: "scoped rig example", args: []string{"--rig=private-rig", "metrics", "example"}},
+		{name: "remote context status", args: []string{"--context=private-context", "metrics", "status"}, wantFactory: 1},
+		{name: "remote URL example", args: []string{"--city-url", "https://city.example", "--city-name=private-city", "metrics", "example"}},
 	}
 	for _, test := range tests {
 		t.Run(test.name, func(t *testing.T) {
@@ -890,7 +892,7 @@ func TestProductMetricsLifecycleRealPackDispatchMatrix(t *testing.T) {
 		{name: "nonzero", args: []string{"backstage", "hello"}, wantID: productmetrics.CommandPackCommand, wantExit: 42, wantOutput: "stdout"},
 		{name: "leaf help", args: []string{"backstage", "hello", "--help"}, wantID: productmetrics.CommandPackCommand, wantOutput: "stdout"},
 		{name: "group help", args: []string{"backstage"}, wantID: productmetrics.CommandPackCommand, wantOutput: "stdout"},
-		{name: "materialized group unresolved help", args: []string{"backstage", "missing"}, wantID: productmetrics.CommandPackCommand, wantOutput: "stdout"},
+		{name: "materialized group unknown", args: []string{"backstage", "missing"}, wantID: productmetrics.CommandPackCommand, wantExit: 1, wantOutput: "stderr"},
 	}
 	for _, scenario := range []string{"eager", "lazy"} {
 		for _, test := range tests {

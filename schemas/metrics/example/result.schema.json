@@ -195,7 +195,16 @@
               "wait-cancel",
               "wait-inspect",
               "wait-list",
-              "wait-ready"
+              "wait-ready",
+              "context-add",
+              "context-current",
+              "context-list",
+              "context-remove",
+              "context-show",
+              "context-use",
+              "login",
+              "logout",
+              "whoami"
             ]
           },
           "event_id": {

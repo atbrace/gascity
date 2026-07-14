@@ -4,15 +4,26 @@ phase: implementation
 rig: gascity
 rig_root: /data/projects/gascity-command-metrics
 design_file: /data/projects/gascity-command-metrics/engdocs/proposals/gascity-command-usage-metrics-v0.md
-status: approved
-scope: stage-1a-endpoint-empty-default-off
+status: core-pr-scope-approved
+scope: stage-1a-client-core-endpoint-empty-default-off
 created_at: 2026-07-11T05:20:00Z
-updated_at: 2026-07-11T05:58:24Z
+updated_at: 2026-07-14T00:00:00Z
 council_verdict: clear
 council_reviewed_at: 2026-07-11T05:58:24Z
 ---
 
 # Implementation Plan: Gas City Command Usage Metrics
+
+> **Maintainer course correction (2026-07-14).** The current Stage 1a PR is
+> the endpoint-empty client core: controls and notice state, minimized event
+> contract, durable bounded queue, strict uploader, centralized Cobra coverage,
+> and targeted recursive-child suppression. The generic go/packages/SSA
+> analyzer, asset-by-asset mutation census, service-manager migration
+> hardening, repeated per-commit councils, and the exhaustive S13 closure loop
+> are explicitly not prerequisites for this PR. They are superseded below by
+> focused behavior/process tests, normal repository gates, and one final
+> three-lane council. This scope change does not activate collection or relax
+> any privacy, wire, opt-out, storage, or backend gate.
 
 ## Outcome and scope
 
@@ -1025,9 +1036,10 @@ None is part of endpoint-empty Stage 1a.
 
 ## Definition of implementation-plan completion
 
-The plan is complete when the council has approved this dependency graph, the
-slice beads have been created with matching acceptance criteria, the proposal
-and plan are committed on the isolated feature branch, and S1 is claimed. The
-Stage 1a is complete only after S13 passes and all in-scope slice beads close;
-external activation beads remain blocked until maintainers supply the four
-deployment decisions.
+The original decomposition was complete when its dependency graph and slice
+beads were approved. For the maintainer-approved core PR scope above, Stage 1a
+client completion instead requires the focused product-metrics suites,
+generated-census check, normal repository gates, and one final council with no
+open P0/P1. S12a's generic analyzer and S13's exhaustive hardening matrix are
+not completion prerequisites. External activation remains blocked until
+maintainers supply the four deployment decisions.

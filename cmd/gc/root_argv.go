@@ -23,20 +23,20 @@ func rootCommandOptionsForArgs(args []string) rootCommandOptions {
 
 // firstRootCommand returns the first command word under the root's narrow
 // persistent-scope grammar. Unknown flags fail closed because this pre-scan
-// cannot know whether a later token is their value. A separate --city/--rig
-// form consumes exactly one following token, including "--", matching pflag.
+// cannot know whether a later token is their value. A separate known value
+// flag consumes exactly one following token, including "--", matching pflag.
 func firstRootCommand(args []string) (string, bool) {
 	for index := 0; index < len(args); index++ {
 		arg := args[index]
 		switch {
 		case arg == "--":
 			return "", false
-		case arg == "--city" || arg == "--rig":
+		case isRootPersistentValueFlag(arg):
 			if index+1 >= len(args) {
 				return "", false
 			}
 			index++
-		case strings.HasPrefix(arg, "--city=") || strings.HasPrefix(arg, "--rig="):
+		case isRootPersistentValueAssignment(arg):
 			continue
 		case strings.HasPrefix(arg, "-"):
 			return "", false
@@ -45,4 +45,18 @@ func firstRootCommand(args []string) (string, bool) {
 		}
 	}
 	return "", false
+}
+
+func isRootPersistentValueFlag(arg string) bool {
+	switch arg {
+	case "--city", "--rig", "--context", "--city-url", "--city-name":
+		return true
+	default:
+		return false
+	}
+}
+
+func isRootPersistentValueAssignment(arg string) bool {
+	name, _, hasValue := strings.Cut(arg, "=")
+	return hasValue && isRootPersistentValueFlag(name)
 }

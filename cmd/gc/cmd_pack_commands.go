@@ -222,6 +222,12 @@ func materializeSelectedPackCommandTree(root *cobra.Command, args []string, requ
 		applyResolvedPackCommandArgs(root, args, request, selectedRequest)
 	}
 	selectedCandidate.addToRoot(root, stdout, stderr)
+	// The root's normal usage-error installation already ran before this lazy
+	// tree was materialized. Apply the same wrapper to the newly added namespace
+	// so eager and lazy unknown-subcommand failures retain identical output.
+	if namespace := findSubcommand(root, request.binding); namespace != nil {
+		installArgUsageErrors(namespace, stderr)
+	}
 }
 
 func failClosedPackCommandTree(root *cobra.Command, binding string, stderr io.Writer) {

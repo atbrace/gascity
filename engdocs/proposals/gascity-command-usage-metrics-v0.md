@@ -8,11 +8,19 @@ requirements_file: null
 requirements_source: "Direct maintainer request, 2026-07-10"
 status: draft
 created_at: 2026-07-11T00:12:23Z
-updated_at: 2026-07-11T05:58:24Z
-implementation_status: stage-1a-approved
+updated_at: 2026-07-14T00:00:00Z
+implementation_status: stage-1a-client-core
 ---
 
 # Design: Privacy-Limited Gas City Command Usage Metrics
+
+> **Stage 1a core scope (maintainer update, 2026-07-14).** The generic
+> go/packages/SSA self-exec analyzer and asset-by-asset/service-manager
+> hardening described as prospective enforcement below are not required for
+> the endpoint-empty client PR. Recursive suppression is enforced with the
+> GC-only `internal/execenv` helper, managed-agent environment pinning, and
+> focused child-process/content tests. Activation gates and the privacy, wire,
+> opt-out, queue, and backend contracts are unchanged.
 
 ## Summary
 

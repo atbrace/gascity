@@ -2279,12 +2279,14 @@ func TestPackCommandCobraHelpAndUnknownParity(t *testing.T) {
 		{
 			name:           "known namespace miss",
 			args:           []string{"backstage", "missing"},
-			wantStdoutText: []string{"Commands from the backstage import", "Usage:", "gc backstage", "hello", "repo"},
+			wantExit:       1,
+			wantStderrText: []string{`unknown command "missing"`, "Usage:", "gc backstage", "hello", "repo"},
 		},
 		{
 			name:           "known intermediate miss",
 			args:           []string{"backstage", "repo", "missing"},
-			wantStdoutText: []string{"Usage:", "gc backstage repo", "sync"},
+			wantExit:       1,
+			wantStderrText: []string{`unknown command "missing"`, "Usage:", "gc backstage repo", "sync"},
 		},
 	}
 	for _, test := range tests {
@@ -2314,7 +2316,7 @@ func TestPackCommandCobraHelpAndUnknownParity(t *testing.T) {
 	}
 }
 
-func TestPackCommandGroupMissPreservesLegacyHelpBehavior(t *testing.T) {
+func TestPackCommandGroupMissRejectsUnknownSubcommands(t *testing.T) {
 	cityPath := setupPackExitCity(t)
 	tests := []struct {
 		name string
@@ -2324,24 +2326,24 @@ func TestPackCommandGroupMissPreservesLegacyHelpBehavior(t *testing.T) {
 		{
 			name: "namespace",
 			args: []string{"backstage", "missing"},
-			want: []string{"Commands from the backstage import", "Usage:", "gc backstage", "hello", "repo"},
+			want: []string{`unknown command "missing"`, "Usage:", "gc backstage", "hello", "repo"},
 		},
 		{
 			name: "intermediate",
 			args: []string{"backstage", "repo", "missing"},
-			want: []string{"Usage:", "gc backstage repo", "sync"},
+			want: []string{`unknown command "missing"`, "Usage:", "gc backstage repo", "sync"},
 		},
 	}
 	for _, test := range tests {
 		t.Run(test.name, func(t *testing.T) {
 			for _, scenario := range []string{"eager", "lazy"} {
 				result := runPackCommandProcess(t, cityPath, scenario, test.args...)
-				if result.exitCode != 0 || result.stderr != "" {
-					t.Fatalf("%s group miss = %+v, want legacy help on stdout with exit 0", scenario, result)
+				if result.exitCode != 1 || result.stdout != "" {
+					t.Fatalf("%s group miss = %+v, want unknown-command failure on stderr", scenario, result)
 				}
 				for _, want := range test.want {
-					if !strings.Contains(result.stdout, want) {
-						t.Fatalf("%s group miss stdout missing %q:\n%s", scenario, want, result.stdout)
+					if !strings.Contains(result.stderr, want) {
+						t.Fatalf("%s group miss stderr missing %q:\n%s", scenario, want, result.stderr)
 					}
 				}
 			}

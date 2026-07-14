@@ -954,7 +954,6 @@ func doSessionListFallback(stateFilter, templateFilter string, jsonOutput bool, 
 		return 1
 	}
 
-	sessionBeads := newSessionBeadSnapshot(allSessionBeads)
 	sp, err := withSessionProviderConstructionContext(
 		newSessionProviderFromContext(providerCtx, sessionBeads),
 	)

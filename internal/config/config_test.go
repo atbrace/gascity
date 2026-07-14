@@ -6626,6 +6626,106 @@ esac
 	}
 }
 
+// TestEffectiveOnDeathSurfacesSchemaSkewOnAssignedListQuery covers ga-ooka7o:
+// effectiveOnDeath's bd calls previously swallowed a schema-skew failure via
+// a bare 2>/dev/null, silently no-oping fleet self-healing (a dead agent's
+// in-progress work never released). The first bd call it makes is the
+// assignee-scoped `bd list`.
+func TestEffectiveOnDeathSurfacesSchemaSkewOnAssignedListQuery(t *testing.T) {
+	a := Agent{
+		Name:              "dog-1",
+		Dir:               "hello-world",
+		MinActiveSessions: ptrInt(0), MaxActiveSessions: ptrInt(5),
+		PoolName: "hello-world/dog",
+	}
+	stdout, stderr, code := runShellWithFakeBdAllowFailure(t, a.EffectiveOnDeath(), nil, schemaSkewBdScript)
+	if code == 0 {
+		t.Fatalf("EffectiveOnDeath() exited 0 on bd schema skew, want non-zero")
+	}
+	if !strings.Contains(stderr, "schema version mismatch") {
+		t.Fatalf("EffectiveOnDeath() stderr = %q, want schema-skew message surfaced", stderr)
+	}
+	if strings.TrimSpace(stdout) != "" {
+		t.Errorf("EffectiveOnDeath() stdout = %q, want empty on a fatal schema-skew abort", stdout)
+	}
+}
+
+func TestEffectiveOnDeathSurfacesSchemaSkewOnEphemeralQuery(t *testing.T) {
+	a := Agent{
+		Name:              "dog-1",
+		Dir:               "hello-world",
+		MinActiveSessions: ptrInt(0), MaxActiveSessions: ptrInt(5),
+		PoolName: "hello-world/dog",
+	}
+	// bd list succeeds empty so the script reaches the ephemeral bd query
+	// probe, which fails with the schema-skew signature.
+	bdScript := `#!/bin/sh
+case "$1" in
+  list)
+    printf '[]'
+    ;;
+  query)
+    printf 'schema version mismatch: database is at v51, binary knows up to v49 (2 migrations ahead)\n' >&2
+    exit 1
+    ;;
+  *)
+    printf '[]'
+    ;;
+esac
+`
+	stdout, stderr, code := runShellWithFakeBdAllowFailure(t, a.EffectiveOnDeath(), nil, bdScript)
+	if code == 0 {
+		t.Fatalf("EffectiveOnDeath() exited 0 on ephemeral-probe schema skew, want non-zero")
+	}
+	if !strings.Contains(stderr, "schema version mismatch") {
+		t.Fatalf("EffectiveOnDeath() stderr = %q, want schema-skew message surfaced", stderr)
+	}
+	if strings.TrimSpace(stdout) != "" {
+		t.Errorf("EffectiveOnDeath() stdout = %q, want empty on a fatal schema-skew abort", stdout)
+	}
+}
+
+// TestEffectiveOnDeathSurfacesSchemaSkewOnUpdate covers the recovery-write
+// side: a dead agent's in-progress work is found (list succeeds) but the bd
+// update that reopens it hits schema skew. Before this fix, the reopen
+// silently no-op'd -- the bead stayed claimed, indistinguishable from real
+// in-progress work.
+func TestEffectiveOnDeathSurfacesSchemaSkewOnUpdate(t *testing.T) {
+	a := Agent{
+		Name:              "dog-1",
+		Dir:               "hello-world",
+		MinActiveSessions: ptrInt(0), MaxActiveSessions: ptrInt(5),
+		PoolName: "hello-world/dog",
+	}
+	bdScript := `#!/bin/sh
+case "$1" in
+  list)
+    printf '[{"id":"ga-stuck","type":"wisp","metadata":{"gc.routed_to":"already/routed"}}]'
+    ;;
+  query)
+    printf '[]'
+    ;;
+  update)
+    printf 'schema version mismatch: database is at v51, binary knows up to v49 (2 migrations ahead)\n' >&2
+    exit 1
+    ;;
+  *)
+    printf '[]'
+    ;;
+esac
+`
+	stdout, stderr, code := runShellWithFakeBdAllowFailure(t, a.EffectiveOnDeath(), nil, bdScript)
+	if code == 0 {
+		t.Fatalf("EffectiveOnDeath() exited 0 on update schema skew, want non-zero")
+	}
+	if !strings.Contains(stderr, "schema version mismatch") {
+		t.Fatalf("EffectiveOnDeath() stderr = %q, want schema-skew message surfaced", stderr)
+	}
+	if strings.TrimSpace(stdout) != "" {
+		t.Errorf("EffectiveOnDeath() stdout = %q, want empty on a fatal schema-skew abort", stdout)
+	}
+}
+
 func TestEffectiveOnBootDefault(t *testing.T) {
 	a := Agent{
 		Name:              "dog",
@@ -6854,6 +6954,145 @@ func TestEffectiveOnBootNonPool(t *testing.T) {
 	}
 	if strings.Contains(got, `--assignee ""`) {
 		t.Errorf("EffectiveOnBoot() = %q, want to target only ownerless work instead of bulk-unassigning routed work", got)
+	}
+}
+
+// TestEffectiveOnBootSurfacesSchemaSkewOnRoutedListQuery covers ga-ooka7o:
+// effectiveOnBoot's bd calls previously swallowed a schema-skew failure via
+// a bare 2>/dev/null, silently no-oping fleet self-healing (a booting
+// agent's routed work never reopened). The first bd call it makes is the
+// gc.routed_to-scoped `bd list`.
+func TestEffectiveOnBootSurfacesSchemaSkewOnRoutedListQuery(t *testing.T) {
+	a := Agent{
+		Name:              "dog-1",
+		Dir:               "hello-world",
+		MinActiveSessions: ptrInt(0), MaxActiveSessions: ptrInt(5),
+		PoolName: "hello-world/dog",
+	}
+	stdout, stderr, code := runShellWithFakeBdAllowFailure(t, a.EffectiveOnBoot(), nil, schemaSkewBdScript)
+	if code == 0 {
+		t.Fatalf("EffectiveOnBoot() exited 0 on bd schema skew, want non-zero")
+	}
+	if !strings.Contains(stderr, "schema version mismatch") {
+		t.Fatalf("EffectiveOnBoot() stderr = %q, want schema-skew message surfaced", stderr)
+	}
+	if strings.TrimSpace(stdout) != "" {
+		t.Errorf("EffectiveOnBoot() stdout = %q, want empty on a fatal schema-skew abort", stdout)
+	}
+}
+
+func TestEffectiveOnBootSurfacesSchemaSkewOnRunTargetListQuery(t *testing.T) {
+	a := Agent{
+		Name:              "dog-1",
+		Dir:               "hello-world",
+		MinActiveSessions: ptrInt(0), MaxActiveSessions: ptrInt(5),
+		PoolName: "hello-world/dog",
+	}
+	// The routed-list probe succeeds empty so the script falls through to
+	// the run_target/workflow-kind list probe, which fails with the
+	// schema-skew signature.
+	bdScript := `#!/bin/sh
+case "$*" in
+  *"--metadata-field gc.routed_to=hello-world/dog"*)
+    printf '[]'
+    ;;
+  *"--metadata-field gc.run_target=hello-world/dog"*)
+    printf 'schema version mismatch: database is at v51, binary knows up to v49 (2 migrations ahead)\n' >&2
+    exit 1
+    ;;
+  *)
+    printf '[]'
+    ;;
+esac
+`
+	stdout, stderr, code := runShellWithFakeBdAllowFailure(t, a.EffectiveOnBoot(), nil, bdScript)
+	if code == 0 {
+		t.Fatalf("EffectiveOnBoot() exited 0 on run_target-list schema skew, want non-zero")
+	}
+	if !strings.Contains(stderr, "schema version mismatch") {
+		t.Fatalf("EffectiveOnBoot() stderr = %q, want schema-skew message surfaced", stderr)
+	}
+	if strings.TrimSpace(stdout) != "" {
+		t.Errorf("EffectiveOnBoot() stdout = %q, want empty on a fatal schema-skew abort", stdout)
+	}
+}
+
+func TestEffectiveOnBootSurfacesSchemaSkewOnEphemeralQuery(t *testing.T) {
+	a := Agent{
+		Name:              "dog-1",
+		Dir:               "hello-world",
+		MinActiveSessions: ptrInt(0), MaxActiveSessions: ptrInt(5),
+		PoolName: "hello-world/dog",
+	}
+	// Both list probes succeed empty so the script reaches the ephemeral bd
+	// query probe, which fails with the schema-skew signature.
+	bdScript := `#!/bin/sh
+case "$1" in
+  list)
+    printf '[]'
+    ;;
+  query)
+    printf 'schema version mismatch: database is at v51, binary knows up to v49 (2 migrations ahead)\n' >&2
+    exit 1
+    ;;
+  *)
+    printf '[]'
+    ;;
+esac
+`
+	stdout, stderr, code := runShellWithFakeBdAllowFailure(t, a.EffectiveOnBoot(), nil, bdScript)
+	if code == 0 {
+		t.Fatalf("EffectiveOnBoot() exited 0 on ephemeral-probe schema skew, want non-zero")
+	}
+	if !strings.Contains(stderr, "schema version mismatch") {
+		t.Fatalf("EffectiveOnBoot() stderr = %q, want schema-skew message surfaced", stderr)
+	}
+	if strings.TrimSpace(stdout) != "" {
+		t.Errorf("EffectiveOnBoot() stdout = %q, want empty on a fatal schema-skew abort", stdout)
+	}
+}
+
+// TestEffectiveOnBootSurfacesSchemaSkewOnUpdate covers the recovery-write
+// side: ownerless routed work is found (list succeeds) but the bd update
+// that reopens it hits schema skew. Before this fix, the reopen silently
+// no-op'd -- a booting agent's routed work was never reopened, with zero
+// signal that recovery didn't happen.
+func TestEffectiveOnBootSurfacesSchemaSkewOnUpdate(t *testing.T) {
+	a := Agent{
+		Name:              "dog-1",
+		Dir:               "hello-world",
+		MinActiveSessions: ptrInt(0), MaxActiveSessions: ptrInt(5),
+		PoolName: "hello-world/dog",
+	}
+	bdScript := `#!/bin/sh
+case "$1" in
+  list)
+    case "$*" in
+      *"--metadata-field gc.routed_to=hello-world/dog"*) printf '[{"id":"ga-wisp","type":"wisp","metadata":{"gc.routed_to":"hello-world/dog"}}]' ;;
+      *) printf '[]' ;;
+    esac
+    ;;
+  query)
+    printf '[]'
+    ;;
+  update)
+    printf 'schema version mismatch: database is at v51, binary knows up to v49 (2 migrations ahead)\n' >&2
+    exit 1
+    ;;
+  *)
+    printf '[]'
+    ;;
+esac
+`
+	stdout, stderr, code := runShellWithFakeBdAllowFailure(t, a.EffectiveOnBoot(), nil, bdScript)
+	if code == 0 {
+		t.Fatalf("EffectiveOnBoot() exited 0 on update schema skew, want non-zero")
+	}
+	if !strings.Contains(stderr, "schema version mismatch") {
+		t.Fatalf("EffectiveOnBoot() stderr = %q, want schema-skew message surfaced", stderr)
+	}
+	if strings.TrimSpace(stdout) != "" {
+		t.Errorf("EffectiveOnBoot() stdout = %q, want empty on a fatal schema-skew abort", stdout)
 	}
 }
 

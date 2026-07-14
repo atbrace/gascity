@@ -200,6 +200,8 @@ type NativeDoltStore struct {
 	// single wall-clock bound on a read's whole reconnect-and-retry chain. Only
 	// tests set it (to exercise budget exhaustion without a real 90s wait).
 	readRetryBudgetOverride time.Duration
+
+	localStrings *localSidecar // clone-local data; see Store.SetLocalString
 }
 
 // NativeStorage is the upstream beads storage handle a NativeDoltStore wraps.
@@ -235,7 +237,7 @@ func newNativeDoltStoreWithStorage(storage beadslib.Storage, actor string) *Nati
 	if actor == "" {
 		actor = nativeDoltStoreActor
 	}
-	return &NativeDoltStore{storage: storage, actor: actor}
+	return &NativeDoltStore{storage: storage, actor: actor, localStrings: newLocalSidecar("")}
 }
 
 func newNativeDoltStoreWithStorageAndPrefix(storage beadslib.Storage, actor, idPrefix string) *NativeDoltStore {
@@ -260,6 +262,7 @@ func newNativeDoltStoreAt(parent context.Context, scopeRoot string, env map[stri
 		return nil, err
 	}
 	store := newNativeDoltStoreWithStorageAndPrefix(storage, nativeDoltStoreActor, prefix)
+	store.localStrings = newLocalSidecar(filepath.Join(scopeRoot, ".beads", "local-strings.json"))
 	for _, opt := range opts {
 		opt(store)
 	}
@@ -1324,6 +1327,28 @@ func (s *NativeDoltStore) SetMetadataBatch(id string, kvs map[string]string) err
 	return nativeStoreError(id, storage.UpdateIssue(ctx, id, map[string]interface{}{"metadata": raw}, s.actor))
 }
 
+// SetLocalString sets a clone-local string value for a bead. See
+// Store.SetLocalString. Persisted to a sidecar JSON file under this store's
+// .beads/ directory rather than through Dolt storage: unlike SetMetadata,
+// this never touches the Dolt DB or commits. Does not validate that id
+// refers to an existing bead — see the interface doc comment for why.
+func (s *NativeDoltStore) SetLocalString(id, key, value string) error {
+	if err := s.localStrings.Set(id, key, value); err != nil {
+		return fmt.Errorf("setting local string on %q: %w", id, err)
+	}
+	return nil
+}
+
+// GetLocalString returns the clone-local string value for a bead. See
+// Store.GetLocalString.
+func (s *NativeDoltStore) GetLocalString(id, key string) (string, error) {
+	value, err := s.localStrings.Get(id, key)
+	if err != nil {
+		return "", fmt.Errorf("getting local string on %q: %w", id, err)
+	}
+	return value, nil
+}
+
 // Tx executes fn inside a single native Dolt transaction so every write in the
 // callback shares one DOLT_COMMIT. This is the coalescing path that lets a
 // caller (e.g. an extmsg bind) issue several bead writes at the cost of one
@@ -1388,7 +1413,13 @@ func (s *NativeDoltStore) Delete(id string) error {
 	defer release()
 	ctx, cancel := nativeDoltOperationContext(context.TODO())
 	defer cancel()
-	return nativeStoreError(id, storage.DeleteIssue(ctx, id))
+	if err := nativeStoreError(id, storage.DeleteIssue(ctx, id)); err != nil {
+		return err
+	}
+	if sidecarErr := s.localStrings.DeleteBead(id); sidecarErr != nil {
+		return fmt.Errorf("deleting bead %q: cleaning up local strings: %w", id, sidecarErr)
+	}
+	return nil
 }
 
 // Ping verifies that the upstream storage is reachable.

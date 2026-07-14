@@ -8112,19 +8112,33 @@ func TestSpoolDeepPurgeConvergesUnderLowFileDescriptorLimit(t *testing.T) {
 	}
 }
 
-func TestSpoolNestedPurgeConvergesAtFileDescriptorLimitSixteen(t *testing.T) {
+func TestSpoolNestedPurgeConvergesAtMinimumDirectoryBudget(t *testing.T) {
 	const helperEnvironment = "GC_PRODUCTMETRICS_MIN_NOFILE_HELPER"
 	if os.Getenv(helperEnvironment) != "1" {
 		ctx, cancel := context.WithTimeout(context.Background(), 4*testutil.ExecRaceTimeout)
 		defer cancel()
-		command := exec.CommandContext(ctx, os.Args[0], "-test.run=^TestSpoolNestedPurgeConvergesAtFileDescriptorLimitSixteen$")
+		command := exec.CommandContext(ctx, os.Args[0], "-test.run=^TestSpoolNestedPurgeConvergesAtMinimumDirectoryBudget$")
 		command.Env = append(os.Environ(), helperEnvironment+"=1")
+		defer func() {
+			for _, inherited := range command.ExtraFiles {
+				if err := inherited.Close(); err != nil {
+					t.Errorf("close inherited descriptor fixture: %v", err)
+				}
+			}
+		}()
+		for range 2 {
+			inherited, err := os.Open(os.DevNull)
+			if err != nil {
+				t.Fatalf("open inherited descriptor fixture: %v", err)
+			}
+			command.ExtraFiles = append(command.ExtraFiles, inherited)
+		}
 		output, err := command.CombinedOutput()
 		if ctx.Err() != nil {
-			t.Fatalf("minimum-NOFILE purge helper timed out: %v\n%s", ctx.Err(), output)
+			t.Fatalf("minimum-directory-budget purge helper timed out: %v\n%s", ctx.Err(), output)
 		}
 		if err != nil {
-			t.Fatalf("minimum-NOFILE purge helper failed: %v\n%s", err, output)
+			t.Fatalf("minimum-directory-budget purge helper failed: %v\n%s", err, output)
 		}
 		return
 	}
@@ -8158,16 +8172,20 @@ func TestSpoolNestedPurgeConvergesAtFileDescriptorLimitSixteen(t *testing.T) {
 	if err := unix.Getrlimit(unix.RLIMIT_NOFILE, &limit); err != nil {
 		t.Fatalf("read RLIMIT_NOFILE: %v", err)
 	}
-	if limit.Max < 16 {
+	// The fallback limit still selects the minimum directory budget because
+	// 32/4 is below spoolMinimumDirectoryProgress, while leaving headroom for
+	// descriptors owned by the Go test harness.
+	const softLimit = spoolFallbackDirectoryLimit
+	if limit.Max < softLimit {
 		t.Skipf("RLIMIT_NOFILE hard limit %d is below regression limit", limit.Max)
 	}
-	limit.Cur = 16
+	limit.Cur = softLimit
 	if err := unix.Setrlimit(unix.RLIMIT_NOFILE, &limit); err != nil {
-		t.Fatalf("set minimum RLIMIT_NOFILE: %v", err)
+		t.Fatalf("set minimum-directory-budget RLIMIT_NOFILE: %v", err)
 	}
 	var observed unix.Rlimit
 	if err := unix.Getrlimit(unix.RLIMIT_NOFILE, &observed); err != nil || observed.Cur != limit.Cur || observed.Max != limit.Max {
-		t.Fatalf("minimum RLIMIT_NOFILE = %+v, err=%v, want %+v", observed, err, limit)
+		t.Fatalf("minimum-directory-budget RLIMIT_NOFILE = %+v, err=%v, want %+v", observed, err, limit)
 	}
 
 	result := spoolSweepResult{}
@@ -8181,15 +8199,15 @@ func TestSpoolNestedPurgeConvergesAtFileDescriptorLimitSixteen(t *testing.T) {
 		closeErr := root.Close()
 		if purgeErr != nil || closeErr != nil || result.usage.directories > spoolMinimumDirectoryProgress ||
 			!strongEvidence || !result.complete && before == after {
-			t.Fatalf("minimum-NOFILE purge attempt %d = complete:%v err:%v close:%v progressed:%v evidence:%v usage:%+v",
+			t.Fatalf("minimum-directory-budget purge attempt %d = complete:%v err:%v close:%v progressed:%v evidence:%v usage:%+v",
 				attempt+1, result.complete, purgeErr, closeErr, before != after, strongEvidence, result.usage)
 		}
 	}
 	if !result.complete || result.quota != (spoolQuota{}) {
-		t.Fatalf("minimum-NOFILE nested purge did not converge: %+v", result)
+		t.Fatalf("minimum-directory-budget nested purge did not converge: %+v", result)
 	}
 	if data, err := os.ReadFile(sentinel); err != nil || string(data) != "outside" {
-		t.Fatalf("minimum-NOFILE nested purge changed outside sentinel: data=%q err=%v", data, err)
+		t.Fatalf("minimum-directory-budget nested purge changed outside sentinel: data=%q err=%v", data, err)
 	}
 }
 

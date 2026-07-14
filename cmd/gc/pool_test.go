@@ -1354,12 +1354,6 @@ func TestShellCommandSurfacesStderrOnFailure(t *testing.T) {
 	}
 }
 
-// shellSingleQuote wraps s in single quotes for safe embedding in an `sh -c`
-// command, escaping any embedded single quotes.
-func shellSingleQuote(s string) string {
-	return "'" + strings.ReplaceAll(s, "'", `'\''`) + "'"
-}
-
 func runExternal(t *testing.T, dir, name string, args ...string) {
 	t.Helper()
 	runExternalOutput(t, dir, name, args...)

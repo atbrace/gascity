@@ -1874,7 +1874,7 @@ func TestStorageIteratorCloseAndFailureSeams(t *testing.T) {
 			t.Fatal(err)
 		}
 		defer func() { _ = root.Close() }()
-		if err := root.writeFileAtomic("event", []byte("event")); err != nil {
+		if err := os.WriteFile(filepath.Join(inspection.Root(), "event"), []byte("event"), 0o600); err != nil {
 			t.Fatal(err)
 		}
 		for range 2 {
@@ -1921,7 +1921,7 @@ func TestStorageIteratorCloseAndFailureSeams(t *testing.T) {
 			t.Fatal(err)
 		}
 		defer func() { _ = root.Close() }()
-		if err := root.writeFileAtomic("event", []byte("event")); err != nil {
+		if err := os.WriteFile(filepath.Join(inspection.Root(), "event"), []byte("event"), 0o600); err != nil {
 			t.Fatal(err)
 		}
 
@@ -1984,7 +1984,7 @@ func TestStorageIteratorCloseAndFailureSeams(t *testing.T) {
 				t.Fatal(err)
 			}
 			defer func() { _ = root.Close() }()
-			if err := root.writeFileAtomic("event", []byte("event")); err != nil {
+			if err := os.WriteFile(filepath.Join(inspection.Root(), "event"), []byte("event"), 0o600); err != nil {
 				t.Fatal(err)
 			}
 			iterator, err := root.iterateEntries()
@@ -2011,7 +2011,7 @@ func TestStorageIteratorCloseAndFailureSeams(t *testing.T) {
 			t.Fatal(err)
 		}
 		defer func() { _ = root.Close() }()
-		if err := root.writeFileAtomic("event", []byte("event")); err != nil {
+		if err := os.WriteFile(filepath.Join(inspection.Root(), "event"), []byte("event"), 0o600); err != nil {
 			t.Fatal(err)
 		}
 		iterator, err := root.iterateEntries()
@@ -2035,7 +2035,7 @@ func TestStorageIteratorCloseAndFailureSeams(t *testing.T) {
 			t.Fatal(err)
 		}
 		defer func() { _ = root.Close() }()
-		if err := root.writeFileAtomic("retained", []byte("event")); err != nil {
+		if err := os.WriteFile(filepath.Join(inspection.Root(), "retained"), []byte("event"), 0o600); err != nil {
 			t.Fatal(err)
 		}
 		iterator, err := root.iterateEntries()

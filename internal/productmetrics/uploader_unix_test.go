@@ -70,6 +70,16 @@ func TestUploaderAcceptedClaimsOldestReleaseAndDeletesDurably(t *testing.T) {
 	currentRelease := testSpoolEvent(testEventIDTwo, permit.releaseVersion, testRecordHour, CommandVersion)
 	oldBytes := writeSpoolEventFixture(t, root, queueDirectoryName, testSpoolGeneration, oldRelease)
 	currentBytes := writeSpoolEventFixture(t, root, queueDirectoryName, testSpoolGeneration, currentRelease)
+	oldPath := filepath.Join(home.Root(), queueDirectoryName, testSpoolGeneration, eventFileName(oldRelease.EventID))
+	currentPath := filepath.Join(home.Root(), queueDirectoryName, testSpoolGeneration, eventFileName(currentRelease.EventID))
+	oldTime := testRecordHour.Add(-2 * time.Hour)
+	currentTime := testRecordHour.Add(-time.Hour)
+	if err := os.Chtimes(oldPath, oldTime, oldTime); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Chtimes(currentPath, currentTime, currentTime); err != nil {
+		t.Fatal(err)
+	}
 	if err := persistSpoolQuota(root, spoolQuota{Events: 2, Bytes: uint64(len(oldBytes) + len(currentBytes))}); err != nil {
 		t.Fatal(err)
 	}
@@ -107,7 +117,6 @@ func TestUploaderAcceptedClaimsOldestReleaseAndDeletesDurably(t *testing.T) {
 		t.Fatalf("quota after exact acknowledgement = %+v", got)
 	}
 	assertSpoolFileLocation(t, home, queueDirectoryName, currentRelease.EventID)
-	oldPath := filepath.Join(home.Root(), queueDirectoryName, testSpoolGeneration, eventFileName(oldRelease.EventID))
 	if _, err := os.Lstat(oldPath); !errors.Is(err, fs.ErrNotExist) {
 		t.Fatalf("acknowledged old-release event remains queued: %v", err)
 	}

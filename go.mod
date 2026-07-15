@@ -246,3 +246,5 @@ require (
 )
 
 replace github.com/steveyegge/beads => /Users/jonesy/Developer/beads
+
+replace github.com/gastownhall/gascity-packs => /Users/jonesy/Developer/gascity-packs

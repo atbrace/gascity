@@ -27,6 +27,7 @@ import (
 	"github.com/gastownhall/gascity/internal/orders"
 	"github.com/gastownhall/gascity/internal/runtime"
 	sessionauto "github.com/gastownhall/gascity/internal/runtime/auto"
+	sessionpkg "github.com/gastownhall/gascity/internal/session"
 	"github.com/gastownhall/gascity/internal/supervisor"
 	"github.com/gastownhall/gascity/internal/telemetry"
 	"github.com/gastownhall/gascity/internal/workspacesvc"
@@ -2320,6 +2321,75 @@ func (cr *CityRuntime) beadReconcileTick(ctx context.Context, result DesiredStat
 	recordPhase(TraceSiteControllerTickPhase, "bead_reconcile.nudge_dispatch_tick", phaseStart, nil)
 
 	// Idle recovery: detect pool sessions stuck at the prompt after
+
+	// Reap detached nudge pollers whose session is gone or long-drained.
+	// Pollers are their own process-group leaders, so session teardown never
+	// reaches them; without this they poll the store every cycle forever.
+	// Skipped on a partial snapshot: an incomplete keep set must not kill
+	// live pollers (a missed reap self-corrects next tick; a wrong kill is
+	// healed only by the next nudge send).
+	if !result.SessionQueryPartial && !result.StoreQueryPartial {
+		phaseStart = time.Now()
+		cr.reapOrphanedNudgePollersTick(sessionBeads)
+		recordPhase(TraceSiteControllerTickPhase, "bead_reconcile.reap_orphaned_nudge_pollers", phaseStart, nil)
+	}
+}
+
+// reapOrphanedNudgePollersTick reaps detached nudge pollers whose owning
+// session is closed/absent from the open session set, or has sat drained past
+// pollerDrainReapGrace. A reaped poller self-heals on demand: the next nudge
+// send to its session re-spawns it via maybeStartNudgePoller.
+func (cr *CityRuntime) reapOrphanedNudgePollersTick(sessionBeads *sessionBeadSnapshot) {
+	if sessionBeads == nil || cr.cityPath == "" {
+		return
+	}
+	now := time.Now()
+	keep := make(map[string]bool)
+	for _, bead := range sessionBeads.Open() {
+		if strings.TrimSpace(bead.Metadata["state"]) == string(sessionpkg.BaseStateClosed) {
+			continue
+		}
+		sn := strings.TrimSpace(bead.Metadata["session_name"])
+		if sn == "" {
+			continue
+		}
+		if cr.sessionDrainedPastPollerGrace(bead, now) {
+			continue
+		}
+		keep[sn] = true
+	}
+	reaped := reapLiveNudgePollers(cr.cityPath, func(sessionName, _ string) bool {
+		return keep[sessionName]
+	}, cr.stderr)
+	for _, target := range reaped {
+		fmt.Fprintf(cr.stderr, "%s: reaped orphaned nudge poller %s (session closed or drained past grace)\n", cr.logPrefix, target) //nolint:errcheck
+	}
+}
+
+// sessionDrainedPastPollerGrace reports whether the session bead has been
+// drained longer than pollerDrainReapGrace. The in-memory drain clock is
+// preferred; the bead's last-update timestamp is the durable fallback so
+// long-drained sessions stay covered across controller restarts. Unknown age
+// keeps the poller (conservative).
+func (cr *CityRuntime) sessionDrainedPastPollerGrace(bead beads.Bead, now time.Time) bool {
+	drained := strings.TrimSpace(bead.Metadata["state"]) == string(sessionpkg.BaseStateDrained) ||
+		strings.TrimSpace(bead.Metadata["sleep_reason"]) == "drained"
+	if !drained {
+		return false
+	}
+	if cr.sessionDrains != nil {
+		if ds := cr.sessionDrains.get(bead.ID); ds != nil {
+			return now.Sub(ds.startedAt) > pollerDrainReapGrace
+		}
+	}
+	since := bead.UpdatedAt
+	if since.IsZero() {
+		since = bead.CreatedAt
+	}
+	if since.IsZero() {
+		return false
+	}
+	return now.Sub(since) > pollerDrainReapGrace
 }
 
 func filterReleasedAssignedWorkBeads(assignedWorkBeads []beads.Bead, released []releasedPoolAssignment) []beads.Bead {

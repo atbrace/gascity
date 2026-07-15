@@ -9250,7 +9250,7 @@ func TestDualControlFullBreakerExchangeMakesBoundedPurgeProgress(t *testing.T) {
 				fallbackInProgress := activeBeforeErr == nil && retiredBeforeErr == nil
 				passBudget := defaultSpoolWorkBudget()
 				if fallbackInProgress {
-					passBudget = budget
+					passBudget.maxDirectories = spoolMinimumDirectoryProgress
 				}
 				physicalOpens = 0
 				result, purgeErr = purgeSpool(root, passBudget)

@@ -28,6 +28,13 @@ type PreflightChecker struct {
 	BDContext func(scope string) (PreflightBDContext, error)
 	// DatabaseProjectID reads the authoritative database _project_id for the scope.
 	DatabaseProjectID func(scope string) (string, bool, error)
+	// DeferIdentityToNativeOpen reports whether, when the direct database probe
+	// cannot confirm _project_id, the identity check may defer to beadslib's
+	// native-open verification (verifyProjectIdentity over the authenticated
+	// connection) instead of degrading the scope off the native store. It is
+	// set for scopes that resolve to an external endpoint the control-plane
+	// probe cannot authenticate.
+	DeferIdentityToNativeOpen func(scope string) bool
 	// BeadsLibraryVersion is the linked github.com/steveyegge/beads module
 	// version. Empty means infer it from build info.
 	BeadsLibraryVersion string
@@ -51,12 +58,25 @@ func (c PreflightChecker) Check(scope string) (PreflightResult, error) {
 		c.checkContractShape(metadata),
 	}
 	verdict := preflightVerdictForChecks(checks)
+	// A DEGRADED verdict caused solely by an unreachable bd context (e.g. a
+	// non-git city root where `bd context` cannot resolve a repo root) is
+	// upgraded to ELIGIBLE when gc has INDEPENDENTLY verified the dolt backend
+	// — the identity_match check connects to the dolt server and matches
+	// project_id. That direct verification is stronger evidence than bd
+	// context's cross-check, so an inability to also cross-verify via bd's
+	// cwd-sensitive context command must not force the per-call bd fallback.
+	eligibleViaIdentityFallback := false
+	if verdict == PreflightVerdictDegraded && bdCtxErr != nil && degradedOnlyByUnreachableBDContext(checks) {
+		verdict = PreflightVerdictEligible
+		eligibleViaIdentityFallback = true
+	}
 	result := PreflightResult{
-		Verdict:             verdict,
-		Scope:               scope,
-		Checks:              checks,
-		RepairSteps:         preflightRepairSteps(checks),
-		NativeStoreEligible: verdict == PreflightVerdictEligible,
+		Verdict:                           verdict,
+		Scope:                             scope,
+		Checks:                            checks,
+		RepairSteps:                       preflightRepairSteps(checks),
+		NativeStoreEligible:               verdict == PreflightVerdictEligible,
+		NativeEligibleViaIdentityFallback: eligibleViaIdentityFallback,
 	}
 	if verdict != PreflightVerdictEligible {
 		result.Fallback = PreflightFallbackBdStore
@@ -200,6 +220,20 @@ func (c PreflightChecker) checkIdentityMatch(scope string, metadata preflightMet
 	dbProjectID, ok, err := c.DatabaseProjectID(scope)
 	details.DBProjectID = strings.TrimSpace(dbProjectID)
 	if err != nil || !ok || details.DBProjectID == "" {
+		// The direct SQL probe connects with control-plane credentials only and
+		// cannot authenticate an external endpoint (a hosted beads-gateway, or a
+		// self-hosted authed dolt sql-server). For such endpoints the
+		// authoritative database _project_id is verified by beadslib at
+		// native-open time (verifyProjectIdentity over the authenticated
+		// connection), which refuses to connect on mismatch and drops the scope
+		// to BdStore — the same open-time gate BdStore itself relies on. Defer to
+		// that gate rather than claiming a confirmation the control plane cannot
+		// make, so the scope stays native-eligible without a false proof. A local
+		// endpoint, whose probe should have succeeded, still degrades so its
+		// genuine probe failure is not silently ignored.
+		if c.DeferIdentityToNativeOpen != nil && c.DeferIdentityToNativeOpen(scope) {
+			return NewPreflightCheckResult(PreflightCheckIdentityMatch, PreflightCheckPass, "database identity deferred to native-open verification (external endpoint)", details)
+		}
 		return NewPreflightCheckResult(PreflightCheckIdentityMatch, PreflightCheckWarn, "database project_id could not be confirmed", details)
 	}
 	if metadata.ProjectID != details.DBProjectID {
@@ -366,6 +400,40 @@ func preflightVerdictForChecks(checks []PreflightCheckResult) PreflightVerdict {
 		return PreflightVerdictDegraded
 	}
 	return PreflightVerdictEligible
+}
+
+// degradedOnlyByUnreachableBDContext reports whether a DEGRADED verdict is safe
+// to upgrade to ELIGIBLE. It is true only when the identity_match check PASSED
+// (gc independently connected to the dolt server and matched project_id) and
+// every non-passing check is a WARN from a bd-context-dependent check — i.e.
+// the sole cause of the degrade is that `bd context` could not run. Any FAIL,
+// or any WARN from a non-bd-context check, makes it false so the per-call bd
+// fallback is preserved.
+func degradedOnlyByUnreachableBDContext(checks []PreflightCheckResult) bool {
+	identityVerified := false
+	for _, check := range checks {
+		switch check.State {
+		case PreflightCheckFail:
+			return false
+		case PreflightCheckWarn:
+			if !isBDContextDependentCheck(check.ID) {
+				return false
+			}
+		}
+		if check.ID == PreflightCheckIdentityMatch && check.State == PreflightCheckPass {
+			identityVerified = true
+		}
+	}
+	return identityVerified
+}
+
+func isBDContextDependentCheck(id PreflightCheckID) bool {
+	switch id {
+	case PreflightCheckBDContextAgreement, PreflightCheckDoltModeSafe, PreflightCheckVersionCompat:
+		return true
+	default:
+		return false
+	}
 }
 
 func preflightRepairSteps(checks []PreflightCheckResult) []PreflightRepairStep {

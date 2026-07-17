@@ -149,7 +149,7 @@ func run(args []string, stdout, stderr io.Writer) int {
 	execStdout := &switchableWriter{target: stdout}
 	var jsonStdout bytes.Buffer
 	var observedStdout *countingWriter
-	root := newRootCmd(execStdout, stderr)
+	root := newRootCmd(execStdout, stderr, args...)
 	if args == nil {
 		args = []string{}
 	}
@@ -205,7 +205,12 @@ func commandFailureMessage(err error) string {
 }
 
 // newRootCmd creates the root cobra command with all subcommands.
-func newRootCmd(stdout, stderr io.Writer) *cobra.Command {
+//
+// argv is the process argument vector (excluding argv[0]). It is used only to
+// decide whether pack-command discovery — a filesystem- and config-heavy step
+// that costs ~1s per invocation — is actually needed for this call. Callers
+// that pass no argv (e.g. tests) get eager discovery, preserving prior behavior.
+func newRootCmd(stdout, stderr io.Writer, argv ...string) *cobra.Command {
 	root := &cobra.Command{
 		Use:           "gc",
 		Short:         "Gas City CLI — orchestration-builder for multi-agent workflows",
@@ -300,13 +305,45 @@ func newRootCmd(stdout, stderr io.Writer) *cobra.Command {
 	// gen-doc needs the root command to walk the tree; add after construction.
 	root.AddCommand(newGenDocCmd(stdout, stderr, root))
 
-	// Best-effort: discover pack CLI commands if we're inside a city.
-	registerPackCommands(root, stdout, stderr)
+	// Best-effort: discover pack CLI commands if we're inside a city. This is
+	// expensive (city resolution + config load), so only do it when this
+	// invocation might actually need pack commands present — a bare `gc`, help,
+	// completion, or a command name that isn't a built-in (and might be a pack
+	// command). A concrete built-in target neither needs nor can be shadowed by
+	// pack commands, so it skips discovery entirely. Pack-command execution for
+	// the unknown-command case is still backstopped by the root's RunE fallback
+	// (tryPackCommandFallback).
+	if shouldDiscoverPackCommands(root, argv) {
+		registerPackCommands(root, stdout, stderr)
+	}
 
 	installArgUsageErrors(root, stderr)
 	installFlagGroupUsageErrors(root, stderr)
 
 	return root
+}
+
+// shouldDiscoverPackCommands reports whether this invocation needs pack CLI
+// commands eagerly registered on the root. Discovery is expensive (city
+// resolution + config load, ~1s), so we skip it whenever argv targets a
+// concrete built-in command: packs are forbidden from shadowing built-ins, so
+// a built-in target can neither need nor be affected by pack commands.
+//
+// Discovery is still performed when there is no clear built-in target — a bare
+// `gc` (prints help listing all commands), `gc help`/`--help`, shell
+// completion, or an unknown first token that might name a pack command. In the
+// unknown case cobra falls through to the root RunE, whose tryPackCommandFallback
+// re-resolves and executes the pack command, so execution is never lost even if
+// this returns true only for listing purposes.
+func shouldDiscoverPackCommands(root *cobra.Command, argv []string) bool {
+	if len(argv) == 0 {
+		return true
+	}
+	target, _, err := root.Find(argv)
+	if err != nil || target == nil || target == root {
+		return true
+	}
+	return false
 }
 
 func installArgUsageErrors(cmd *cobra.Command, stderr io.Writer) {

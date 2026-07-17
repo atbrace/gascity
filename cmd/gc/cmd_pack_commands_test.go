@@ -238,6 +238,92 @@ func TestNewRootCmdExposesRootPackCommands(t *testing.T) {
 	}
 }
 
+// TestShouldDiscoverPackCommands pins the gate that keeps the ~1s pack-command
+// discovery (city resolution + config load) off the hot path. When argv targets
+// a concrete built-in command, discovery must be skipped; for a bare invocation,
+// help, completion, or an unknown (possibly-pack) first token, it must run.
+func TestShouldDiscoverPackCommands(t *testing.T) {
+	root := &cobra.Command{Use: "gc", RunE: func(*cobra.Command, []string) error { return nil }}
+	root.PersistentFlags().String("city", "", "")
+	root.AddCommand(&cobra.Command{Use: "version", RunE: func(*cobra.Command, []string) error { return nil }})
+	events := &cobra.Command{Use: "events", RunE: func(*cobra.Command, []string) error { return nil }}
+	events.Flags().Bool("watch", false, "")
+	root.AddCommand(events)
+
+	skip := [][]string{
+		{"version"},
+		{"events"},
+		{"events", "--watch"},
+		{"--city", "/somewhere", "events"}, // global flag before a built-in
+	}
+	for _, argv := range skip {
+		if shouldDiscoverPackCommands(root, argv) {
+			t.Errorf("argv %v targets a built-in; want skip (false), got discover (true)", argv)
+		}
+	}
+
+	discover := [][]string{
+		{},                  // bare gc -> help lists all commands
+		{"--help"},          // root help must list pack commands
+		{"help"},            // help subcommand (added lazily by cobra) not yet a built-in
+		{"completion"},      // shell completion must list pack commands
+		{"somepackcommand"}, // unknown first token might be a pack command
+	}
+	for _, argv := range discover {
+		if !shouldDiscoverPackCommands(root, argv) {
+			t.Errorf("argv %v has no built-in target; want discover (true), got skip (false)", argv)
+		}
+	}
+}
+
+// TestNewRootCmdGatesPackDiscoveryByArgv is the behavioral regression pin: with
+// a real pack city on the cwd, building the root for a built-in command
+// (`version`) must NOT register the pack namespace — proving the expensive
+// discovery I/O was skipped — while a bare or unknown-command build still does.
+func TestNewRootCmdGatesPackDiscoveryByArgv(t *testing.T) {
+	dir := t.TempDir()
+	cityDir := filepath.Join(dir, "city")
+	if err := os.MkdirAll(filepath.Join(cityDir, "commands", "hello"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(cityDir, "city.toml"), []byte("[workspace]\nname = \"test\"\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(cityDir, "pack.toml"), []byte("[pack]\nname = \"backstage\"\nschema = 2\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(cityDir, "commands", "hello", "run.sh"), []byte("#!/bin/sh\nexit 0\n"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+
+	oldWd, err := os.Getwd()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Chdir(cityDir); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = os.Chdir(oldWd) })
+
+	// Built-in target: discovery must be skipped, pack namespace absent.
+	builtin := newRootCmd(&bytes.Buffer{}, &bytes.Buffer{}, "version")
+	if findSubcommand(builtin, "backstage") != nil {
+		t.Fatal("pack discovery ran for a built-in command (`version`); it must be skipped")
+	}
+
+	// Bare invocation: help lists everything, so discovery must run.
+	bare := newRootCmd(&bytes.Buffer{}, &bytes.Buffer{})
+	if findSubcommand(bare, "backstage") == nil {
+		t.Fatal("pack discovery skipped for a bare invocation; help must list pack commands")
+	}
+
+	// Unknown first token (might be a pack command): discovery must run.
+	unknown := newRootCmd(&bytes.Buffer{}, &bytes.Buffer{}, "backstage")
+	if findSubcommand(unknown, "backstage") == nil {
+		t.Fatal("pack discovery skipped for an unknown command; pack commands must be discoverable")
+	}
+}
+
 func TestLegacyPackCommandHelpFlagUsesBuiltInHelp(t *testing.T) {
 	cityPath, packDir := setupPackCity(t)
 

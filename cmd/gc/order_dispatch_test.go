@@ -9474,3 +9474,38 @@ func TestSweepClosedOrderTrackingRetentionAcrossStoresBounded_ZeroLimitDeletesNo
 		t.Fatalf("deleted = %d, want 0 (limit=0 means no budget)", deleted)
 	}
 }
+
+func TestOrderDispatchMaxDispatchesPerTickConfig(t *testing.T) {
+	aa := []orders.Order{{
+		Name:         "cap-order",
+		Trigger:      "cooldown",
+		Interval:     "1m",
+		Formula:      "test-formula",
+		Pool:         "worker",
+		FormulaLayer: sharedTestFormulaDir,
+	}}
+
+	// Unset (zero) preserves the historical default of 4.
+	cfgDefault := &config.City{}
+	adDefault := buildOrderDispatcherFromOrderSet(t.TempDir(), cfgDefault, aa, events.Discard, &bytes.Buffer{})
+	mDefault, ok := adDefault.(*memoryOrderDispatcher)
+	if !ok {
+		t.Fatalf("expected *memoryOrderDispatcher, got %T", adDefault)
+	}
+	if mDefault.maxDispatchesPerTick != defaultMaxOrderDispatchesPerTick {
+		t.Errorf("default maxDispatchesPerTick = %d, want %d", mDefault.maxDispatchesPerTick, defaultMaxOrderDispatchesPerTick)
+	}
+
+	// Configured value of 1 overrides the default.
+	one := 1
+	cfgOne := &config.City{}
+	cfgOne.Orders.MaxDispatchesPerTick = &one
+	adOne := buildOrderDispatcherFromOrderSet(t.TempDir(), cfgOne, aa, events.Discard, &bytes.Buffer{})
+	mOne, ok := adOne.(*memoryOrderDispatcher)
+	if !ok {
+		t.Fatalf("expected *memoryOrderDispatcher, got %T", adOne)
+	}
+	if mOne.maxDispatchesPerTick != 1 {
+		t.Errorf("configured maxDispatchesPerTick = %d, want 1", mOne.maxDispatchesPerTick)
+	}
+}

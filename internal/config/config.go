@@ -1906,6 +1906,13 @@ type OrdersConfig struct {
 	// No order gets more than this duration. Go duration string (e.g., "60s").
 	// Empty means uncapped (no override).
 	MaxTimeout string `toml:"max_timeout,omitempty"`
+	// MaxDispatchesPerTick caps how many orders the supervisor dispatches
+	// per tick. Nil (unset) keeps the built-in default; set to 1 to drain
+	// overdue cooldown orders one-per-tick at cold start instead of firing
+	// several concurrent goroutines at once. Pointer so an unset value is
+	// omitted from marshalled config (BurntSushi omitempty does not drop a
+	// zero int).
+	MaxDispatchesPerTick *int `toml:"max_dispatches_per_tick,omitempty"`
 	// Overrides apply per-order field overrides after scanning.
 	// Each override targets an order by name and optionally by rig.
 	Overrides []OrderOverride `toml:"overrides,omitempty"`

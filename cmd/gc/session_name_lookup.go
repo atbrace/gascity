@@ -412,51 +412,91 @@ func poolSessionTemplateKeys(session beads.Bead, cfg *config.City) []string {
 	return keys
 }
 
-// poolSessionEffectiveTemplateKey resolves the single demand-map key a pool
-// session is counted under: the first of its candidate template keys that the
-// demand map (poolDesired, keyed by PoolDesiredState.Template) actually carries.
-// Aligning the live census and the capacity check on the same key sidesteps the
-// qualified-vs-bare template mismatch. Returns "" if the session's template has
-// no demand entry.
-func poolSessionEffectiveTemplateKey(session beads.Bead, cfg *config.City, poolDesired map[string]int) string {
+// canonicalTemplateKeyForName resolves a raw template string (bare or qualified)
+// to the owning configured agent's QualifiedName — the stable join key shared by
+// the pool live census and the pool demand census. Returns "" if no configured
+// agent owns the template.
+func canonicalTemplateKeyForName(cfg *config.City, template string) string {
+	if a := findAgentByTemplate(cfg, template); a != nil {
+		return a.QualifiedName()
+	}
+	return ""
+}
+
+// canonicalPoolTemplateKey resolves any spelling of a pool session's template
+// (via pool_template / normalized template / template metadata) to the owning
+// configured agent's QualifiedName. This is the sys-exbu keying fix: v1/v2 keyed
+// the census off the pool_slot-bearing metadata and the numeric poolDesired map,
+// both of which are structurally absent for canonical-singleton (slot-0) pools.
+// Returns "" if the session's template resolves to no configured agent (i.e. it
+// is not a managed pool member this grace should protect).
+func canonicalPoolTemplateKey(session beads.Bead, cfg *config.City) string {
 	for _, key := range poolSessionTemplateKeys(session, cfg) {
-		if _, ok := poolDesired[key]; ok {
-			return key
+		if resolved := canonicalTemplateKeyForName(cfg, key); resolved != "" {
+			return resolved
 		}
 	}
 	return ""
 }
 
-// poolLiveCountByTemplate censuses live pool-instance sessions per demand-map
-// template key. Only sessions carrying a pool_slot are counted (named/singleton
-// sessions never take the pool grace path). This counts sessions that are
-// ACTUALLY alive — not desired-state slot entries — which is the correction over
-// the v1 bound-count discriminator: the desired pool slot is keyed under a
-// pending/canonical name distinct from the concrete spawned session, so counting
-// desired-state entries was fooled into bound==desired and never granted grace
-// (sys-exbu, disproved in live dogfood).
-func poolLiveCountByTemplate(sessions []beads.Bead, cfg *config.City, poolDesired map[string]int) map[string]int {
-	counts := make(map[string]int, len(poolDesired))
-	for i := range sessions {
-		if strings.TrimSpace(sessions[i].Metadata["pool_slot"]) == "" {
+// poolGraceDesiredByTemplate builds the pool startup grace's demand ceiling,
+// keyed by configured-agent QualifiedName. A pool template's desired count can
+// live in EITHER of two places, so it unions both (by max — they count the same
+// demand two ways, not additively):
+//   - desiredState: a canonical-singleton pool (max_active_sessions=1) expresses
+//     its single desired slot as a desiredState entry, keyed under a canonical /
+//     pending name DISTINCT from the concrete spawned session. Such pools run at
+//     slot 0, carry no pool_slot, and are ABSENT from the numeric poolDesired
+//     map — exactly the blind spot that disproved v1/v2 live (sys-exbu).
+//   - poolDesired: an elastic pool expresses scale-check demand as a count.
+func poolGraceDesiredByTemplate(desiredState map[string]TemplateParams, poolDesired map[string]int, cfg *config.City) map[string]int {
+	out := make(map[string]int)
+	for _, tp := range desiredState {
+		if key := canonicalTemplateKeyForName(cfg, tp.TemplateName); key != "" {
+			out[key]++
+		}
+	}
+	for tmpl, n := range poolDesired {
+		if n <= 0 {
 			continue
 		}
-		if key := poolSessionEffectiveTemplateKey(sessions[i], cfg, poolDesired); key != "" {
+		if key := canonicalTemplateKeyForName(cfg, tmpl); key != "" && n > out[key] {
+			out[key] = n
+		}
+	}
+	return out
+}
+
+// poolLiveCountByTemplate censuses ACTUALLY-alive pool-managed sessions per
+// configured-agent QualifiedName. Membership is by isPoolManagedSessionBead (the
+// pool_managed marker, stamped at bead creation for every ephemeral pool session
+// regardless of slot) — NOT by pool_slot. Canonical-singleton pools run at
+// canonical slot 0 and carry no pool_slot (session_beads.go stamps it only when
+// poolSlot>0), so the v2 pool_slot-gated census counted them as 0 and the
+// capacity check never fired (sys-exbu). Counting live sessions — not
+// desiredState slot entries — also sidesteps the canonical-slot-vs-concrete-
+// session keying gap that fooled v1's bound-count discriminator.
+func poolLiveCountByTemplate(sessions []beads.Bead, cfg *config.City) map[string]int {
+	counts := make(map[string]int)
+	for i := range sessions {
+		if !isPoolManagedSessionBead(sessions[i]) {
+			continue
+		}
+		if key := canonicalPoolTemplateKey(sessions[i], cfg); key != "" {
 			counts[key]++
 		}
 	}
 	return counts
 }
 
-// poolSessionWithinDesiredCapacity reports whether keeping this fresh pool session
-// alive does NOT exceed the demand tier's desired count for its template — i.e.
-// live_count(template) <= poolDesired(template). This distinguishes a genuine
-// fresh spawn filling demand (1 live <= 1 desired -> protect through boot/claim)
-// from scale-DOWN excess (2 live > 1 desired -> the surplus must drain). It
-// replaces the v1 desired-state bound count, which the canonical-slot-vs-concrete-
-// session keying gap fooled into never firing (sys-exbu).
+// poolSessionWithinDesiredCapacity reports whether keeping this pool session alive
+// does NOT exceed the demand ceiling for its template — i.e. live_count <=
+// desired. This distinguishes a genuine fresh spawn filling demand (1 live <= 1
+// desired -> protect through boot/claim) from scale-DOWN excess (2 live > 1
+// desired -> the surplus must drain). Both sides are keyed by configured-agent
+// QualifiedName (see poolGraceDesiredByTemplate / poolLiveCountByTemplate).
 func poolSessionWithinDesiredCapacity(session beads.Bead, cfg *config.City, poolLive, poolDesired map[string]int) bool {
-	key := poolSessionEffectiveTemplateKey(session, cfg, poolDesired)
+	key := canonicalPoolTemplateKey(session, cfg)
 	if key == "" {
 		return false
 	}
@@ -464,19 +504,45 @@ func poolSessionWithinDesiredCapacity(session beads.Bead, cfg *config.City, pool
 	return desired > 0 && poolLive[key] <= desired
 }
 
-// poolSessionWithinStartupGrace reports whether session is a freshly-spawned
-// pool instance still inside its startup/claim window. A pool worker runs
-// `gc hook --claim` only AFTER it finishes booting (~seconds), so during this
-// window it legitimately holds no concrete-assigned work. Without this grace the
-// orphan gate drains every fresh spawn before it can claim, while the demand
-// tier keeps re-desiring one — the sys-exbu respawn treadmill. The grace reuses
-// the configured startup timeout (default 60s); a stale pool session past this
-// window with no claimed work is a genuine orphan and drains normally.
-func poolSessionWithinStartupGrace(session beads.Bead, cfg *config.City, clk clock.Clock) bool {
-	if strings.TrimSpace(session.Metadata["pool_slot"]) == "" {
+// poolSessionGraceEligible reports whether session is a managed pool member the
+// startup grace may protect: a pool_managed bead whose template resolves to a
+// configured agent. Deliberately INDEPENDENT of pool_slot so canonical-singleton
+// (slot-0) pool sessions qualify — the v1/v2 pool_slot gate excluded them and was
+// structurally dead for max-one pools (sys-exbu).
+func poolSessionGraceEligible(session beads.Bead, cfg *config.City) bool {
+	if !isPoolManagedSessionBead(session) {
 		return false
 	}
-	if session.CreatedAt.IsZero() {
+	return canonicalPoolTemplateKey(session, cfg) != ""
+}
+
+// poolSessionStartBoundary returns the best-known spawn time for a pool session,
+// preferring the pending_create_started_at metadata (stamped when the bead enters
+// state=creating for THIS spawn attempt) over the bead row's CreatedAt, which is
+// stale for reused/reopened beads. Mirrors pendingCreateAttemptStale. The bool is
+// false when no boundary is known (no metadata and zero CreatedAt).
+func poolSessionStartBoundary(session beads.Bead) (time.Time, bool) {
+	if started, ok := parseRFC3339Metadata(session.Metadata["pending_create_started_at"]); ok {
+		return started, true
+	}
+	if !session.CreatedAt.IsZero() {
+		return session.CreatedAt, true
+	}
+	return time.Time{}, false
+}
+
+// poolSessionWithinStartupGrace reports whether session is a freshly-spawned pool
+// instance still inside its startup/claim window. A pool worker runs
+// `gc hook --claim` only AFTER it finishes booting (~seconds), so during this
+// window it legitimately holds no concrete-assigned work. Without this grace the
+// orphan gate drains every fresh spawn before it can claim, while the demand tier
+// keeps re-desiring one — the sys-exbu respawn treadmill. Freshness is measured
+// from poolSessionStartBoundary (a reliable spawn timestamp, not stale CreatedAt);
+// the grace reuses the configured startup timeout (default 60s), so a pool session
+// past this window with no claimed work is a genuine orphan and drains normally.
+func poolSessionWithinStartupGrace(session beads.Bead, cfg *config.City, clk clock.Clock) bool {
+	start, ok := poolSessionStartBoundary(session)
+	if !ok {
 		return false
 	}
 	grace := time.Minute
@@ -485,9 +551,9 @@ func poolSessionWithinStartupGrace(session beads.Bead, cfg *config.City, clk clo
 			grace = d
 		}
 	}
-	age := clk.Now().UTC().Sub(session.CreatedAt.UTC())
-	// A non-positive age means CreatedAt is at or ahead of the reconcile clock
-	// (a data/clock anomaly, never a real fresh spawn) — don't grant grace.
+	age := clk.Now().UTC().Sub(start.UTC())
+	// A non-positive age means the start boundary is at or ahead of the reconcile
+	// clock (a data/clock anomaly, never a real fresh spawn) — don't grant grace.
 	return age >= 0 && age < grace
 }
 

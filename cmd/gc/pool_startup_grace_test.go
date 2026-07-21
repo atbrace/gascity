@@ -132,6 +132,102 @@ func TestReconcileSessionBeads_FreshPoolSessionSurvivesWithCanonicalSlotInDesire
 	}
 }
 
+// makeManagedSlotZeroPoolSession builds the TRUE production shape that disproved
+// v1 AND v2 (sys-exbu): a canonical-singleton (max_active_sessions=1) pool session
+// runs at canonical SLOT 0, so session_beads.go stamps pool_managed=true but NO
+// pool_slot (that metadata is written only when poolSlot>0). Both prior grace
+// fixes gated on pool_slot and were therefore structurally dead for this shape.
+// Freshness is expressed via pending_create_started_at (the reliable spawn stamp)
+// rather than overriding CreatedAt — proving the grace no longer depends on the
+// stale bead-row CreatedAt.
+func makeManagedSlotZeroPoolSession(t *testing.T, env *reconcilerTestEnv, name, template string, ageFromNow time.Duration) beads.Bead {
+	t.Helper()
+	session := env.createSessionBead(name, template)
+	env.setSessionMetadata(&session, map[string]string{
+		"pool_managed":              "true",
+		"session_origin":            "ephemeral",
+		"pending_create_started_at": env.clk.Now().UTC().Add(ageFromNow).Format(time.RFC3339),
+	})
+	env.markSessionActive(&session)
+	if err := env.sp.Start(context.Background(), name, runtime.Config{Command: "test-cmd"}); err != nil {
+		t.Fatalf("Start(%s): %v", name, err)
+	}
+	if err := env.sp.SetMeta(name, "GC_SESSION_ID", session.ID); err != nil {
+		t.Fatalf("SetMeta(GC_SESSION_ID): %v", err)
+	}
+	return session
+}
+
+// TestReconcileSessionBeads_FreshSlotZeroPoolSessionSurvives is the sys-exbu v3
+// regression, modeling the exact production shape v1+v2 missed: a fresh canonical-
+// singleton pool session with pool_managed=true but pool_slot ABSENT, whose only
+// demand is a canonical desiredState slot (NOT in the numeric poolDesired map, so
+// poolDesired is passed empty). The pool_slot-gated v1/v2 grace never fired for
+// this shape; v3 identifies pool membership by pool_managed and sources demand
+// from desiredState, so the fresh session is protected through its claim window.
+func TestReconcileSessionBeads_FreshSlotZeroPoolSessionSurvives(t *testing.T) {
+	env := newReconcilerTestEnv()
+	env.cfg = &config.City{Agents: []config.Agent{{Name: "muthur"}}}
+
+	// The demand tier's single desired slot: a desiredState entry keyed under a
+	// canonical/pending name, running=false, distinct from the concrete session.
+	env.addDesired("muthur-canonical-slot", "muthur", false)
+
+	// The concrete freshly-spawned slot-0 session: pool_managed, NO pool_slot,
+	// NOT keyed in desiredState, fresh (10s < 60s grace).
+	session := makeManagedSlotZeroPoolSession(t, env, "muthur-gc-abcd", "muthur", -10*time.Second)
+
+	// poolDesired is EMPTY — the production reality for a canonical-singleton pool
+	// (its demand lives only in desiredState).
+	woken := env.reconcileWithPoolDesired([]beads.Bead{session}, map[string]int{})
+	if woken != 0 {
+		t.Fatalf("woken = %d, want 0", woken)
+	}
+
+	if got := env.stdout.String(); containsDrainOrphaned(got, "muthur-gc-abcd") {
+		t.Fatalf("fresh slot-0 pool session (no pool_slot) was orphan-drained — the v1/v2 disproof shape:\nstdout=%s", got)
+	}
+	if !env.sp.IsRunning("muthur-gc-abcd") {
+		t.Fatalf("fresh slot-0 pool session runtime was stopped; expected it kept alive during startup grace")
+	}
+}
+
+// TestReconcileSessionBeads_StaleSlotZeroPoolSessionDrains proves the v3 grace is
+// still bounded for the slot-0 shape: past the startup window (freshness measured
+// from pending_create_started_at) an unclaimed pool session IS drained.
+func TestReconcileSessionBeads_StaleSlotZeroPoolSessionDrains(t *testing.T) {
+	env := newReconcilerTestEnv()
+	env.cfg = &config.City{Agents: []config.Agent{{Name: "muthur"}}}
+
+	env.addDesired("muthur-canonical-slot", "muthur", false)
+	// Stale: spawned 90s ago, past the 60s default startup grace.
+	session := makeManagedSlotZeroPoolSession(t, env, "muthur-gc-stale0", "muthur", -90*time.Second)
+
+	_ = env.reconcileWithPoolDesired([]beads.Bead{session}, map[string]int{})
+
+	if got := env.stdout.String(); !containsDrainOrphaned(got, "muthur-gc-stale0") {
+		t.Fatalf("stale slot-0 pool session past startup grace was NOT drained:\nstdout=%s", got)
+	}
+}
+
+// TestReconcileSessionBeads_FreshSlotZeroPoolSessionWithoutDemandDrains proves the
+// v3 grace still only protects sessions the demand tier wants: a fresh slot-0 pool
+// session whose template has NO desiredState slot and empty poolDesired is a
+// genuine orphan and IS drained.
+func TestReconcileSessionBeads_FreshSlotZeroPoolSessionWithoutDemandDrains(t *testing.T) {
+	env := newReconcilerTestEnv()
+	env.cfg = &config.City{Agents: []config.Agent{{Name: "muthur"}}}
+
+	// No desiredState slot for muthur, and empty poolDesired -> zero demand.
+	session := makeManagedSlotZeroPoolSession(t, env, "muthur-gc-nodemand0", "muthur", -10*time.Second)
+
+	_ = env.reconcileWithPoolDesired([]beads.Bead{session}, map[string]int{})
+
+	if got := env.stdout.String(); !containsDrainOrphaned(got, "muthur-gc-nodemand0") {
+		t.Fatalf("fresh slot-0 pool session with no template demand was NOT drained:\nstdout=%s", got)
+	}
+}
+
 func containsDrainOrphaned(stdout, name string) bool {
 	return strings.Contains(stdout, "Draining session '"+name+"': orphaned")
 }

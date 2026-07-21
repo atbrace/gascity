@@ -1109,14 +1109,19 @@ func reconcileSessionBeadsTracedWithNamedDemand(
 		}
 		rollbackPendingCreate(session, store, clk.Now().UTC(), stderr)
 	}
-	// Live pool-session census by template (sys-exbu): the orphan-drain startup
-	// grace for a freshly-spawned pool worker keys off how many pool instances are
-	// ACTUALLY alive for its template, not how many desired-state slots reference
-	// it. The desired slot is keyed under a pending/canonical name distinct from
-	// the concrete spawned session, so counting desired-state entries (v1) was
-	// fooled into never granting grace. Counting live sessions here sidesteps that
-	// keying mismatch. Computed once over the full session set the loop reconciles.
-	poolLiveByTemplate := poolLiveCountByTemplate(ordered, cfg, poolDesired)
+	// Pool startup-grace censuses (sys-exbu), computed once over the full session
+	// set the loop reconciles, both keyed by configured-agent QualifiedName:
+	//   - poolGraceDesired: the demand ceiling, unioning desiredState (canonical-
+	//     singleton slot-0 pools live here, absent from poolDesired) with the
+	//     numeric poolDesired (elastic pools). v1/v2 read only one source and
+	//     missed slot-0 pools.
+	//   - poolLiveByTemplate: how many pool-managed sessions are ACTUALLY alive
+	//     per template (by the pool_managed marker, NOT pool_slot — slot-0 pools
+	//     carry no pool_slot). Counting live sessions rather than desired-state
+	//     slot entries sidesteps the canonical-slot-vs-concrete-session keying gap
+	//     that fooled v1's bound-count discriminator.
+	poolGraceDesired := poolGraceDesiredByTemplate(desiredState, poolDesired, cfg)
+	poolLiveByTemplate := poolLiveCountByTemplate(ordered, cfg)
 
 	phaseStart = time.Now()
 	for i := range ordered {
@@ -1386,8 +1391,9 @@ func reconcileSessionBeadsTracedWithNamedDemand(
 					// a respawn treadmill. Give a fresh pool session that still
 					// has outstanding template demand time to boot and claim.
 					if reason == "orphaned" &&
+						poolSessionGraceEligible(*session, cfg) &&
 						poolSessionWithinStartupGrace(*session, cfg, clk) &&
-						poolSessionWithinDesiredCapacity(*session, cfg, poolLiveByTemplate, poolDesired) {
+						poolSessionWithinDesiredCapacity(*session, cfg, poolLiveByTemplate, poolGraceDesired) {
 						if trace != nil {
 							template := normalizedSessionTemplate(*session, cfg)
 							if template == "" {

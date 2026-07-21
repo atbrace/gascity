@@ -1369,6 +1369,29 @@ func reconcileSessionBeadsTracedWithNamedDemand(
 						fmt.Fprintf(stdout, "Skipping drain for '%s': live assigned work found\n", name) //nolint:errcheck
 						continue
 					}
+					// Pool boot/claim grace (sys-exbu): a freshly-spawned pool
+					// session has not yet run `gc hook --claim`, so it holds no
+					// concrete-assigned work during its startup window. The
+					// demand tier keeps desiring one for this template, but the
+					// orphan gate would drain each spawn before it can claim —
+					// a respawn treadmill. Give a fresh pool session that still
+					// has outstanding template demand time to boot and claim.
+					if reason == "orphaned" &&
+						poolSessionWithinStartupGrace(*session, cfg, clk) &&
+						poolSessionHasUnmetTemplateDemand(*session, cfg, desiredState, poolDesired) {
+						if trace != nil {
+							template := normalizedSessionTemplate(*session, cfg)
+							if template == "" {
+								template = session.Metadata["template"]
+							}
+							trace.recordDecision("reconciler.session.pool_startup_grace", template, name, reason, "kept_open", traceRecordPayload{
+								"provider_alive": providerAlive,
+								"pool_slot":      strings.TrimSpace(session.Metadata["pool_slot"]),
+							}, nil, "")
+						}
+						fmt.Fprintf(stdout, "Skipping drain for '%s': pool session in startup/claim grace\n", name) //nolint:errcheck
+						continue
+					}
 					if beginSessionDrain(*session, sp, dt, reason, clk, defaultDrainTimeout) {
 						if trace != nil {
 							template := normalizedSessionTemplate(*session, cfg)

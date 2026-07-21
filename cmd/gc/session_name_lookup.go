@@ -10,6 +10,7 @@ import (
 
 	"github.com/gastownhall/gascity/internal/agent"
 	"github.com/gastownhall/gascity/internal/beads"
+	"github.com/gastownhall/gascity/internal/clock"
 	"github.com/gastownhall/gascity/internal/config"
 	sessionpkg "github.com/gastownhall/gascity/internal/session"
 )
@@ -391,6 +392,79 @@ func normalizedSessionTemplate(bead beads.Bead, cfg *config.City) string {
 		return resolved
 	}
 	return template
+}
+
+// poolSessionTemplateKeys returns the candidate template keys a pool session may
+// be counted under in the desired-state demand map. Pool demand is keyed by the
+// agent template (PoolDesiredState.Template); a pool session records that same
+// template across a few metadata fields depending on how it was spawned, so we
+// probe all of them to avoid a keying mismatch silently disabling the grace.
+func poolSessionTemplateKeys(session beads.Bead, cfg *config.City) []string {
+	keys := make([]string, 0, 3)
+	add := func(s string) {
+		if s = strings.TrimSpace(s); s != "" {
+			keys = append(keys, s)
+		}
+	}
+	add(session.Metadata["pool_template"])
+	add(normalizedSessionTemplate(session, cfg))
+	add(session.Metadata["template"])
+	return keys
+}
+
+// poolTemplateBoundCount counts desired-state entries backed by the given
+// template — the pool sessions the reconciler has already committed to keeping.
+func poolTemplateBoundCount(desiredState map[string]TemplateParams, template string) int {
+	n := 0
+	for _, tp := range desiredState {
+		if tp.TemplateName == template {
+			n++
+		}
+	}
+	return n
+}
+
+// poolSessionHasUnmetTemplateDemand reports whether the demand tier desires MORE
+// sessions for this pool session's template than are already bound into desired
+// state. This is the treadmill precondition (sys-exbu): a fresh spawn fills a
+// real gap (bound < desired), so draining it before it can claim just forces a
+// re-spawn. It deliberately excludes scale-DOWN excess — there, demand is already
+// met by a bound session (bound >= desired), so this session is genuine excess
+// and must drain immediately.
+func poolSessionHasUnmetTemplateDemand(session beads.Bead, cfg *config.City, desiredState map[string]TemplateParams, poolDesired map[string]int) bool {
+	for _, key := range poolSessionTemplateKeys(session, cfg) {
+		if poolDesired[key] > poolTemplateBoundCount(desiredState, key) {
+			return true
+		}
+	}
+	return false
+}
+
+// poolSessionWithinStartupGrace reports whether session is a freshly-spawned
+// pool instance still inside its startup/claim window. A pool worker runs
+// `gc hook --claim` only AFTER it finishes booting (~seconds), so during this
+// window it legitimately holds no concrete-assigned work. Without this grace the
+// orphan gate drains every fresh spawn before it can claim, while the demand
+// tier keeps re-desiring one — the sys-exbu respawn treadmill. The grace reuses
+// the configured startup timeout (default 60s); a stale pool session past this
+// window with no claimed work is a genuine orphan and drains normally.
+func poolSessionWithinStartupGrace(session beads.Bead, cfg *config.City, clk clock.Clock) bool {
+	if strings.TrimSpace(session.Metadata["pool_slot"]) == "" {
+		return false
+	}
+	if session.CreatedAt.IsZero() {
+		return false
+	}
+	grace := time.Minute
+	if cfg != nil {
+		if d := cfg.Session.StartupTimeoutDuration(); d > 0 {
+			grace = d
+		}
+	}
+	age := clk.Now().UTC().Sub(session.CreatedAt.UTC())
+	// A non-positive age means CreatedAt is at or ahead of the reconcile clock
+	// (a data/clock anomaly, never a real fresh spawn) — don't grant grace.
+	return age >= 0 && age < grace
 }
 
 // findSessionNameByTemplate searches for an open session bead with the given

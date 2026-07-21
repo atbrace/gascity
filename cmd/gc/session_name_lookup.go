@@ -412,32 +412,56 @@ func poolSessionTemplateKeys(session beads.Bead, cfg *config.City) []string {
 	return keys
 }
 
-// poolTemplateBoundCount counts desired-state entries backed by the given
-// template — the pool sessions the reconciler has already committed to keeping.
-func poolTemplateBoundCount(desiredState map[string]TemplateParams, template string) int {
-	n := 0
-	for _, tp := range desiredState {
-		if tp.TemplateName == template {
-			n++
+// poolSessionEffectiveTemplateKey resolves the single demand-map key a pool
+// session is counted under: the first of its candidate template keys that the
+// demand map (poolDesired, keyed by PoolDesiredState.Template) actually carries.
+// Aligning the live census and the capacity check on the same key sidesteps the
+// qualified-vs-bare template mismatch. Returns "" if the session's template has
+// no demand entry.
+func poolSessionEffectiveTemplateKey(session beads.Bead, cfg *config.City, poolDesired map[string]int) string {
+	for _, key := range poolSessionTemplateKeys(session, cfg) {
+		if _, ok := poolDesired[key]; ok {
+			return key
 		}
 	}
-	return n
+	return ""
 }
 
-// poolSessionHasUnmetTemplateDemand reports whether the demand tier desires MORE
-// sessions for this pool session's template than are already bound into desired
-// state. This is the treadmill precondition (sys-exbu): a fresh spawn fills a
-// real gap (bound < desired), so draining it before it can claim just forces a
-// re-spawn. It deliberately excludes scale-DOWN excess — there, demand is already
-// met by a bound session (bound >= desired), so this session is genuine excess
-// and must drain immediately.
-func poolSessionHasUnmetTemplateDemand(session beads.Bead, cfg *config.City, desiredState map[string]TemplateParams, poolDesired map[string]int) bool {
-	for _, key := range poolSessionTemplateKeys(session, cfg) {
-		if poolDesired[key] > poolTemplateBoundCount(desiredState, key) {
-			return true
+// poolLiveCountByTemplate censuses live pool-instance sessions per demand-map
+// template key. Only sessions carrying a pool_slot are counted (named/singleton
+// sessions never take the pool grace path). This counts sessions that are
+// ACTUALLY alive — not desired-state slot entries — which is the correction over
+// the v1 bound-count discriminator: the desired pool slot is keyed under a
+// pending/canonical name distinct from the concrete spawned session, so counting
+// desired-state entries was fooled into bound==desired and never granted grace
+// (sys-exbu, disproved in live dogfood).
+func poolLiveCountByTemplate(sessions []beads.Bead, cfg *config.City, poolDesired map[string]int) map[string]int {
+	counts := make(map[string]int, len(poolDesired))
+	for i := range sessions {
+		if strings.TrimSpace(sessions[i].Metadata["pool_slot"]) == "" {
+			continue
+		}
+		if key := poolSessionEffectiveTemplateKey(sessions[i], cfg, poolDesired); key != "" {
+			counts[key]++
 		}
 	}
-	return false
+	return counts
+}
+
+// poolSessionWithinDesiredCapacity reports whether keeping this fresh pool session
+// alive does NOT exceed the demand tier's desired count for its template — i.e.
+// live_count(template) <= poolDesired(template). This distinguishes a genuine
+// fresh spawn filling demand (1 live <= 1 desired -> protect through boot/claim)
+// from scale-DOWN excess (2 live > 1 desired -> the surplus must drain). It
+// replaces the v1 desired-state bound count, which the canonical-slot-vs-concrete-
+// session keying gap fooled into never firing (sys-exbu).
+func poolSessionWithinDesiredCapacity(session beads.Bead, cfg *config.City, poolLive, poolDesired map[string]int) bool {
+	key := poolSessionEffectiveTemplateKey(session, cfg, poolDesired)
+	if key == "" {
+		return false
+	}
+	desired := poolDesired[key]
+	return desired > 0 && poolLive[key] <= desired
 }
 
 // poolSessionWithinStartupGrace reports whether session is a freshly-spawned

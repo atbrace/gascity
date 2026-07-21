@@ -1109,6 +1109,15 @@ func reconcileSessionBeadsTracedWithNamedDemand(
 		}
 		rollbackPendingCreate(session, store, clk.Now().UTC(), stderr)
 	}
+	// Live pool-session census by template (sys-exbu): the orphan-drain startup
+	// grace for a freshly-spawned pool worker keys off how many pool instances are
+	// ACTUALLY alive for its template, not how many desired-state slots reference
+	// it. The desired slot is keyed under a pending/canonical name distinct from
+	// the concrete spawned session, so counting desired-state entries (v1) was
+	// fooled into never granting grace. Counting live sessions here sidesteps that
+	// keying mismatch. Computed once over the full session set the loop reconciles.
+	poolLiveByTemplate := poolLiveCountByTemplate(ordered, cfg, poolDesired)
+
 	phaseStart = time.Now()
 	for i := range ordered {
 		if ctx != nil && ctx.Err() != nil {
@@ -1378,7 +1387,7 @@ func reconcileSessionBeadsTracedWithNamedDemand(
 					// has outstanding template demand time to boot and claim.
 					if reason == "orphaned" &&
 						poolSessionWithinStartupGrace(*session, cfg, clk) &&
-						poolSessionHasUnmetTemplateDemand(*session, cfg, desiredState, poolDesired) {
+						poolSessionWithinDesiredCapacity(*session, cfg, poolLiveByTemplate, poolDesired) {
 						if trace != nil {
 							template := normalizedSessionTemplate(*session, cfg)
 							if template == "" {

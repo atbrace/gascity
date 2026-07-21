@@ -98,6 +98,40 @@ func TestReconcileSessionBeads_FreshPoolSessionWithoutDemandDrains(t *testing.T)
 	}
 }
 
+// TestReconcileSessionBeads_FreshPoolSessionSurvivesWithCanonicalSlotInDesiredState
+// models the PRODUCTION shape that disproved the v1 fix (sys-exbu): the demand
+// tier's desired pool slot is present in desiredState keyed under a canonical /
+// pending name ("muthur-pending-xyz"), distinct from the concrete spawned session
+// ("muthur-gc-abcd") that is actually alive. v1 counted desired-state entries by
+// template (poolTemplateBoundCount): the pending slot made bound==desired, so
+// "unmet demand" was always false and the grace never fired — the concrete
+// session drained every tick. The live-count discriminator counts ACTUAL live
+// pool sessions (1) against poolDesired (1), so the fresh session is protected.
+func TestReconcileSessionBeads_FreshPoolSessionSurvivesWithCanonicalSlotInDesiredState(t *testing.T) {
+	env := newReconcilerTestEnv()
+	env.cfg = &config.City{Agents: []config.Agent{{Name: "muthur"}}}
+
+	// The demand tier's desired slot: present in desiredState under a canonical /
+	// pending name, NOT the concrete session's name. running=false so no runtime
+	// is registered under the pending name (only the concrete session is alive).
+	env.addDesired("muthur-pending-xyz", "muthur", false)
+
+	// The concrete freshly-spawned session, NOT keyed in desiredState.
+	session := makeRunningOrphanPoolSession(t, env, "muthur-gc-abcd", "muthur", -10*time.Second)
+
+	woken := env.reconcileWithPoolDesired([]beads.Bead{session}, map[string]int{"muthur": 1})
+	if woken != 0 {
+		t.Fatalf("woken = %d, want 0", woken)
+	}
+
+	if got := env.stdout.String(); containsDrainOrphaned(got, "muthur-gc-abcd") {
+		t.Fatalf("fresh pool session was orphan-drained despite a canonical desired slot (v1 disproof shape):\nstdout=%s", got)
+	}
+	if !env.sp.IsRunning("muthur-gc-abcd") {
+		t.Fatalf("fresh pool session runtime was stopped; expected it kept alive during startup grace")
+	}
+}
+
 func containsDrainOrphaned(stdout, name string) bool {
 	return strings.Contains(stdout, "Draining session '"+name+"': orphaned")
 }

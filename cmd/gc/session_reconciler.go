@@ -1378,30 +1378,6 @@ func reconcileSessionBeadsTracedWithNamedDemand(
 						fmt.Fprintf(stdout, "Skipping drain for '%s': live assigned work found\n", name) //nolint:errcheck
 						continue
 					}
-					// DIAG(sys-exbu): why did the pool startup grace not fire?
-					// Temporary — emits the exact inputs to the grace predicates
-					// for EVERY orphaned session (not gated on pool_slot, since the
-					// RCA is that max-one/slot-0 pool sessions carry NO pool_slot
-					// metadata at all). Remove after RCA.
-					if reason == "orphaned" {
-						effKey := poolSessionEffectiveTemplateKey(*session, cfg, poolDesired)
-						age := clk.Now().UTC().Sub(session.CreatedAt.UTC())
-						isCfgAgent := findAgentByTemplate(cfg, normalizedSessionTemplate(*session, cfg)) != nil
-						fmt.Fprintf(stderr, "DIAG-exbu drain-orphan session=%s pool_slot=%q metaTemplate=%q normTemplate=%q cfgAgent=%t effKey=%q poolDesired=%v poolLive=%v createdAt=%q age=%s withinGrace=%t withinCapacity=%t\n",
-							name,
-							strings.TrimSpace(session.Metadata["pool_slot"]),
-							session.Metadata["template"],
-							normalizedSessionTemplate(*session, cfg),
-							isCfgAgent,
-							effKey,
-							poolDesired,
-							poolLiveByTemplate,
-							session.CreatedAt.Format(time.RFC3339),
-							age,
-							poolSessionWithinStartupGrace(*session, cfg, clk),
-							poolSessionWithinDesiredCapacity(*session, cfg, poolLiveByTemplate, poolDesired),
-						) //nolint:errcheck
-					}
 					// Pool boot/claim grace (sys-exbu): a freshly-spawned pool
 					// session has not yet run `gc hook --claim`, so it holds no
 					// concrete-assigned work during its startup window. The

@@ -439,69 +439,87 @@ func canonicalPoolTemplateKey(session beads.Bead, cfg *config.City) string {
 	return ""
 }
 
-// poolGraceDesiredByTemplate builds the pool startup grace's demand ceiling,
-// keyed by configured-agent QualifiedName. A pool template's desired count can
-// live in EITHER of two places, so it unions both (by max — they count the same
-// demand two ways, not additively):
-//   - desiredState: a canonical-singleton pool (max_active_sessions=1) expresses
-//     its single desired slot as a desiredState entry, keyed under a canonical /
-//     pending name DISTINCT from the concrete spawned session. Such pools run at
-//     slot 0, carry no pool_slot, and are ABSENT from the numeric poolDesired
-//     map — exactly the blind spot that disproved v1/v2 live (sys-exbu).
-//   - poolDesired: an elastic pool expresses scale-check demand as a count.
-func poolGraceDesiredByTemplate(desiredState map[string]TemplateParams, poolDesired map[string]int, cfg *config.City) map[string]int {
-	out := make(map[string]int)
+// poolSessionTemplateDemand returns the desired session count for this pool
+// session's template. It probes BOTH demand sources using the session's OWN
+// template-key spellings (poolSessionTemplateKeys) rather than re-resolving each
+// demand-map key through findAgentByTemplate — which is asymmetric (it matches a
+// bare local name like "muthur" but NOT the rig-qualified "sysadmin/muthur"), and
+// in v3 silently dropped the qualified poolDesired key, yielding desired=0 and no
+// grace live (sys-exbu, disproven by the exbudiag3 capture):
+//   - poolDesired: the numeric demand map (elastic scale-check + wake demand),
+//     probed directly by the session's keys (the spelling the demand computation
+//     used IS one of them).
+//   - desiredState: a canonical-singleton pool's single desired slot, matched by
+//     template equivalence.
+//
+// Returns the max of the two (they count the same demand two ways, not additively).
+func poolSessionTemplateDemand(session beads.Bead, cfg *config.City, desiredState map[string]TemplateParams, poolDesired map[string]int) int {
+	keys := poolSessionTemplateKeys(session, cfg)
+	demand := 0
+	for _, k := range keys {
+		if n := poolDesired[k]; n > demand {
+			demand = n
+		}
+	}
+	dsCount := 0
 	for _, tp := range desiredState {
-		if key := canonicalTemplateKeyForName(cfg, tp.TemplateName); key != "" {
-			out[key]++
+		for _, k := range keys {
+			if agentTemplateIdentitiesEquivalent(cfg, tp.TemplateName, k) {
+				dsCount++
+				break
+			}
 		}
 	}
-	for tmpl, n := range poolDesired {
-		if n <= 0 {
-			continue
-		}
-		if key := canonicalTemplateKeyForName(cfg, tmpl); key != "" && n > out[key] {
-			out[key] = n
-		}
+	if dsCount > demand {
+		demand = dsCount
 	}
-	return out
+	return demand
 }
 
-// poolLiveCountByTemplate censuses ACTUALLY-alive pool-managed sessions per
-// configured-agent QualifiedName. Membership is by isPoolManagedSessionBead (the
-// pool_managed marker, stamped at bead creation for every ephemeral pool session
-// regardless of slot) — NOT by pool_slot. Canonical-singleton pools run at
-// canonical slot 0 and carry no pool_slot (session_beads.go stamps it only when
-// poolSlot>0), so the v2 pool_slot-gated census counted them as 0 and the
-// capacity check never fired (sys-exbu). Counting live sessions — not
-// desiredState slot entries — also sidesteps the canonical-slot-vs-concrete-
-// session keying gap that fooled v1's bound-count discriminator.
-func poolLiveCountByTemplate(sessions []beads.Bead, cfg *config.City) map[string]int {
-	counts := make(map[string]int)
+// poolLiveCountForSessionTemplate counts pool-managed sessions (by the
+// pool_managed marker, not pool_slot — slot-0 canonical-singleton pools carry no
+// pool_slot) whose template is equivalent to this session's, using the SAME
+// template-equivalence relation as poolSessionTemplateDemand so the live census
+// and the demand ceiling are consistently keyed.
+func poolLiveCountForSessionTemplate(session beads.Bead, cfg *config.City, sessions []beads.Bead) int {
+	keys := poolSessionTemplateKeys(session, cfg)
+	count := 0
 	for i := range sessions {
 		if !isPoolManagedSessionBead(sessions[i]) {
 			continue
 		}
-		if key := canonicalPoolTemplateKey(sessions[i], cfg); key != "" {
-			counts[key]++
+		if poolSessionTemplateKeysMatchAny(sessions[i], cfg, keys) {
+			count++
 		}
 	}
-	return counts
+	return count
+}
+
+// poolSessionTemplateKeysMatchAny reports whether any of session's template-key
+// spellings is agent-equivalent to any key in want.
+func poolSessionTemplateKeysMatchAny(session beads.Bead, cfg *config.City, want []string) bool {
+	for _, sk := range poolSessionTemplateKeys(session, cfg) {
+		for _, k := range want {
+			if agentTemplateIdentitiesEquivalent(cfg, sk, k) {
+				return true
+			}
+		}
+	}
+	return false
 }
 
 // poolSessionWithinDesiredCapacity reports whether keeping this pool session alive
-// does NOT exceed the demand ceiling for its template — i.e. live_count <=
-// desired. This distinguishes a genuine fresh spawn filling demand (1 live <= 1
-// desired -> protect through boot/claim) from scale-DOWN excess (2 live > 1
-// desired -> the surplus must drain). Both sides are keyed by configured-agent
-// QualifiedName (see poolGraceDesiredByTemplate / poolLiveCountByTemplate).
-func poolSessionWithinDesiredCapacity(session beads.Bead, cfg *config.City, poolLive, poolDesired map[string]int) bool {
-	key := canonicalPoolTemplateKey(session, cfg)
-	if key == "" {
+// does NOT exceed its template's desired count — i.e. live_count <= desired. This
+// distinguishes a genuine fresh spawn filling demand (1 live <= 1 desired ->
+// protect through boot/claim) from scale-DOWN excess (2 live > 1 desired -> the
+// surplus must drain). Demand and live census are both computed session-centrically
+// (see poolSessionTemplateDemand / poolLiveCountForSessionTemplate).
+func poolSessionWithinDesiredCapacity(session beads.Bead, cfg *config.City, ordered []beads.Bead, desiredState map[string]TemplateParams, poolDesired map[string]int) bool {
+	demand := poolSessionTemplateDemand(session, cfg, desiredState, poolDesired)
+	if demand <= 0 {
 		return false
 	}
-	desired := poolDesired[key]
-	return desired > 0 && poolLive[key] <= desired
+	return poolLiveCountForSessionTemplate(session, cfg, ordered) <= demand
 }
 
 // poolSessionGraceEligible reports whether session is a managed pool member the

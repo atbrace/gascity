@@ -228,6 +228,35 @@ func TestReconcileSessionBeads_FreshSlotZeroPoolSessionWithoutDemandDrains(t *te
 	}
 }
 
+// TestPoolSessionTemplateDemand_ProbesPoolDesiredByRawTemplateKey is the sys-exbu
+// v4 regression from the exbudiag3 live capture: v3 built the demand ceiling by
+// re-resolving every poolDesired key through findAgentByTemplate, which is
+// asymmetric (matches a bare local name but not the rig-qualified form). For a
+// rig-qualified pool template the numeric demand key ("sysadmin/muthur") was
+// dropped -> desired=0 -> no grace, even though poolDesired carried it =1. v4
+// probes poolDesired DIRECTLY with the session's own template-key spellings, so
+// the qualified key matches by string and the demand is found.
+func TestPoolSessionTemplateDemand_ProbesPoolDesiredByRawTemplateKey(t *testing.T) {
+	cfg := &config.City{Agents: []config.Agent{{Name: "muthur", Dir: "sysadmin"}}}
+	// Session carries its template as the rig-qualified string, exactly as the
+	// live muthur-gc-XXXX bead did (DIAG: tmpl="sysadmin/muthur").
+	session := beads.Bead{Metadata: map[string]string{
+		"session_name": "muthur-gc-abcd",
+		"template":     "sysadmin/muthur",
+		"pool_managed": "true",
+	}}
+	// poolDesired keyed by the rig-qualified name (the shape that yielded desired=0
+	// under v3). desiredState empty — demand lives only in poolDesired here.
+	poolDesired := map[string]int{"sysadmin/muthur": 1}
+	if got := poolSessionTemplateDemand(session, cfg, map[string]TemplateParams{}, poolDesired); got != 1 {
+		t.Fatalf("poolSessionTemplateDemand = %d, want 1 (v3 dropped the qualified key to 0)", got)
+	}
+	// And the capacity gate is satisfied with a single live session.
+	if !poolSessionWithinDesiredCapacity(session, cfg, []beads.Bead{session}, map[string]TemplateParams{}, poolDesired) {
+		t.Fatal("poolSessionWithinDesiredCapacity = false, want true (1 live <= 1 desired)")
+	}
+}
+
 func containsDrainOrphaned(stdout, name string) bool {
 	return strings.Contains(stdout, "Draining session '"+name+"': orphaned")
 }

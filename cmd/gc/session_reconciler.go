@@ -1109,20 +1109,6 @@ func reconcileSessionBeadsTracedWithNamedDemand(
 		}
 		rollbackPendingCreate(session, store, clk.Now().UTC(), stderr)
 	}
-	// Pool startup-grace censuses (sys-exbu), computed once over the full session
-	// set the loop reconciles, both keyed by configured-agent QualifiedName:
-	//   - poolGraceDesired: the demand ceiling, unioning desiredState (canonical-
-	//     singleton slot-0 pools live here, absent from poolDesired) with the
-	//     numeric poolDesired (elastic pools). v1/v2 read only one source and
-	//     missed slot-0 pools.
-	//   - poolLiveByTemplate: how many pool-managed sessions are ACTUALLY alive
-	//     per template (by the pool_managed marker, NOT pool_slot — slot-0 pools
-	//     carry no pool_slot). Counting live sessions rather than desired-state
-	//     slot entries sidesteps the canonical-slot-vs-concrete-session keying gap
-	//     that fooled v1's bound-count discriminator.
-	poolGraceDesired := poolGraceDesiredByTemplate(desiredState, poolDesired, cfg)
-	poolLiveByTemplate := poolLiveCountByTemplate(ordered, cfg)
-
 	phaseStart = time.Now()
 	for i := range ordered {
 		if ctx != nil && ctx.Err() != nil {
@@ -1383,33 +1369,6 @@ func reconcileSessionBeadsTracedWithNamedDemand(
 						fmt.Fprintf(stdout, "Skipping drain for '%s': live assigned work found\n", name) //nolint:errcheck
 						continue
 					}
-					// DIAG-exbu (TEMP, remove after v3 RCA): log the full grace
-					// predicate breakdown for every orphaned-reason drain so a single
-					// short instrumented dogfood reveals which predicate short-circuits
-					// live (beads are pruned post-drain, so this is the only ground
-					// truth). Prints to stderr, which lands in supervisor.log.
-					if reason == "orphaned" {
-						dkey := canonicalPoolTemplateKey(*session, cfg)
-						dstart, dok := poolSessionStartBoundary(*session)
-						dage := time.Duration(-1)
-						if dok {
-							dage = clk.Now().UTC().Sub(dstart.UTC())
-						}
-						fmt.Fprintf(stderr, "DIAG-exbu: name=%s pool_managed=%q pool_slot=%q origin=%q tmpl=%q key=%q eligible=%t fresh=%t withinCap=%t pcsa=%q createdAt=%s age=%s desired=%d live=%d\n",
-							name,
-							strings.TrimSpace(session.Metadata["pool_managed"]),
-							strings.TrimSpace(session.Metadata["pool_slot"]),
-							strings.TrimSpace(session.Metadata["session_origin"]),
-							strings.TrimSpace(session.Metadata["template"]),
-							dkey,
-							poolSessionGraceEligible(*session, cfg),
-							poolSessionWithinStartupGrace(*session, cfg, clk),
-							poolSessionWithinDesiredCapacity(*session, cfg, poolLiveByTemplate, poolGraceDesired),
-							strings.TrimSpace(session.Metadata["pending_create_started_at"]),
-							session.CreatedAt.UTC().Format(time.RFC3339),
-							dage, poolGraceDesired[dkey], poolLiveByTemplate[dkey],
-						) //nolint:errcheck
-					}
 					// Pool boot/claim grace (sys-exbu): a freshly-spawned pool
 					// session has not yet run `gc hook --claim`, so it holds no
 					// concrete-assigned work during its startup window. The
@@ -1420,7 +1379,7 @@ func reconcileSessionBeadsTracedWithNamedDemand(
 					if reason == "orphaned" &&
 						poolSessionGraceEligible(*session, cfg) &&
 						poolSessionWithinStartupGrace(*session, cfg, clk) &&
-						poolSessionWithinDesiredCapacity(*session, cfg, poolLiveByTemplate, poolGraceDesired) {
+						poolSessionWithinDesiredCapacity(*session, cfg, ordered, desiredState, poolDesired) {
 						if trace != nil {
 							template := normalizedSessionTemplate(*session, cfg)
 							if template == "" {

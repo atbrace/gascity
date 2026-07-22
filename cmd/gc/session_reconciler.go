@@ -1383,6 +1383,33 @@ func reconcileSessionBeadsTracedWithNamedDemand(
 						fmt.Fprintf(stdout, "Skipping drain for '%s': live assigned work found\n", name) //nolint:errcheck
 						continue
 					}
+					// DIAG-exbu (TEMP, remove after v3 RCA): log the full grace
+					// predicate breakdown for every orphaned-reason drain so a single
+					// short instrumented dogfood reveals which predicate short-circuits
+					// live (beads are pruned post-drain, so this is the only ground
+					// truth). Prints to stderr, which lands in supervisor.log.
+					if reason == "orphaned" {
+						dkey := canonicalPoolTemplateKey(*session, cfg)
+						dstart, dok := poolSessionStartBoundary(*session)
+						dage := time.Duration(-1)
+						if dok {
+							dage = clk.Now().UTC().Sub(dstart.UTC())
+						}
+						fmt.Fprintf(stderr, "DIAG-exbu: name=%s pool_managed=%q pool_slot=%q origin=%q tmpl=%q key=%q eligible=%t fresh=%t withinCap=%t pcsa=%q createdAt=%s age=%s desired=%d live=%d\n",
+							name,
+							strings.TrimSpace(session.Metadata["pool_managed"]),
+							strings.TrimSpace(session.Metadata["pool_slot"]),
+							strings.TrimSpace(session.Metadata["session_origin"]),
+							strings.TrimSpace(session.Metadata["template"]),
+							dkey,
+							poolSessionGraceEligible(*session, cfg),
+							poolSessionWithinStartupGrace(*session, cfg, clk),
+							poolSessionWithinDesiredCapacity(*session, cfg, poolLiveByTemplate, poolGraceDesired),
+							strings.TrimSpace(session.Metadata["pending_create_started_at"]),
+							session.CreatedAt.UTC().Format(time.RFC3339),
+							dage, poolGraceDesired[dkey], poolLiveByTemplate[dkey],
+						) //nolint:errcheck
+					}
 					// Pool boot/claim grace (sys-exbu): a freshly-spawned pool
 					// session has not yet run `gc hook --claim`, so it holds no
 					// concrete-assigned work during its startup window. The

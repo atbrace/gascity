@@ -317,8 +317,14 @@ func cmdHookWithOptions(args []string, opts hookCommandOptions, stdout, stderr i
 		stores = appendCityHookStore(stores, cityPath, cfg, &a, overrides)
 	}
 
+	// winningStore tracks which federated store the work query hit, so the
+	// claim path can mutate the bead in the store it was FOUND in (a claim
+	// against the agent's primary store fails "bead not found" when the work
+	// lives in a federated store — sys-exbu).
+	var winningStore *hookStore
 	runner := func(command, _ string) (string, error) {
-		out, err := firstStoreWithWork(command, stores, shellWorkQueryWithEnv)
+		out, st, err := firstStoreWithWork(command, stores, shellWorkQueryWithEnv)
+		winningStore = st
 		if err != nil && emitFailureEvent {
 			// A killed/timed-out work query strands the session with no
 			// output and no cause on the event bus; emit one so the
@@ -351,7 +357,13 @@ func cmdHookWithOptions(args []string, opts hookCommandOptions, stdout, stderr i
 			DrainAck:     opts.DrainAck,
 			JSON:         opts.JSON,
 		}
-		return doHookClaim(workQuery, workDir, claimOpts, hookClaimOps{Runner: runner}, stdout, stderr)
+		claimStore := func() (string, []string, bool) {
+			if winningStore == nil {
+				return "", nil, false
+			}
+			return winningStore.dir, winningStore.env, true
+		}
+		return doHookClaim(workQuery, workDir, claimOpts, hookClaimOps{Runner: runner, ClaimStore: claimStore}, stdout, stderr)
 	}
 	return doHook(workQuery, workDir, false, runner, stdout, stderr)
 }

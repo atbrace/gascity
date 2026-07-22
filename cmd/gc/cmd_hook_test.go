@@ -274,6 +274,80 @@ func TestDoHookClaimReturnsExistingAssignment(t *testing.T) {
 	}
 }
 
+// TestDoHookClaimMutatesWinningFederatedStore is the sys-exbu cross-store
+// claim regression: the work query federates across stores and can find the
+// candidate in a store that is NOT the agent's primary (a rig-scoped agent
+// claiming a city-store order wisp). The claim mutation must be issued
+// against the store the work was FOUND in — claiming against the primary
+// store fails "bead not found" and the session drains unclaimed forever.
+func TestDoHookClaimMutatesWinningFederatedStore(t *testing.T) {
+	var claimDir string
+	var claimEnv []string
+	runner := func(string, string) (string, error) {
+		return `[{"id":"gc-1ki4","status":"open","metadata":{"gc.routed_to":"sysadmin/muthur"}}]`, nil
+	}
+	ops := hookClaimOps{
+		Runner: runner,
+		Claim: func(_ context.Context, dir string, env []string, beadID, assignee string) (beads.Bead, bool, error) {
+			claimDir, claimEnv = dir, env
+			return beads.Bead{ID: beadID, Status: "in_progress", Assignee: assignee}, true, nil
+		},
+		ClaimStore: func() (string, []string, bool) {
+			return "/city/path", []string{"BEADS_DIR=/city/store"}, true
+		},
+	}
+	opts := hookClaimOptions{
+		Assignee:           "muthur-gc-abcd",
+		IdentityCandidates: []string{"muthur-gc-abcd"},
+		RouteTargets:       []string{"sysadmin/muthur"},
+		Env:                []string{"BEADS_DIR=/rig/store"},
+		JSON:               true,
+	}
+
+	var stdout, stderr bytes.Buffer
+	code := doHookClaim("bd ready --json", "/rig/work", opts, ops, &stdout, &stderr)
+	if code != 0 {
+		t.Fatalf("doHookClaim(cross-store) = %d, want 0; stderr=%s", code, stderr.String())
+	}
+	if claimDir != "/city/path" {
+		t.Fatalf("Claim dir = %q, want the winning store's dir \"/city/path\" (primary-store claim is the sys-exbu bead-not-found bug)", claimDir)
+	}
+	if len(claimEnv) != 1 || claimEnv[0] != "BEADS_DIR=/city/store" {
+		t.Fatalf("Claim env = %v, want the winning store's env", claimEnv)
+	}
+}
+
+// TestDoHookClaimFallsBackToPrimaryStoreWithoutWinner keeps the pre-federation
+// contract: no ClaimStore (or no winner) means mutations use the caller's
+// primary dir/Env.
+func TestDoHookClaimFallsBackToPrimaryStoreWithoutWinner(t *testing.T) {
+	var claimDir string
+	runner := func(string, string) (string, error) {
+		return `[{"id":"hw-9","status":"open","metadata":{"gc.routed_to":"worker"}}]`, nil
+	}
+	ops := hookClaimOps{
+		Runner: runner,
+		Claim: func(_ context.Context, dir string, _ []string, beadID, assignee string) (beads.Bead, bool, error) {
+			claimDir = dir
+			return beads.Bead{ID: beadID, Status: "in_progress", Assignee: assignee}, true, nil
+		},
+		ClaimStore: func() (string, []string, bool) { return "", nil, false },
+	}
+	opts := hookClaimOptions{
+		Assignee:           "worker-1",
+		IdentityCandidates: []string{"worker-1"},
+		RouteTargets:       []string{"worker"},
+		JSON:               true,
+	}
+	var stdout, stderr bytes.Buffer
+	if code := doHookClaim("bd ready --json", "/tmp/work", opts, ops, &stdout, &stderr); code != 0 {
+		t.Fatalf("doHookClaim(fallback) = %d, want 0; stderr=%s", code, stderr.String())
+	}
+	if claimDir != "/tmp/work" {
+		t.Fatalf("Claim dir = %q, want primary \"/tmp/work\"", claimDir)
+	}
+}
+
 func TestDoHookClaimClaimsRoutedUnassignedWork(t *testing.T) {
 	var claimedID string
 	runner := func(string, string) (string, error) {

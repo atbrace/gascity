@@ -77,7 +77,7 @@ func TestFirstStoreWithWorkReturnsFirstStoreThatHasWork(t *testing.T) {
 		}
 		return `[]`, nil
 	}
-	out, err := firstStoreWithWork("q", stores, run)
+	out, _, err := firstStoreWithWork("q", stores, run)
 	if err != nil {
 		t.Fatalf("err: %v", err)
 	}
@@ -93,7 +93,7 @@ func TestFirstStoreWithWorkReturnsFirstStoreThatHasWork(t *testing.T) {
 func TestFirstStoreWithWorkReturnsLastWhenNoneHasWork(t *testing.T) {
 	stores := []hookStore{{dir: "city"}, {dir: "riga"}}
 	run := func(_, _ string, _ []string) (string, error) { return `[]`, nil }
-	out, err := firstStoreWithWork("q", stores, run)
+	out, _, err := firstStoreWithWork("q", stores, run)
 	if err != nil {
 		t.Fatalf("err: %v", err)
 	}
@@ -113,7 +113,7 @@ func TestFirstStoreWithWorkSurfacesOwnStoreErrorWhenNoWork(t *testing.T) {
 		}
 		return `[]`, nil
 	}
-	if _, err := firstStoreWithWork("q", stores, run); !errors.Is(err, errTestStoreTimeout) {
+	if _, _, err := firstStoreWithWork("q", stores, run); !errors.Is(err, errTestStoreTimeout) {
 		t.Fatalf("own-store error must be surfaced when no store has work; got %v", err)
 	}
 }
@@ -128,7 +128,7 @@ func TestFirstStoreWithWorkIgnoresRigStoreErrorWhenOwnStoreHasNoWork(t *testing.
 		}
 		return "", errTestStoreTimeout
 	}
-	out, err := firstStoreWithWork("q", stores, run)
+	out, _, err := firstStoreWithWork("q", stores, run)
 	if err != nil {
 		t.Fatalf("rig-store error must not surface when own store is healthy; got %v", err)
 	}
@@ -146,7 +146,7 @@ func TestFirstStoreWithWorkSkipsStoreWithOnlyUnreadyRows(t *testing.T) {
 		}
 		return `[{"id":"va-2"}]`, nil
 	}
-	out, err := firstStoreWithWork("q", stores, run)
+	out, _, err := firstStoreWithWork("q", stores, run)
 	if err != nil {
 		t.Fatalf("err: %v", err)
 	}

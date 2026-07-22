@@ -142,7 +142,13 @@ func rigScopedHookRig(cfg *config.City, agentIdentity string) string {
 // firstStoreWithWork runs command against each store in order and returns the
 // output of the FIRST store that reports ready work (applying the same
 // normalize + unready-filter that doHook uses, so a store with only
-// deferred/blocked rows is not treated as a hit). run is injectable for tests.
+// deferred/blocked rows is not treated as a hit), plus THAT store — callers
+// that mutate the winning bead (gc hook --claim) must address the store the
+// work was FOUND in, not the agent's primary store: a rig-scoped agent's
+// routed work can live in the federated city store (or vice versa), and a
+// claim issued against the wrong store fails "bead not found" while the
+// session drains unclaimed (sys-exbu). The store is nil when no store
+// reported ready work. run is injectable for tests.
 //
 // When no store has ready work, an error on the agent's OWN store (the first
 // entry) is surfaced so emitCityWorkQueryFailure can classify it — preserving
@@ -150,7 +156,7 @@ func rigScopedHookRig(cfg *config.City, agentIdentity string) string {
 // the reconciler, not be silently downgraded to "no work"). Errors from
 // federated rig stores are best-effort discovery (like appendRigHookStores)
 // and are not surfaced, so one flaky rig store can't wedge the hook.
-func firstStoreWithWork(command string, stores []hookStore, run func(command, dir string, env []string) (string, error)) (string, error) {
+func firstStoreWithWork(command string, stores []hookStore, run func(command, dir string, env []string) (string, error)) (string, *hookStore, error) {
 	var lastOut string
 	var ownStoreOut string
 	var ownStoreErr error
@@ -159,7 +165,8 @@ func firstStoreWithWork(command string, stores []hookStore, run func(command, di
 		if err == nil {
 			ready := filterUnreadyHookCandidates(normalizeWorkQueryOutput(strings.TrimSpace(out)), time.Now())
 			if workQueryHasReadyWork(ready) {
-				return out, nil
+				winner := st
+				return out, &winner, nil
 			}
 			lastOut = out
 			continue
@@ -169,7 +176,7 @@ func firstStoreWithWork(command string, stores []hookStore, run func(command, di
 		}
 	}
 	if ownStoreErr != nil {
-		return ownStoreOut, ownStoreErr
+		return ownStoreOut, nil, ownStoreErr
 	}
-	return lastOut, nil
+	return lastOut, nil, nil
 }

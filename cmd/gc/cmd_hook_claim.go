@@ -33,6 +33,13 @@ type hookClaimOps struct {
 	AssignContinuation hookAssignContinuationFunc
 	DrainAck           hookDrainAckFunc
 	Now                func() time.Time
+	// ClaimStore reports the (dir, env) of the store the work query found its
+	// candidates in, after Runner has run. Claims and continuation
+	// assignments must mutate THAT store: with cross-store federation the
+	// winning store can differ from the caller's primary dir/Env, and a
+	// claim against the wrong store fails "bead not found" (sys-exbu). When
+	// nil or not ok, mutations fall back to the caller's dir/Env.
+	ClaimStore func() (dir string, env []string, ok bool)
 }
 
 type (
@@ -104,8 +111,17 @@ func doHookClaim(workQuery, dir string, opts hookClaimOptions, ops hookClaimOps,
 		return writeHookClaimNoWork(opts, ops, stdout, stderr)
 	}
 
+	// Mutations (claim + continuation preassign) target the store the work
+	// was FOUND in; the caller's dir/Env are the primary-store fallback.
+	claimDir, claimEnv := dir, opts.Env
+	if ops.ClaimStore != nil {
+		if d, e, ok := ops.ClaimStore(); ok {
+			claimDir, claimEnv = d, e
+		}
+	}
+
 	if result, bead, ok := hookClaimExistingOrAssigned(candidates, opts); ok {
-		return writeHookClaimWorkResultForBead(result, bead, opts, ops, dir, stdout, stderr)
+		return writeHookClaimWorkResultForBead(result, bead, opts, ops, claimDir, claimEnv, stdout, stderr)
 	}
 
 	ctx, cancel := context.WithTimeout(context.Background(), hookClaimMutationTimeout)
@@ -116,7 +132,7 @@ func doHookClaim(workQuery, dir string, opts hookClaimOptions, ops hookClaimOps,
 			!hookClaimMatchesRoute(candidate, opts.RouteTargets) {
 			continue
 		}
-		claimed, ok, err := ops.Claim(ctx, dir, opts.Env, candidate.ID, opts.Assignee)
+		claimed, ok, err := ops.Claim(ctx, claimDir, claimEnv, candidate.ID, opts.Assignee)
 		if err != nil {
 			fmt.Fprintf(stderr, "gc hook --claim: claiming %s: %v\n", candidate.ID, err) //nolint:errcheck
 			return 1
@@ -143,7 +159,7 @@ func doHookClaim(workQuery, dir string, opts hookClaimOptions, ops hookClaimOps,
 		if result.Assignee == "" {
 			result.Assignee = opts.Assignee
 		}
-		return writeHookClaimWorkResultForBead(result, claimed, opts, ops, dir, stdout, stderr)
+		return writeHookClaimWorkResultForBead(result, claimed, opts, ops, claimDir, claimEnv, stdout, stderr)
 	}
 
 	return writeHookClaimNoWork(opts, ops, stdout, stderr)
@@ -185,8 +201,8 @@ func hookClaimExistingOrAssigned(candidates []beads.Bead, opts hookClaimOptions)
 	return hookClaimJSONResult{}, beads.Bead{}, false
 }
 
-func writeHookClaimWorkResultForBead(result hookClaimJSONResult, bead beads.Bead, opts hookClaimOptions, ops hookClaimOps, dir string, stdout, stderr io.Writer) int {
-	assigned, err := preassignHookContinuationGroup(bead, opts, ops, dir)
+func writeHookClaimWorkResultForBead(result hookClaimJSONResult, bead beads.Bead, opts hookClaimOptions, ops hookClaimOps, dir string, env []string, stdout, stderr io.Writer) int {
+	assigned, err := preassignHookContinuationGroup(bead, opts, ops, dir, env)
 	if err != nil {
 		fmt.Fprintf(stderr, "gc hook --claim: preassigning continuation group for %s: %v\n", bead.ID, err) //nolint:errcheck
 		return 1
@@ -230,7 +246,7 @@ func writeHookClaimNoWork(opts hookClaimOptions, ops hookClaimOps, stdout, stder
 	return 1
 }
 
-func preassignHookContinuationGroup(bead beads.Bead, opts hookClaimOptions, ops hookClaimOps, dir string) ([]string, error) {
+func preassignHookContinuationGroup(bead beads.Bead, opts hookClaimOptions, ops hookClaimOps, dir string, env []string) ([]string, error) {
 	rootID := strings.TrimSpace(bead.Metadata[beadmeta.RootBeadIDMetadataKey])
 	group := strings.TrimSpace(bead.Metadata[beadmeta.ContinuationGroupMetadataKey])
 	if rootID == "" || group == "" {
@@ -238,7 +254,7 @@ func preassignHookContinuationGroup(bead beads.Bead, opts hookClaimOptions, ops 
 	}
 	ctx, cancel := context.WithTimeout(context.Background(), hookClaimMutationTimeout)
 	defer cancel()
-	siblings, err := ops.ListContinuation(ctx, dir, opts.Env, rootID, group)
+	siblings, err := ops.ListContinuation(ctx, dir, env, rootID, group)
 	if err != nil {
 		return nil, err
 	}
@@ -251,7 +267,7 @@ func preassignHookContinuationGroup(bead beads.Bead, opts hookClaimOptions, ops 
 			!hookClaimMatchesRoute(sibling, opts.RouteTargets) {
 			continue
 		}
-		if err := ops.AssignContinuation(ctx, dir, opts.Env, sibling.ID, opts.Assignee); err != nil {
+		if err := ops.AssignContinuation(ctx, dir, env, sibling.ID, opts.Assignee); err != nil {
 			return assigned, fmt.Errorf("assigning %s: %w", sibling.ID, err)
 		}
 		assigned = append(assigned, sibling.ID)

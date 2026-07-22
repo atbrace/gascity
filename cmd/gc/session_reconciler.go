@@ -1377,14 +1377,25 @@ func reconcileSessionBeadsTracedWithNamedDemand(
 					// demand tier keeps desiring one for this template, but the
 					// orphan gate would drain each spawn before it can claim —
 					// a respawn treadmill. Give a fresh pool session that still
-					// has outstanding scale-check demand time to boot and claim.
-					// Demand is read from scaleCheckCounts (result.ScaleCheckCounts):
-					// the only demand signal reliably present at drain-time (v3/v4
-					// gated on stale poolDesired/desiredState and failed live).
+					// has outstanding demand time to boot and claim.
+					// Demand is read in two tiers: the in-memory scale-check
+					// counts (cheap, but throttled — intermittently EMPTY at
+					// drain-time even for a genuinely-wanted pool; that killed
+					// v3/v4/v6 identically), then a direct store probe for open
+					// unassigned routed work (poolSessionStoreDemand) — the only
+					// demand state that persists across ticks. A probe error
+					// fails open (grace) like the assignedErr path above: it is
+					// bounded by the startup window, and draining on a transient
+					// store failure is the treadmill this guard exists to stop.
 					if reason == "orphaned" && isPoolManagedSessionBead(*session) {
 						eligible := poolSessionGraceEligible(*session, cfg)
 						fresh := poolSessionWithinStartupGrace(*session, cfg, clk)
 						demand := poolSessionScaleCheckDemand(*session, cfg, scaleCheckCounts)
+						storeDemand := 0
+						var storeDemandErr error
+						if eligible && fresh && demand == 0 {
+							storeDemand, storeDemandErr = poolSessionStoreDemand(store, rigStores, *session, cfg)
+						}
 						// Permanent observability (sys-exbu): pool session beads are
 						// pruned, so this stderr line is the only post-hoc signal for
 						// why a fresh pool session was drained or held. A silent job
@@ -1393,17 +1404,19 @@ func reconcileSessionBeadsTracedWithNamedDemand(
 						if start, ok := poolSessionStartBoundary(*session); ok {
 							ageStr = clk.Now().UTC().Sub(start.UTC()).Round(time.Second).String()
 						}
-						fmt.Fprintf(stderr, "pool-orphan-eval '%s': eligible=%t fresh=%t scaleCheck=%d age=%s\n", name, eligible, fresh, demand, ageStr) //nolint:errcheck
-						if eligible && fresh && demand > 0 {
+						fmt.Fprintf(stderr, "pool-orphan-eval '%s': eligible=%t fresh=%t scaleCheck=%d storeDemand=%d storeDemandErr=%v age=%s\n", name, eligible, fresh, demand, storeDemand, storeDemandErr, ageStr) //nolint:errcheck
+						if eligible && fresh && (demand > 0 || storeDemand > 0 || storeDemandErr != nil) {
 							if trace != nil {
 								template := normalizedSessionTemplate(*session, cfg)
 								if template == "" {
 									template = session.Metadata["template"]
 								}
 								trace.recordDecision("reconciler.session.pool_startup_grace", template, name, reason, "kept_open", traceRecordPayload{
-									"provider_alive": providerAlive,
-									"scale_check":    demand,
-									"pool_slot":      strings.TrimSpace(session.Metadata["pool_slot"]),
+									"provider_alive":   providerAlive,
+									"scale_check":      demand,
+									"store_demand":     storeDemand,
+									"store_demand_err": storeDemandErr != nil,
+									"pool_slot":        strings.TrimSpace(session.Metadata["pool_slot"]),
 								}, nil, "")
 							}
 							fmt.Fprintf(stdout, "Skipping drain for '%s': pool session in startup/claim grace\n", name) //nolint:errcheck

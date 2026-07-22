@@ -155,6 +155,108 @@ func TestPoolSessionScaleCheckDemand_MatchesQualifiedTemplateKey(t *testing.T) {
 	}
 }
 
+// TestReconcileSessionBeads_FreshPoolSessionSurvivesViaStoreDemand is the sys-exbu
+// v7 regression, modeling the EXACT live disproof shape of v6: at the drain tick,
+// EVERY in-memory demand map (poolDesired, desiredState, scaleCheckCounts) is
+// empty — the scale-check is throttled and only populates them on the ticks it
+// re-runs — while the durable demand (an open, unassigned, gc.routed_to work
+// bead) sits in the store the whole time. v6's green tests all drove the
+// reconciler with an always-fresh ScaleCheckCounts and missed this. The v7 grace
+// falls back to a direct store probe, so the fresh session survives.
+func TestReconcileSessionBeads_FreshPoolSessionSurvivesViaStoreDemand(t *testing.T) {
+	env := newReconcilerTestEnv()
+	env.cfg = &config.City{Agents: []config.Agent{{Name: "muthur"}}}
+
+	session := makeManagedSlotZeroPoolSession(t, env, "muthur-gc-store1", "muthur", -10*time.Second)
+
+	// Durable demand: an open, unassigned work bead routed to the template,
+	// visible ONLY via the store (scaleCheckCounts passed below is nil).
+	if _, err := env.store.Create(beads.Bead{
+		Title:    "mol-validation-closer",
+		Type:     "task",
+		Status:   "open",
+		Metadata: map[string]string{"gc.routed_to": "muthur"},
+	}); err != nil {
+		t.Fatalf("Create routed work bead: %v", err)
+	}
+
+	woken := env.reconcileWithScaleCheck([]beads.Bead{session}, nil)
+	if woken != 0 {
+		t.Fatalf("woken = %d, want 0", woken)
+	}
+	if got := env.stdout.String(); containsDrainOrphaned(got, "muthur-gc-store1") {
+		t.Fatalf("fresh pool session with store-only routed demand was orphan-drained (the v6 live disproof shape):\nstdout=%s", got)
+	}
+	if !env.sp.IsRunning("muthur-gc-store1") {
+		t.Fatalf("fresh pool session runtime was stopped; expected startup grace via store demand probe")
+	}
+}
+
+// TestReconcileSessionBeads_FreshPoolSessionClaimedStoreWorkDrains proves the
+// store probe respects assignment: routed work already CLAIMED (assignee set,
+// by some other session) is not demand for this session, so a fresh surplus
+// pool session still drains. Guards against the probe re-introducing the v5
+// failure (protecting fresh-but-unwanted sessions).
+func TestReconcileSessionBeads_FreshPoolSessionClaimedStoreWorkDrains(t *testing.T) {
+	env := newReconcilerTestEnv()
+	env.cfg = &config.City{Agents: []config.Agent{{Name: "muthur"}}}
+
+	session := makeManagedSlotZeroPoolSession(t, env, "muthur-gc-claimed1", "muthur", -10*time.Second)
+
+	if _, err := env.store.Create(beads.Bead{
+		Title:    "mol-validation-closer",
+		Type:     "task",
+		Status:   "open",
+		Assignee: "muthur-gc-other",
+		Metadata: map[string]string{"gc.routed_to": "muthur"},
+	}); err != nil {
+		t.Fatalf("Create claimed work bead: %v", err)
+	}
+
+	_ = env.reconcileWithScaleCheck([]beads.Bead{session}, nil)
+	if got := env.stdout.String(); !containsDrainOrphaned(got, "muthur-gc-claimed1") {
+		t.Fatalf("fresh pool session with only CLAIMED routed work was NOT drained:\nstdout=%s", got)
+	}
+}
+
+// TestPoolSessionStoreDemand_MatchesQualifiedRoutedKey locks the store-probe
+// contract against the exbudiag3 live shape: the session bead carries the
+// rig-qualified template ("sysadmin/muthur") and the work bead is routed with
+// the same qualified spelling — the keying that v3 silently dropped through
+// findAgentByTemplate re-resolution.
+func TestPoolSessionStoreDemand_MatchesQualifiedRoutedKey(t *testing.T) {
+	cfg := &config.City{Agents: []config.Agent{{Name: "muthur", Dir: "sysadmin"}}}
+	store := beads.NewMemStore()
+	if _, err := store.Create(beads.Bead{
+		Title:    "mol-papercut-rollup",
+		Type:     "task",
+		Status:   "open",
+		Metadata: map[string]string{"gc.routed_to": "sysadmin/muthur"},
+	}); err != nil {
+		t.Fatalf("Create routed work bead: %v", err)
+	}
+	session := beads.Bead{Metadata: map[string]string{
+		"session_name": "muthur-gc-abcd",
+		"template":     "sysadmin/muthur",
+		"pool_managed": "true",
+	}}
+	demand, err := poolSessionStoreDemand(store, nil, session, cfg)
+	if err != nil {
+		t.Fatalf("poolSessionStoreDemand: %v", err)
+	}
+	if demand != 1 {
+		t.Fatalf("poolSessionStoreDemand = %d, want 1 (qualified routed-key match)", demand)
+	}
+	// Empty store -> 0.
+	demand, err = poolSessionStoreDemand(beads.NewMemStore(), nil, session, cfg)
+	if err != nil {
+		t.Fatalf("poolSessionStoreDemand (empty store): %v", err)
+	}
+	if demand != 0 {
+		t.Fatalf("poolSessionStoreDemand = %d, want 0 for empty store", demand)
+	}
+}
+
 func containsDrainOrphaned(stdout, name string) bool {
 	return strings.Contains(stdout, "Draining session '"+name+"': orphaned")
 }

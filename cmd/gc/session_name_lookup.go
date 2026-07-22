@@ -486,6 +486,62 @@ func poolSessionScaleCheckDemand(session beads.Bead, cfg *config.City, scaleChec
 	return demand
 }
 
+// poolSessionStoreDemand probes the bead stores directly for durable routed
+// demand for this pool session's template — the drain-time fallback behind the
+// sys-exbu startup grace. EVERY per-tick in-memory demand signal (poolDesired,
+// desiredState, result.ScaleCheckCounts) is computed by a throttled/cached
+// scale-check and was observed EMPTY at the exact tick a genuinely-wanted fresh
+// pool session was orphan-evaluated, while the same signals printed non-zero on
+// neighboring ticks (v3/v4/v6 each gated on one of those maps and failed live
+// identically). The open routed work bead itself is the only demand state that
+// persists across ticks, and the orphan gate already queries stores live at
+// drain time — so read that same durable state here. Semantics mirror
+// defaultScaleCheckCounts: ready, unassigned beads matched to the session's
+// template-key spellings (and their canonical forms) via
+// controllerDemandRouteTarget (gc.routed_to + legacy gc.run_target).
+func poolSessionStoreDemand(store beads.Store, rigStores map[string]beads.Store, session beads.Bead, cfg *config.City) (int, error) {
+	templates := make(map[string]struct{})
+	for _, key := range poolSessionTemplateKeys(session, cfg) {
+		templates[key] = struct{}{}
+		if canonical := canonicalTemplateKeyForName(cfg, key); canonical != "" {
+			templates[canonical] = struct{}{}
+		}
+	}
+	if len(templates) == 0 {
+		return 0, nil
+	}
+	stores := make([]beads.Store, 0, 1+len(rigStores))
+	if store != nil {
+		stores = append(stores, store)
+	}
+	for _, rigStore := range rigStores {
+		if rigStore != nil && rigStore != store {
+			stores = append(stores, rigStore)
+		}
+	}
+	demand := 0
+	var errs []error
+	for _, s := range stores {
+		ready, err := readyForControllerDemand(s)
+		if err != nil && !beads.IsPartialResult(err) {
+			errs = append(errs, err)
+			continue
+		}
+		for i := range ready {
+			if strings.TrimSpace(ready[i].Assignee) != "" {
+				continue
+			}
+			if controllerDemandRouteTarget(ready[i], templates) != "" {
+				demand++
+			}
+		}
+	}
+	if demand == 0 && len(errs) > 0 {
+		return 0, errors.Join(errs...)
+	}
+	return demand, nil
+}
+
 // poolSessionGraceEligible reports whether session is a managed pool member the
 // startup grace may protect: a pool_managed bead whose template resolves to a
 // configured agent. Deliberately INDEPENDENT of pool_slot so canonical-singleton

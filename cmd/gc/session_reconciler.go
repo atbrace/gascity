@@ -845,7 +845,7 @@ func reconcileSessionBeadsAtPath(
 ) int {
 	return reconcileSessionBeadsAtPathWithNamedDemand(
 		ctx, cityPath, sessions, desiredState, configuredNames, cfg, sp, store, dops, assignedWorkBeads, rigStores, readyWaitSet, dt, nil,
-		poolDesired, nil, storeQueryPartial, workSet, cityName, it, clk, rec, startupTimeout, driftDrainTimeout, stdout, stderr,
+		poolDesired, nil, nil, storeQueryPartial, workSet, cityName, it, clk, rec, startupTimeout, driftDrainTimeout, stdout, stderr,
 	)
 }
 
@@ -866,6 +866,7 @@ func reconcileSessionBeadsAtPathWithNamedDemand(
 	gate *providerHealthGate,
 	poolDesired map[string]int,
 	namedSessionDemand map[string]bool,
+	scaleCheckCounts map[string]int,
 	storeQueryPartial bool,
 	workSet map[string]bool,
 	cityName string,
@@ -878,7 +879,7 @@ func reconcileSessionBeadsAtPathWithNamedDemand(
 ) int {
 	return reconcileSessionBeadsTracedWithNamedDemand(
 		ctx, cityPath, sessions, desiredState, configuredNames, cfg, sp, store, dops, assignedWorkBeads, rigStores, readyWaitSet, dt, gate,
-		poolDesired, namedSessionDemand, storeQueryPartial, workSet, cityName, it, clk, rec, startupTimeout, driftDrainTimeout, stdout, stderr, nil,
+		poolDesired, namedSessionDemand, scaleCheckCounts, storeQueryPartial, workSet, cityName, it, clk, rec, startupTimeout, driftDrainTimeout, stdout, stderr, nil,
 	)
 }
 
@@ -912,7 +913,7 @@ func reconcileSessionBeadsTraced(
 ) int {
 	return reconcileSessionBeadsTracedWithNamedDemand(
 		ctx, cityPath, sessions, desiredState, configuredNames, cfg, sp, store, dops, assignedWorkBeads, rigStores, readyWaitSet, dt, nil,
-		poolDesired, nil, storeQueryPartial, workSet, cityName, it, clk, rec, startupTimeout, driftDrainTimeout, stdout, stderr, trace,
+		poolDesired, nil, nil, storeQueryPartial, workSet, cityName, it, clk, rec, startupTimeout, driftDrainTimeout, stdout, stderr, trace,
 		startOptions...,
 	)
 }
@@ -934,6 +935,7 @@ func reconcileSessionBeadsTracedWithNamedDemand(
 	gate *providerHealthGate,
 	poolDesired map[string]int,
 	namedSessionDemand map[string]bool,
+	scaleCheckCounts map[string]int,
 	storeQueryPartial bool,
 	workSet map[string]bool,
 	cityName string,
@@ -1375,23 +1377,38 @@ func reconcileSessionBeadsTracedWithNamedDemand(
 					// demand tier keeps desiring one for this template, but the
 					// orphan gate would drain each spawn before it can claim —
 					// a respawn treadmill. Give a fresh pool session that still
-					// has outstanding template demand time to boot and claim.
-					if reason == "orphaned" &&
-						poolSessionGraceEligible(*session, cfg) &&
-						poolSessionWithinStartupGrace(*session, cfg, clk) &&
-						poolSessionWithinDesiredCapacity(*session, cfg, ordered, desiredState, poolDesired) {
-						if trace != nil {
-							template := normalizedSessionTemplate(*session, cfg)
-							if template == "" {
-								template = session.Metadata["template"]
-							}
-							trace.recordDecision("reconciler.session.pool_startup_grace", template, name, reason, "kept_open", traceRecordPayload{
-								"provider_alive": providerAlive,
-								"pool_slot":      strings.TrimSpace(session.Metadata["pool_slot"]),
-							}, nil, "")
+					// has outstanding scale-check demand time to boot and claim.
+					// Demand is read from scaleCheckCounts (result.ScaleCheckCounts):
+					// the only demand signal reliably present at drain-time (v3/v4
+					// gated on stale poolDesired/desiredState and failed live).
+					if reason == "orphaned" && isPoolManagedSessionBead(*session) {
+						eligible := poolSessionGraceEligible(*session, cfg)
+						fresh := poolSessionWithinStartupGrace(*session, cfg, clk)
+						demand := poolSessionScaleCheckDemand(*session, cfg, scaleCheckCounts)
+						// Permanent observability (sys-exbu): pool session beads are
+						// pruned, so this stderr line is the only post-hoc signal for
+						// why a fresh pool session was drained or held. A silent job
+						// is an assumed job.
+						ageStr := "unknown"
+						if start, ok := poolSessionStartBoundary(*session); ok {
+							ageStr = clk.Now().UTC().Sub(start.UTC()).Round(time.Second).String()
 						}
-						fmt.Fprintf(stdout, "Skipping drain for '%s': pool session in startup/claim grace\n", name) //nolint:errcheck
-						continue
+						fmt.Fprintf(stderr, "pool-orphan-eval '%s': eligible=%t fresh=%t scaleCheck=%d age=%s\n", name, eligible, fresh, demand, ageStr) //nolint:errcheck
+						if eligible && fresh && demand > 0 {
+							if trace != nil {
+								template := normalizedSessionTemplate(*session, cfg)
+								if template == "" {
+									template = session.Metadata["template"]
+								}
+								trace.recordDecision("reconciler.session.pool_startup_grace", template, name, reason, "kept_open", traceRecordPayload{
+									"provider_alive": providerAlive,
+									"scale_check":    demand,
+									"pool_slot":      strings.TrimSpace(session.Metadata["pool_slot"]),
+								}, nil, "")
+							}
+							fmt.Fprintf(stdout, "Skipping drain for '%s': pool session in startup/claim grace\n", name) //nolint:errcheck
+							continue
+						}
 					}
 					if beginSessionDrain(*session, sp, dt, reason, clk, defaultDrainTimeout) {
 						if trace != nil {

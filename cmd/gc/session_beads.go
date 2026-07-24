@@ -32,6 +32,15 @@ const (
 	poolAliasConflictAtMetadataKey    = "pool_alias_conflict_at"
 )
 
+// deferredSingletonAliasConflictRerecordBackoff bounds how often a deferred
+// canonical-singleton session bead re-records a still-standing alias conflict.
+// The re-record is telemetry only (count + timestamp); the alias acquisition
+// retry itself runs on every sync tick regardless. Without the backoff a
+// permanent conflict — e.g. a manual session holding the canonical alias
+// against the named/pool session — writes the bead every tick, and each write
+// emits a bead.updated event that can dominate the city's event stream.
+const deferredSingletonAliasConflictRerecordBackoff = 15 * time.Minute
+
 // loadSessionBeads returns all open session beads from the store.
 func loadSessionBeads(store beads.Store) ([]beads.Bead, error) {
 	if store == nil {
@@ -2012,9 +2021,19 @@ func syncSessionBeadsWithSnapshotAndRigStores(
 					strings.TrimSpace(b.Metadata[poolAliasConflictMetadataKey]) == managedAlias
 			}
 			if strings.TrimSpace(b.Metadata[poolAliasConflictMetadataKey]) == managedAlias &&
-				strings.TrimSpace(b.Metadata[poolAliasConflictCountMetadataKey]) != "" &&
-				!retryDeferredSingleton {
-				return
+				strings.TrimSpace(b.Metadata[poolAliasConflictCountMetadataKey]) != "" {
+				if !retryDeferredSingleton {
+					return
+				}
+				// Deferred-singleton retries advance the counter only on a
+				// backoff. A negative elapsed (conflict stamped in the future,
+				// i.e. clock skew) falls through so the re-record repairs the
+				// timestamp.
+				if at, err := time.Parse(time.RFC3339, strings.TrimSpace(b.Metadata[poolAliasConflictAtMetadataKey])); err == nil {
+					if elapsed := now.Sub(at); elapsed >= 0 && elapsed < deferredSingletonAliasConflictRerecordBackoff {
+						return
+					}
+				}
 			}
 			count := 0
 			if existing, err := strconv.Atoi(strings.TrimSpace(b.Metadata[poolAliasConflictCountMetadataKey])); err == nil && existing > 0 {

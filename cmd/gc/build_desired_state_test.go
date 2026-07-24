@@ -4539,9 +4539,26 @@ func TestSyncSessionBeads_ReclaimsDeferredSingletonAliasAfterConflictClears(t *t
 		}},
 	}, desired, &buildStderr)
 
+	// Keep the canonical alias holder desired across the persistent-conflict
+	// syncs — in the live scenario the holder is a desired named/pool session,
+	// and the not-in-desired sweep must not close it out from under the
+	// deferred bead.
+	desired["s-refinery-canonical"] = TemplateParams{
+		TemplateName: "cashmaster/refinery",
+		SessionName:  "s-refinery-canonical",
+		Alias:        "cashmaster/refinery",
+	}
+
+	sp := runtime.NewFake()
+	if err := sp.Start(context.Background(), "s-refinery-stale", runtime.Config{}); err != nil {
+		t.Fatal(err)
+	}
+	if err := sp.Start(context.Background(), "s-refinery-canonical", runtime.Config{}); err != nil {
+		t.Fatal(err)
+	}
 	var persistentStderr bytes.Buffer
 	persistentClk := &clock.Fake{Time: time.Date(2026, 5, 6, 2, 30, 0, 0, time.UTC)}
-	syncSessionBeads(cityPath, store, desired, runtime.NewFake(), allConfiguredDS(desired), cfg, persistentClk, &persistentStderr, false)
+	syncSessionBeads(cityPath, store, desired, sp, allConfiguredDS(desired), cfg, persistentClk, &persistentStderr, false)
 
 	stillConflicted, err := store.Get(stale.ID)
 	if err != nil {
@@ -4557,12 +4574,51 @@ func TestSyncSessionBeads_ReclaimsDeferredSingletonAliasAfterConflictClears(t *t
 		t.Fatalf("persistent-conflict pool_alias_conflict_count = %q, want sync retry increment", got)
 	}
 
+	// A still-standing conflict must NOT re-record on every sync tick: each
+	// re-record is a bead write that emits bead.updated, and a permanent
+	// conflict (e.g. a manual session holding the canonical alias) turns that
+	// into an event firehose. Within the re-record backoff the counter and
+	// timestamp stay untouched.
+	var withinBackoffStderr bytes.Buffer
+	withinBackoffClk := &clock.Fake{Time: time.Date(2026, 5, 6, 2, 31, 0, 0, time.UTC)}
+	syncSessionBeads(cityPath, store, desired, sp, allConfiguredDS(desired), cfg, withinBackoffClk, &withinBackoffStderr, false)
+
+	suppressed, err := store.Get(stale.ID)
+	if err != nil {
+		t.Fatalf("Get(%s): %v", stale.ID, err)
+	}
+	if got := suppressed.Metadata[poolAliasConflictCountMetadataKey]; got != "2" {
+		t.Fatalf("within-backoff pool_alias_conflict_count = %q, want re-record suppressed at 2", got)
+	}
+	if got := suppressed.Metadata[poolAliasConflictAtMetadataKey]; got != "2026-05-06T02:30:00Z" {
+		t.Fatalf("within-backoff pool_alias_conflict_at = %q, want unchanged 2026-05-06T02:30:00Z", got)
+	}
+
+	// Once the backoff elapses the retry telemetry advances again.
+	var afterBackoffStderr bytes.Buffer
+	afterBackoffClk := &clock.Fake{Time: time.Date(2026, 5, 6, 2, 50, 0, 0, time.UTC)}
+	syncSessionBeads(cityPath, store, desired, sp, allConfiguredDS(desired), cfg, afterBackoffClk, &afterBackoffStderr, false)
+
+	rerecorded, err := store.Get(stale.ID)
+	if err != nil {
+		t.Fatalf("Get(%s): %v", stale.ID, err)
+	}
+	if got := rerecorded.Metadata[poolAliasConflictCountMetadataKey]; got != "3" {
+		t.Fatalf("post-backoff pool_alias_conflict_count = %q, want re-record after backoff", got)
+	}
+	if got := rerecorded.Metadata[poolAliasConflictAtMetadataKey]; got != "2026-05-06T02:50:00Z" {
+		t.Fatalf("post-backoff pool_alias_conflict_at = %q, want re-stamped 2026-05-06T02:50:00Z", got)
+	}
+
 	if err := store.Close(canonical.ID); err != nil {
 		t.Fatalf("Close(%s): %v", canonical.ID, err)
 	}
+	// The holder is gone for good; stop desiring it so sync doesn't create a
+	// replacement bead that would re-claim the canonical alias.
+	delete(desired, "s-refinery-canonical")
 	var syncStderr bytes.Buffer
 	clk := &clock.Fake{Time: time.Date(2026, 5, 6, 3, 0, 0, 0, time.UTC)}
-	syncSessionBeads(cityPath, store, desired, runtime.NewFake(), allConfiguredDS(desired), cfg, clk, &syncStderr, false)
+	syncSessionBeads(cityPath, store, desired, sp, allConfiguredDS(desired), cfg, clk, &syncStderr, false)
 
 	got, err := store.Get(stale.ID)
 	if err != nil {

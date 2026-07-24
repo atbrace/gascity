@@ -64,7 +64,19 @@ func closeSessionBeadIfReachableStoreUnassigned(
 	if stderr == nil {
 		stderr = io.Discard
 	}
-	hasAssignedWork, err := sessionHasOpenAssignedWorkForReachableStore(cityPath, cfg, store, rigStores, session)
+	// Pool-managed sessions must not be preserved for work that can never wake
+	// them. A blocked/deferred-open assignment satisfies the "open" predicate but
+	// never the "awake" (in_progress, or open AND ready) predicate the drain and
+	// wake paths use. Gating the close on any-open work strands such a session in
+	// a drain->re-wake treadmill (sys-exbu): the bead is kept open solely to be
+	// re-woken and re-drained. Use the awake/actionable predicate for
+	// pool-managed sessions so non-actionable work releases to the
+	// orphan-reclaim path instead of vetoing the close.
+	assignedWorkForCloseGate := sessionHasOpenAssignedWorkForReachableStore
+	if isPoolManagedSessionBead(session) {
+		assignedWorkForCloseGate = sessionHasAwakeAssignedWorkForReachableStore
+	}
+	hasAssignedWork, err := assignedWorkForCloseGate(cityPath, cfg, store, rigStores, session)
 	if err != nil {
 		fmt.Fprintf(stderr, "session work guard: checking reachable assigned work for %s: %v\n", session.ID, err) //nolint:errcheck
 		return false

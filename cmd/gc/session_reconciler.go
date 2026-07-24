@@ -301,7 +301,17 @@ func finalizeDrainAckStoppedSession(
 			Payload: api.SessionLifecyclePayloadJSON(session.ID, template, "drain acknowledged"),
 		})
 	}
-	hasAssignedWork, assignedErr := sessionHasOpenAssignedWorkForReachableStore(cityPath, cfg, store, rigStores, *session)
+	// For sessions eligible to close when unassigned (pool-managed / orphaned),
+	// non-actionable work (open-but-blocked/deferred) must not veto the close:
+	// otherwise the drained bead is kept alive only to be re-woken by the resume
+	// tier and re-drained, an infinite drain<->wake treadmill (sys-exbu). Mirror
+	// the drain-cancel path (below), which already gates on the awake/actionable
+	// predicate. Named sessions keep the any-open semantics.
+	assignedWorkForCloseGate := sessionHasOpenAssignedWorkForReachableStore
+	if closeIfUnassigned {
+		assignedWorkForCloseGate = sessionHasAwakeAssignedWorkForReachableStore
+	}
+	hasAssignedWork, assignedErr := assignedWorkForCloseGate(cityPath, cfg, store, rigStores, *session)
 	if assignedErr != nil {
 		fmt.Fprintf(stderr, "session reconciler: checking assigned work for drain-acked %s: %v\n", name, assignedErr) //nolint:errcheck
 		hasAssignedWork = true
@@ -338,7 +348,7 @@ func finalizeDrainAckStoppedSession(
 			recordStopped()
 			return
 		}
-		assignedAfterCloseGate, closeGateAssignedErr := sessionHasOpenAssignedWorkForReachableStore(cityPath, cfg, store, rigStores, *session)
+		assignedAfterCloseGate, closeGateAssignedErr := assignedWorkForCloseGate(cityPath, cfg, store, rigStores, *session)
 		if closeGateAssignedErr != nil {
 			fmt.Fprintf(stderr, "session reconciler: checking assigned work after failed drain-ack close gate for %s: %v\n", name, closeGateAssignedErr) //nolint:errcheck
 			assignedAfterCloseGate = true

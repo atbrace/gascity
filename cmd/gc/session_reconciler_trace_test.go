@@ -582,6 +582,7 @@ func TestSessionReconcilePhaseTraceUsesDistinctSites(t *testing.T) {
 		nil, // gate (*providerHealthGate) — ADR-0013 A1 M3a
 		nil,
 		nil,
+		nil, // scaleCheckCounts (sys-exbu pool startup grace)
 		false,
 		nil,
 		"trace-town",

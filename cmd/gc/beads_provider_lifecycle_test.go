@@ -5189,8 +5189,8 @@ exit 99
 	if !ok || state.Backend != "postgres" || state.PostgresDatabase != "beads_pg" {
 		t.Fatalf("metadata state = %+v, ok=%v; want postgres metadata preserved", state, ok)
 	}
-	if _, err := os.Stat(filepath.Join(cityPath, ".beads", "hooks", "on_create")); err != nil {
-		t.Fatalf("expected hooks installed for postgres scope: %v", err)
+	if _, err := os.Stat(filepath.Join(cityPath, ".beads", "hooks", "on_create")); !os.IsNotExist(err) {
+		t.Fatalf("gc must not install bd event hooks for postgres scope (stat err=%v)", err)
 	}
 }
 
@@ -5357,8 +5357,8 @@ exit 99
 	if _, err := os.Stat(filepath.Join(rigPath, ".beads", "metadata.json")); !os.IsNotExist(err) {
 		t.Fatalf("inherited postgres rig should not be pinned with local metadata, stat err = %v", err)
 	}
-	if _, err := os.Stat(filepath.Join(rigPath, ".beads", "hooks", "on_create")); err != nil {
-		t.Fatalf("expected hooks installed for inherited postgres rig: %v", err)
+	if _, err := os.Stat(filepath.Join(rigPath, ".beads", "hooks", "on_create")); !os.IsNotExist(err) {
+		t.Fatalf("gc must not install bd event hooks for inherited postgres rig (stat err=%v)", err)
 	}
 }
 
@@ -5401,8 +5401,8 @@ exit 99
 			if string(data) != tc.metadata {
 				t.Fatalf("metadata = %s, want preserved %s", data, tc.metadata)
 			}
-			if _, err := os.Stat(filepath.Join(rigPath, ".beads", "hooks", "on_create")); err != nil {
-				t.Fatalf("expected hooks installed for inherited postgres rig: %v", err)
+			if _, err := os.Stat(filepath.Join(rigPath, ".beads", "hooks", "on_create")); !os.IsNotExist(err) {
+				t.Fatalf("gc must not install bd event hooks for inherited postgres rig (stat err=%v)", err)
 			}
 		})
 	}
@@ -5462,8 +5462,8 @@ esac
 	if _, err := os.Stat(initArgsFile); err != nil {
 		t.Fatalf("expected bd init attempt, stat err = %v", err)
 	}
-	if _, err := os.Stat(filepath.Join(rigPath, ".beads", "hooks", "on_create")); err != nil {
-		t.Fatalf("expected hooks installed for adopted rig: %v", err)
+	if _, err := os.Stat(filepath.Join(rigPath, ".beads", "hooks", "on_create")); !os.IsNotExist(err) {
+		t.Fatalf("gc must not install bd event hooks for adopted rig (stat err=%v)", err)
 	}
 }
 
@@ -5520,8 +5520,8 @@ esac
 	if _, err := os.Stat(providerArgsFile); err != nil {
 		t.Fatalf("expected provider init attempt, stat err = %v", err)
 	}
-	if _, err := os.Stat(filepath.Join(rigPath, ".beads", "hooks", "on_create")); err != nil {
-		t.Fatalf("expected hooks installed for adopted rig: %v", err)
+	if _, err := os.Stat(filepath.Join(rigPath, ".beads", "hooks", "on_create")); !os.IsNotExist(err) {
+		t.Fatalf("gc must not install bd event hooks for adopted canonical exec rig (stat err=%v)", err)
 	}
 }
 
@@ -6878,7 +6878,7 @@ esac
 	}
 }
 
-func TestGcBeadsBdInitMetadataOnlyFallsThroughToLocalReinitWithPinnedDatabaseWhenSchemaMissing(t *testing.T) {
+func TestGcBeadsBdInitMetadataOnlyFallsThroughToForcedBdInitWithPinnedDatabaseWhenSchemaMissing(t *testing.T) {
 	cityPath := t.TempDir()
 	if err := os.MkdirAll(filepath.Join(cityPath, ".gc"), 0o755); err != nil {
 		t.Fatal(err)
@@ -6908,14 +6908,14 @@ set -eu
 cmd="${1:-}"
 case "$cmd" in
   init)
-    has_reinit=false
+    has_force=false
     for arg in "$@"; do
-      if [ "$arg" = "--reinit-local" ]; then
-        has_reinit=true
+      if [ "$arg" = "--force" ]; then
+        has_force=true
       fi
     done
-    if [ "$has_reinit" != "true" ]; then
-      echo "bd init fallback must reinitialize existing workspace" >&2
+    if [ "$has_force" != "true" ]; then
+      echo "bd init fallback must force reinitialize existing workspace" >&2
       exit 2
     fi
     printf '1\n' > %q
@@ -6985,266 +6985,13 @@ esac
 		t.Fatalf("expected bd init fallback to run: %v", err)
 	}
 	got := string(data)
-	for _, want := range []string{"--reinit-local", "--server", "-p", "gc", "--database", "hq", cityPath} {
+	for _, want := range []string{"--force", "--server", "-p", "gc", "--database", "hq", cityPath} {
 		if !strings.Contains(got, want) {
 			t.Fatalf("bd init argv missing %q:\n%s", want, got)
 		}
 	}
 	if strings.Contains(got, "-p hq") {
 		t.Fatalf("bd init should keep visible prefix gc while pinning database hq:\n%s", got)
-	}
-}
-
-func TestGcBeadsBdInitDirtySchemaRecovery(t *testing.T) {
-	const exactError = "Error: failed to open Dolt store: failed to initialize schema: schema migration: pending schema migrations alter pre-existing dirty tables: comments, compaction_snapshots, dependencies, events, issue_snapshots, labels; run 'bd dolt commit' to commit the working set at the current schema, then re-run the migration (gastownhall/beads#4566)"
-	const similarError = "Error: failed to open Dolt store: failed to initialize schema: schema migration: pending schema migrations alter pre-existing dirty tables: comments, dependencies; retry manually"
-	const migrationDirtyTables = "comments\ncompaction_snapshots\ndependencies\ndolt_schemas\nevents\nissue_snapshots\nlabels\nschema_migrations\n"
-
-	tests := []struct {
-		name                string
-		initError           string
-		dirtyTables         string
-		databasePreexisting bool
-		databaseDirectory   bool
-		alreadyClean        bool
-		wantSuccess         bool
-		wantInitCount       string
-		wantCheckpoint      bool
-	}{
-		{
-			name:           "exact v1.1.0 fresh-init signature is checkpointed selectively",
-			initError:      exactError,
-			dirtyTables:    migrationDirtyTables,
-			wantSuccess:    true,
-			wantInitCount:  "2",
-			wantCheckpoint: true,
-		},
-		{
-			name:          "similar unrecognized error fails closed",
-			initError:     similarError,
-			dirtyTables:   migrationDirtyTables,
-			wantInitCount: "1",
-		},
-		{
-			name:          "unexpected dirty table fails closed",
-			initError:     exactError,
-			dirtyTables:   migrationDirtyTables + "operator_notes\n",
-			wantInitCount: "1",
-		},
-		{
-			name:                "preexisting database fails closed",
-			initError:           exactError,
-			dirtyTables:         migrationDirtyTables,
-			databasePreexisting: true,
-			wantInitCount:       "1",
-		},
-		{
-			name:              "uncataloged database directory fails closed",
-			initError:         exactError,
-			dirtyTables:       migrationDirtyTables,
-			databaseDirectory: true,
-			wantInitCount:     "1",
-		},
-		{
-			name:          "already-clean recovery is idempotent",
-			initError:     exactError,
-			alreadyClean:  true,
-			wantSuccess:   true,
-			wantInitCount: "2",
-		},
-	}
-
-	for _, tt := range tests {
-		t.Run(tt.name, func(t *testing.T) {
-			cityPath := t.TempDir()
-			if err := os.MkdirAll(filepath.Join(cityPath, ".gc"), 0o755); err != nil {
-				t.Fatal(err)
-			}
-			if err := os.MkdirAll(filepath.Join(cityPath, ".beads"), 0o700); err != nil {
-				t.Fatal(err)
-			}
-			if err := os.WriteFile(filepath.Join(cityPath, ".beads", "metadata.json"),
-				[]byte(`{"database":"dolt","backend":"dolt","dolt_mode":"server","dolt_database":"hq"}`), 0o644); err != nil {
-				t.Fatal(err)
-			}
-
-			materializeBuiltinPacksForTest(t, cityPath)
-			script := gcBeadsBdScriptPath(cityPath)
-			binDir := filepath.Join(t.TempDir(), "bin")
-			if err := os.MkdirAll(binDir, 0o755); err != nil {
-				t.Fatal(err)
-			}
-
-			stateDir := t.TempDir()
-			initCountFile := filepath.Join(stateDir, "bd-init-count")
-			checkpointFile := filepath.Join(stateDir, "schema-checkpointed")
-			recoveryReadyFile := filepath.Join(stateDir, "recovery-ready")
-			schemaReadyFile := filepath.Join(stateDir, "schema-ready")
-			databaseFile := filepath.Join(stateDir, "database-exists")
-			dirtyTablesFile := filepath.Join(stateDir, "dirty-tables")
-			stageLogFile := filepath.Join(stateDir, "staged-tables")
-			sqlLogFile := filepath.Join(stateDir, "dolt-sql")
-			dataDir := filepath.Join(stateDir, "dolt-data")
-			if err := os.WriteFile(dirtyTablesFile, []byte(tt.dirtyTables), 0o600); err != nil {
-				t.Fatal(err)
-			}
-			if tt.databasePreexisting {
-				if err := os.WriteFile(databaseFile, nil, 0o600); err != nil {
-					t.Fatal(err)
-				}
-			}
-			if tt.databasePreexisting || tt.databaseDirectory {
-				if err := os.MkdirAll(filepath.Join(dataDir, "hq"), 0o700); err != nil {
-					t.Fatal(err)
-				}
-			}
-			alreadyClean := "false"
-			if tt.alreadyClean {
-				alreadyClean = "true"
-			}
-
-			fakeBd := filepath.Join(binDir, "bd")
-			fakeBdScript := fmt.Sprintf(`#!/bin/sh
-set -eu
-case "${1:-}" in
-  init)
-    count=0
-    if [ -f %q ]; then
-      count=$(cat %q)
-    fi
-    count=$((count + 1))
-    printf '%%s\n' "$count" > %q
-    case " $* " in
-      *" --reinit-local "*) ;;
-      *) echo "bd init must use --reinit-local" >&2; exit 2 ;;
-    esac
-    if [ "$count" -eq 1 ]; then
-      printf '%%s\n' %q >&2
-      exit 1
-    fi
-    if [ ! -f %q ] && [ ! -f %q ]; then
-      echo "bd init retried before the partial schema was checkpointed" >&2
-      exit 2
-    fi
-    : > %q
-    exit 0
-    ;;
-  config|migrate|list)
-    exit 0
-    ;;
-  *)
-    exit 0
-    ;;
-esac
-`, initCountFile, initCountFile, initCountFile, tt.initError, checkpointFile, recoveryReadyFile, schemaReadyFile)
-			if err := os.WriteFile(fakeBd, []byte(fakeBdScript), 0o755); err != nil {
-				t.Fatal(err)
-			}
-
-			fakeDolt := filepath.Join(binDir, "dolt")
-			fakeDoltScript := fmt.Sprintf(`#!/bin/sh
-set -eu
-query=""
-prev=""
-for arg in "$@"; do
-  if [ "$prev" = "-q" ]; then
-    query="$arg"
-    break
-  fi
-  prev="$arg"
-done
-printf '%%s\n' "$query" >> %q
-case "$query" in
-  'SELECT 1')
-    exit 0
-    ;;
-  'USE `+"`hq`"+`')
-    [ -f %q ]
-    ;;
-  'CREATE DATABASE IF NOT EXISTS `+"`hq`"+`')
-    : > %q
-    ;;
-  'USE `+"`hq`"+`; SELECT 1 FROM config LIMIT 1')
-    [ -f %q ]
-    ;;
-  *'FROM dolt_status'*)
-    printf 'table_name\n'
-    cat %q
-    if [ %q = true ]; then
-      : > %q
-    fi
-    ;;
-  *'CALL DOLT_ADD('* )
-    case "$query" in
-      *operator_notes*) echo "refusing to stage operator_notes" >&2; exit 3 ;;
-    esac
-    printf '%%s\n' "$query" >> %q
-    ;;
-  *'CALL DOLT_COMMIT('* )
-    case "$query" in
-      *"'-A"*|*"'-a"*) echo "refusing checkpoint-all commit" >&2; exit 3 ;;
-    esac
-    if [ %q = true ]; then
-      echo "nothing to commit" >&2
-      exit 1
-    fi
-    [ -s %q ] || { echo "commit attempted before selective staging" >&2; exit 3; }
-    : > %q
-    ;;
-  *)
-    exit 0
-    ;;
-esac
-`, sqlLogFile, databaseFile, databaseFile, schemaReadyFile, dirtyTablesFile, alreadyClean, recoveryReadyFile, stageLogFile, alreadyClean, stageLogFile, checkpointFile)
-			if err := os.WriteFile(fakeDolt, []byte(fakeDoltScript), 0o755); err != nil {
-				t.Fatal(err)
-			}
-
-			cmd := exec.Command(script, "init", cityPath, "gc", "hq")
-			cmd.Env = sanitizedBaseEnv(append(gcBeadsBdTestHomeEnv(t),
-				"GC_CITY_PATH="+cityPath,
-				"GC_DOLT_DATA_DIR="+dataDir,
-				"PATH="+strings.Join([]string{binDir, os.Getenv("PATH")}, string(os.PathListSeparator)),
-			)...)
-			out, err := cmd.CombinedOutput()
-			if tt.wantSuccess && err != nil {
-				t.Fatalf("gc-beads-bd init failed: %v\n%s", err, out)
-			}
-			if !tt.wantSuccess && err == nil {
-				t.Fatalf("gc-beads-bd init unexpectedly succeeded:\n%s", out)
-			}
-			if !tt.wantSuccess && !strings.Contains(string(out), tt.initError) {
-				t.Fatalf("gc-beads-bd init output lost original error %q:\n%s", tt.initError, out)
-			}
-
-			countData, err := os.ReadFile(initCountFile)
-			if err != nil {
-				t.Fatalf("read init count: %v", err)
-			}
-			if got := strings.TrimSpace(string(countData)); got != tt.wantInitCount {
-				t.Fatalf("bd init count = %q, want %s", got, tt.wantInitCount)
-			}
-			sqlData, err := os.ReadFile(sqlLogFile)
-			if err != nil {
-				t.Fatalf("read Dolt SQL log: %v", err)
-			}
-			sqlText := string(sqlData)
-			if strings.Contains(sqlText, "DOLT_COMMIT('-A") || strings.Contains(sqlText, "DOLT_COMMIT('-a") {
-				t.Fatalf("recovery must not checkpoint every dirty table:\n%s", sqlText)
-			}
-			if tt.wantCheckpoint {
-				for _, table := range []string{"comments", "compaction_snapshots", "dependencies", "dolt_schemas", "events", "issue_snapshots", "labels", "schema_migrations"} {
-					if !strings.Contains(sqlText, "DOLT_ADD('-f', '"+table+"')") {
-						t.Fatalf("Dolt SQL log missing selective stage for %q:\n%s", table, sqlText)
-					}
-				}
-				if !strings.Contains(sqlText, "DOLT_COMMIT('--skip-empty', '-m', 'gc: checkpoint partial bd init schema')") {
-					t.Fatalf("Dolt SQL log missing idempotent recovery commit:\n%s", sqlText)
-				}
-			} else if strings.Contains(sqlText, "DOLT_ADD(") || strings.Contains(sqlText, "DOLT_COMMIT(") {
-				t.Fatalf("fail-closed path must not stage or commit Dolt state:\n%s", sqlText)
-			}
-		})
 	}
 }
 
@@ -7615,7 +7362,7 @@ esac
 	}
 	gotState := string(stateData)
 	for _, want := range []string{
-		"metadata=yes args=init --reinit-local --quiet --server -p gc --database hq",
+		"metadata=yes args=init --force --quiet --server -p gc --database hq",
 		"metadata=no args=init --quiet --server -p gc --database hq",
 	} {
 		if !strings.Contains(gotState, want) {

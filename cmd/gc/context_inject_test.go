@@ -165,6 +165,23 @@ func TestContextInjectBareOpus48Is1M(t *testing.T) {
 	}
 }
 
+// Regression for sys-v3izb/gc-esqr: transcripts never carry the "[1m]"
+// launch suffix for current-generation models (message.model logs the bare
+// API name, e.g. "claude-opus-5") — a 1M session on one of these must not
+// misclassify as the 200k default and fire the urgent tier at ~17% real
+// usage. MEASURED shape: 166k/1M (~17%) must stay silent (below the 60%
+// advisory threshold), not read as 166k/200k (~83%, urgent).
+func TestContextInjectBareOpus5AndSonnet5AreCurrentGeneration1M(t *testing.T) {
+	t.Setenv("GC_INJECT_CONTEXT", "")
+	for _, model := range []string{"claude-opus-5", "claude-sonnet-5"} {
+		p := writeTranscript(t, usageLine(model, 10_000, 146_000, 10_000))
+		got := contextInjectLine(hookInputFor(p))
+		if got != "" {
+			t.Errorf("%s: 166k of a 1M window (~17%%) must be silent, got %q", model, got)
+		}
+	}
+}
+
 // Sidecar/compaction call on a smaller-window model must not shrink the
 // main-loop session's window: max-over-models wins. (The observed 782k/200k
 // bug: a Fable session with bare-opus sidecar entries, newest entry opus.)

@@ -7,6 +7,8 @@ import (
 	"os"
 	"strconv"
 	"strings"
+
+	"github.com/gastownhall/gascity/internal/modelwindow"
 )
 
 // Context-usage injection — the context-pressure sibling of clock_inject.go.
@@ -146,18 +148,13 @@ func contextWindowTokens(models []string) int {
 	return best
 }
 
-// classifyWindow maps one model string to its context window. 1M families:
-// Opus 4.6/4.7/4.8, Sonnet 4.6, Fable, Mythos, and an explicit [1m] launch
-// suffix; everything else (Haiku, older models, unrecognized) is a
-// conservative 200k. Kept simple/substring rather than a strict table so a
-// dated-suffix variant still matches; pin GC_CONTEXT_WINDOW_TOKENS when a new
-// model's window isn't yet recognized here.
+// classifyWindow maps one model string to its context window, delegating to
+// modelwindow (the shared, single-place classifier — see its package doc for
+// why the "[1m]" suffix alone isn't a reliable signal). A non-Claude or
+// unrecognized model string falls back to the conservative 200k default.
 func classifyWindow(model string) int {
-	ml := strings.ToLower(model)
-	for _, s := range []string{"[1m]", "fable", "mythos", "opus-4-6", "opus-4-7", "opus-4-8", "sonnet-4-6"} {
-		if strings.Contains(ml, s) {
-			return 1_000_000
-		}
+	if window, ok := modelwindow.ForClaudeModel(model); ok {
+		return window
 	}
 	return 200_000
 }

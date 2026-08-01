@@ -534,6 +534,13 @@ func buildDesiredStateWithSessionBeads(
 	// Their pool demand is clamped to 1 at the merge so one pool slot wakes the
 	// session without over-spawning {name}-N phantoms when N routed beads arrive.
 	namedOnDemandTemplates := map[string]bool{}
+	// zeroCapacityPoolTemplates collects pool templates dropped from the
+	// enumeration below because max_active_sessions=0. The drop is correct —
+	// zeroing the cap is the documented way to structurally disable a pool —
+	// but it is otherwise silent, so routed work aimed at such a template
+	// starves with no error and looks identical to "no demand" (gcy-zes).
+	// warnZeroCapacityPoolDemand reports them once demand is known.
+	zeroCapacityPoolTemplates := map[string]struct{}{}
 	// activeStores is the set of stores a cold custom-scale_check pool is probed
 	// against (city + every non-suspended rig store), so routed demand a sleeping
 	// rig pool can't see locally — e.g. work queued in the city store — still
@@ -571,6 +578,12 @@ func buildDesiredStateWithSessionBeads(
 		sp.Check = expandAgentCommandTemplate(cityPath, cityName, &cfg.Agents[i], cfg.Rigs, "scale_check", sp.Check, stderr)
 
 		if !cfg.Agents[i].SupportsGenericEphemeralSessions() {
+			// Named-session templates are materialized by the named-session
+			// pass, not the pool pipeline, so a zero pool cap does not starve
+			// them and must not warn.
+			if !backsNamedSession {
+				zeroCapacityPoolTemplates[cfg.Agents[i].QualifiedName()] = struct{}{}
+			}
 			continue
 		}
 
@@ -787,6 +800,7 @@ func buildDesiredStateWithSessionBeads(
 		// an explicit-handle CachingStore returns its memoized pre-write live
 		// snapshot as the authoritative demand read.
 		demandReadyCache := newReadyDemandCache()
+		warnZeroCapacityPoolDemand(zeroCapacityPoolTemplates, unassignedRoutedBeads, stderr)
 		controlDispatcherOpenDemand := openControlDispatcherDemand(cfg, unassignedRoutedBeads)
 		recordDemandSubPhase(trace, "demand_snapshot.collect_unassigned_routed", subPhaseStart, map[string]any{
 			"beads": len(unassignedRoutedBeads),
@@ -1738,6 +1752,38 @@ func controllerDemandRouteTarget(b beads.Bead, templates map[string]struct{}) st
 // stamped before root routing switched to gc.routed_to.
 func controllerDemandRouteCandidates(b beads.Bead) []string {
 	return routedToAndLegacyWorkflowCandidates(b)
+}
+
+// warnZeroCapacityPoolDemand reports open, unassigned routed work aimed at a
+// pool template whose max_active_sessions is 0. Such a template is deliberately
+// excluded from pool-target enumeration, so nothing will ever consume its
+// queue. Zeroing the cap is a legitimate way to disable a pool, but doing it
+// while work is still routed there produces silent starvation: no session, no
+// demand line, no error — indistinguishable from an empty queue. gcy-zes lost
+// ten days of daily digests to exactly this, and the investigation that
+// followed read the pack's max_active_sessions=3 without seeing the city.toml
+// patch that zeroed it. Naming the cap in the log closes that gap.
+func warnZeroCapacityPoolDemand(templates map[string]struct{}, workBeads []beads.Bead, stderr io.Writer) {
+	if len(templates) == 0 || len(workBeads) == 0 {
+		return
+	}
+	counts := make(map[string]int, len(templates))
+	for _, b := range workBeads {
+		for _, candidate := range controllerDemandRouteCandidates(b) {
+			if _, ok := templates[candidate]; ok {
+				counts[candidate]++
+				break
+			}
+		}
+	}
+	starved := make([]string, 0, len(counts))
+	for template := range counts {
+		starved = append(starved, template)
+	}
+	sort.Strings(starved)
+	for _, template := range starved {
+		fmt.Fprintf(stderr, "scaleCheck: %s has %d unassigned routed bead(s) but max_active_sessions=0 — this pool is structurally disabled and cannot consume them; raise the cap or re-route the work\n", template, counts[template]) //nolint:errcheck
+	}
 }
 
 func openControlDispatcherDemand(cfg *config.City, workBeads []beads.Bead) map[string]bool {

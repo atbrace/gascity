@@ -131,12 +131,49 @@ if [[ -n "${GO_TEST_COVERPROFILE:-}" ]]; then
   go_test_args+=(-coverpkg=./... -coverprofile "$GO_TEST_COVERPROFILE")
 fi
 
+# When the runner compiled the package's test binary once up front and handed
+# it to us (GO_TEST_PREBUILT_BIN, see scripts/test-local-parallel), enumerate
+# and run from that binary instead of shelling out to `go test`. `go test -list`
+# has to BUILD the package before it can print a single test name, so the old
+# path made every shard recompile the same package concurrently (gcy-cmf).
+#
+# Deliberately declined in three cases, each of which falls through to the
+# original `go test` path unchanged:
+#   - coverage: -coverpkg is a COMPILE-time flag, so a binary built without it
+#     cannot produce a coverage profile;
+#   - observable timing: scripts/go-test-observable shells out to `go test
+#     -json` specifically and cannot wrap an arbitrary prebuilt binary;
+#   - build tags: -tags is also COMPILE-time, so a binary built without the
+#     caller's tags would silently run the wrong set of tests.
+use_prebuilt=0
+if [[ -n "${GO_TEST_PREBUILT_BIN:-}" && -x "${GO_TEST_PREBUILT_BIN:-}" \
+      && -z "${GO_TEST_COVERPROFILE:-}" \
+      && -z "${GO_TEST_TIMING_FILE:-}" \
+      && -z "${GO_TEST_TAGS:-}" ]]; then
+  use_prebuilt=1
+fi
+
+# `go test` always runs a test binary with the package directory as its working
+# directory. Tests that open testdata/ or any other relative path depend on
+# that, so reproduce it here rather than running from the repo root.
+pkg_dir="$repo_root/${test_pkg#./}"
+
+run_prebuilt_test() {
+  ( cd "$pkg_dir" && run_in_test_env "$GO_TEST_PREBUILT_BIN" "$@" )
+}
+
 # Capture the enumeration separately so a build/compile failure here surfaces
 # its output. `go test -list` builds the test binary; if that fails, the bare
 # assignment's non-zero status is swallowed by `set -e` (the script dies before
 # the "no tests discovered" branch below), producing an undebuggable empty
 # shard failure. Check the status explicitly and print what go printed.
-if ! list_output="$(run_go_test "${go_test_args[@]}" "$test_pkg" -list '^Test' 2>&1)"; then
+if [[ "$use_prebuilt" -eq 1 ]]; then
+  if ! list_output="$(run_prebuilt_test -test.list '^Test' 2>&1)"; then
+    echo "prebuilt test binary failed to list tests for ${test_pkg}; output:" >&2
+    printf '%s\n' "$list_output" >&2
+    exit 1
+  fi
+elif ! list_output="$(run_go_test "${go_test_args[@]}" "$test_pkg" -list '^Test' 2>&1)"; then
   echo "go test -list failed for ${test_pkg} (build/compile error); output:" >&2
   printf '%s\n' "$list_output" >&2
   exit 1
@@ -173,7 +210,16 @@ join_regex() {
 regex="^($(join_regex "${selected[@]}"))$"
 echo "Running ${test_pkg} shard ${shard_index} of ${shard_total} (${#selected[@]} tests)"
 printf '  %s\n' "${selected[@]}"
-if [[ -n "${GO_TEST_TIMING_FILE:-}" ]]; then
+if [[ "$use_prebuilt" -eq 1 ]]; then
+  # Translate the `go test` flags we own into their -test.* binary equivalents.
+  # -tags, -coverpkg and -coverprofile are absent by construction: use_prebuilt
+  # is only set when none of them were requested.
+  prebuilt_run_args=(-test.timeout "$timeout" -test.run "$regex")
+  if [[ -n "${GO_TEST_COUNT:-}" ]]; then
+    prebuilt_run_args=(-test.count="$GO_TEST_COUNT" "${prebuilt_run_args[@]}")
+  fi
+  run_prebuilt_test "${prebuilt_run_args[@]}"
+elif [[ -n "${GO_TEST_TIMING_FILE:-}" ]]; then
   run_observable_go_test "${go_test_args[@]}" "$test_pkg" -run "$regex"
 else
   run_go_test "${go_test_args[@]}" "$test_pkg" -run "$regex"

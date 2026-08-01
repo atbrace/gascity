@@ -3781,7 +3781,7 @@ exit 0
 		t.Fatalf("ReadFile(gc log): %v", err)
 	}
 	gcLogText := string(gcData)
-	if !strings.Contains(gcLogText, "mail send human -s ESCALATION: Reaper anomalies detected [MEDIUM]") {
+	if !strings.Contains(gcLogText, "mail send triage-agent -s ESCALATION: Reaper anomalies detected [MEDIUM]") {
 		t.Fatalf("reaper did not send escalation mail for session-state prune failure:\n%s", gcLogText)
 	}
 	if !strings.Contains(gcLogText, "gm: terminal session-state prune failed: session prune exploded") {
@@ -3889,7 +3889,7 @@ exit 0
 		t.Fatalf("ReadFile(gc log): %v", err)
 	}
 	gcLogText := string(gcData)
-	if !strings.Contains(gcLogText, "mail send human -s ESCALATION: Reaper anomalies detected [MEDIUM]") {
+	if !strings.Contains(gcLogText, "mail send triage-agent -s ESCALATION: Reaper anomalies detected [MEDIUM]") {
 		t.Fatalf("reaper did not send escalation mail for session-prune anomaly:\n%s", gcLogText)
 	}
 	if !strings.Contains(gcLogText, "gm: 1500 closed session beads pruned (pattern=gm-* threshold: 1000)") {
@@ -4930,7 +4930,7 @@ exit 0
 		t.Fatalf("ReadFile(gc log): %v", err)
 	}
 	gcLogText := string(gcData)
-	if !strings.Contains(gcLogText, "mail send human -s ESCALATION: Reaper anomalies detected [MEDIUM]") {
+	if !strings.Contains(gcLogText, "mail send triage-agent -s ESCALATION: Reaper anomalies detected [MEDIUM]") {
 		t.Fatalf("reaper did not escalate Dolt commit failure:\n%s", gcLogText)
 	}
 	if !strings.Contains(gcLogText, "Dolt commit failed for beads") {
@@ -7085,6 +7085,12 @@ fi
 func mergeTestEnv(overrides map[string]string) []string {
 	if _, ok := overrides["GC_MAINTENANCE_DONE_TARGET"]; !ok {
 		overrides["GC_MAINTENANCE_DONE_TARGET"] = "deacon/"
+	}
+	// MEDIUM escalations never page the human mailbox; they are only mailed
+	// when a triage mailbox is configured. Configure one so the tests below
+	// can keep observing escalation content through the mail log.
+	if _, ok := overrides["GC_ESCALATION_TRIAGE_RECIPIENT"]; !ok {
+		overrides["GC_ESCALATION_TRIAGE_RECIPIENT"] = "triage-agent"
 	}
 	env := os.Environ()
 	for key := range overrides {

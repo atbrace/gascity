@@ -70,7 +70,7 @@ fi
 # --- Step 2: Escalate to operator ---
 
 dolt_escalate \
-    "ESCALATION: Unservable Dolt databases detected [HIGH]" \
+    "ESCALATION: Unservable Dolt databases detected" \
     "Dolt: detected $UNSERVABLE_COUNT unservable database directories in $DATA_DIR:$UNSERVABLES.
 
 Phantoms missing noms/manifest: $PHANTOM_COUNT${PHANTOMS:- (none)}
@@ -85,6 +85,7 @@ still lists after restart, verify they are no longer needed and use:
 
 Investigate root cause (incomplete dolt init, interrupted replacement,
 manual filesystem edit) before re-creating affected databases." \
+    HIGH \
     2>/dev/null || true
 
 # --- Step 3: Report ---

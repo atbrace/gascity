@@ -80,8 +80,9 @@ acquire_backup_lock() {
     if ! command -v flock >/dev/null 2>&1; then
         SUMMARY="backup — flock-missing"
         dolt_escalate \
-            "Dolt backup: flock missing for backup sync [HIGH]" \
+            "Dolt backup: flock missing for backup sync" \
             "Skipping backup sync because flock is unavailable; concurrent dolt backup sync can overload the shared sql-server." \
+            HIGH \
             2>/dev/null || true
         dolt_notify_done "$SUMMARY"
         echo "backup: $SUMMARY"
@@ -103,8 +104,9 @@ acquire_backup_lock() {
 DOLT_VERSION="$(dolt version 2>/dev/null | awk 'NR == 1 {print $NF}' || true)"
 if ! dolt_version_at_least "$DOLT_VERSION" "$MIN_DOLT_BACKUP_VERSION"; then
     dolt_escalate \
-        "Dolt backup: dolt-too-old for backup sync [HIGH]" \
+        "Dolt backup: dolt-too-old for backup sync" \
         "Skipping backup sync: dolt version ${DOLT_VERSION:-unknown} is below required ${MIN_DOLT_BACKUP_VERSION}. Gas City requires this managed Dolt floor before backup sync." \
+        HIGH \
         2>/dev/null || true
     SUMMARY="backup — dolt-too-old: ${DOLT_VERSION:-unknown}, required: $MIN_DOLT_BACKUP_VERSION"
     dolt_notify_done "$SUMMARY"
@@ -204,8 +206,9 @@ fi
 
 if [ "$FAILED_COUNT" -gt 0 ]; then
     dolt_escalate \
-        "Dolt backup: $FAILED_COUNT/$TOTAL databases failed to sync [MEDIUM]" \
+        "Dolt backup: $FAILED_COUNT/$TOTAL databases failed to sync" \
         "Failed databases:$FAILED_DBS" \
+        MEDIUM \
         2>/dev/null || true
 fi
 

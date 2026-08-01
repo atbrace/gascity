@@ -4,6 +4,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"runtime"
 	"strings"
 	"testing"
 
@@ -11,15 +12,28 @@ import (
 	"github.com/gastownhall/gascity/internal/orders"
 )
 
+// coreEscalateScript returns the absolute path to Core's escalate.sh. The
+// stale-db formula routes every escalation through it — there is no
+// open-coded `gc mail send` fallback — so the rendered script needs a
+// resolvable copy to exercise real severity routing.
+func coreEscalateScript() string {
+	_, filename, _, _ := runtime.Caller(0)
+	return filepath.Join(filepath.Dir(filename),
+		"..", "..", "..",
+		"internal", "bootstrap", "packs", "core", "assets", "scripts", "escalate.sh")
+}
+
 func staleDBFilteredEnv(keys ...string) []string {
 	keys = append(keys,
 		"GC_ESCALATE_SCRIPT",
 		"GC_ESCALATE_SEARCH_PACKS",
 		"GC_ESCALATION_RECIPIENT",
+		"GC_ESCALATION_PAGE_RECIPIENT",
+		"GC_ESCALATION_TRIAGE_RECIPIENT",
 		"GC_SYSTEM_PACKS_DIR",
 		"GC_MAINTENANCE_DONE_TARGET",
 	)
-	return filteredEnv(keys...)
+	return append(filteredEnv(keys...), "GC_ESCALATE_SCRIPT="+coreEscalateScript())
 }
 
 func TestStaleDBFormulaRuntimeContract(t *testing.T) {

@@ -470,8 +470,9 @@ send_spike_alert() {
     local threshold="$5"
 
     "$ESCALATE_SCRIPT" \
-        --subject "ESCALATION: JSONL spike detected [HIGH]" \
+        --subject "ESCALATION: JSONL spike detected" \
         --message "Database: $db, prev: $prev_count, current: $current_count, delta: ${delta}%, threshold: ${threshold}%" \
+        --severity HIGH \
         2>/dev/null
 }
 
@@ -596,8 +597,9 @@ Remediation:
 ESCALATION
 )
             if "$ESCALATE_SCRIPT" \
-                --subject "ESCALATION: JSONL push failed [HIGH]" \
+                --subject "ESCALATION: JSONL push failed" \
                 --message "$body" \
+                --severity HIGH \
                 2>/dev/null; then
                 mark_push_failure_escalated
             fi

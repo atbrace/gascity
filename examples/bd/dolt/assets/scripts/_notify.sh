@@ -30,15 +30,20 @@ dolt_resolve_escalate_script() {
 
 DOLT_ESCALATE_SCRIPT="${DOLT_ESCALATE_SCRIPT:-$(dolt_resolve_escalate_script)}"
 
+# dolt_escalate sends an escalation through the resolved escalate.sh.
+# Severity decides whether it pages a person or lands in the triage mailbox,
+# so callers pass it instead of embedding "[MEDIUM]" in the subject —
+# escalate.sh appends the tag itself.
 dolt_escalate() {
     local subject="$1"
     local message="$2"
+    local severity="$3"
 
     if [ -z "$DOLT_ESCALATE_SCRIPT" ] || [ ! -x "$DOLT_ESCALATE_SCRIPT" ]; then
         echo "dolt notify: no executable escalate.sh found" >&2
         return 1
     fi
-    "$DOLT_ESCALATE_SCRIPT" --subject "$subject" --message "$message"
+    "$DOLT_ESCALATE_SCRIPT" --subject "$subject" --message "$message" --severity "$severity"
 }
 
 dolt_notify_done() {

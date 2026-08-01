@@ -626,8 +626,22 @@ Core maintenance scripts route alerts through a generic escalation hook
 instead of mailing a hardcoded role. Orders inherit the orchestrator's
 environment, so set these at orchestrator start to customize routing:
 
-- `GC_ESCALATION_RECIPIENT` — mail recipient for escalations (default:
-  `human`, the reserved human mailbox).
+Severity decides the destination. `CRITICAL` and `HIGH` are pages — a
+person should see an outage — so they go to the reserved `human` mailbox.
+Everything else (`MEDIUM`, lower, or unspecified) is an advisory for
+triage, and never pages a person: it goes to the triage mailbox, and is
+reported in the order's output without being mailed when no triage
+mailbox is configured. Core ships no triage default because `human` is
+the only recipient every city resolves; anything else is a
+user-configured agent name, and Core hardcodes no roles.
+
+- `GC_ESCALATION_RECIPIENT` — mail recipient for escalations at every
+  severity. Overrides both tiers below (default: unset).
+- `GC_ESCALATION_PAGE_RECIPIENT` — recipient for `CRITICAL` and `HIGH`
+  (default: `human`, the reserved human mailbox).
+- `GC_ESCALATION_TRIAGE_RECIPIENT` — recipient for `MEDIUM` and below.
+  Set it to an agent mailbox to have advisories triaged (default: unset,
+  advisories are reported but not mailed).
 - `GC_ESCALATE_SCRIPT` — absolute path to an escalation script to run
   instead of searching packs.
 - `GC_ESCALATE_SEARCH_PACKS` — space-separated pack names searched (in

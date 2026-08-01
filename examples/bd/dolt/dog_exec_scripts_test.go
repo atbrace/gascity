@@ -32,6 +32,8 @@ func runDogScriptCommand(t *testing.T, scriptName, binDir, cityPath, dataDir str
 		"GC_ESCALATE_SCRIPT",
 		"GC_ESCALATE_SEARCH_PACKS",
 		"GC_ESCALATION_RECIPIENT",
+		"GC_ESCALATION_PAGE_RECIPIENT",
+		"GC_ESCALATION_TRIAGE_RECIPIENT",
 		"GC_SYSTEM_PACKS_DIR",
 		"DOLT_ESCALATE_SCRIPT",
 		"GC_MAINTENANCE_DONE_TARGET",
@@ -4248,7 +4250,10 @@ func TestBackupScriptCountsFailedDatabasesByDatabase(t *testing.T) {
 	gcLogPath := writeDogFakeGC(t, binDir)
 	_ = writeBackupFakeDolt(t, binDir, "2.1.0", 1)
 
-	out := runDogScript(t, "mol-dog-backup.sh", binDir, cityPath, dataDir, "GC_BACKUP_DATABASES=prod")
+	// A failed sync is MEDIUM, so it goes to the triage mailbox rather than
+	// paging a person — the mail is only sent when one is configured.
+	out := runDogScript(t, "mol-dog-backup.sh", binDir, cityPath, dataDir,
+		"GC_BACKUP_DATABASES=prod", "GC_ESCALATION_TRIAGE_RECIPIENT=triage-agent")
 	if !strings.Contains(out, "synced: 0/1") {
 		t.Fatalf("unexpected backup summary:\n%s", out)
 	}
@@ -4259,8 +4264,8 @@ func TestBackupScriptCountsFailedDatabasesByDatabase(t *testing.T) {
 	if !strings.Contains(string(gcLog), "Dolt backup: 1/1 databases failed to sync") {
 		t.Fatalf("failure mail should count databases, log:\n%s", gcLog)
 	}
-	if !strings.Contains(string(gcLog), "mail send human -s Dolt backup: 1/1 databases failed to sync [MEDIUM]") {
-		t.Fatalf("backup failure escalation must use the generic default recipient:\n%s", gcLog)
+	if !strings.Contains(string(gcLog), "mail send triage-agent -s Dolt backup: 1/1 databases failed to sync [MEDIUM]") {
+		t.Fatalf("backup failure escalation must route to the triage mailbox:\n%s", gcLog)
 	}
 }
 
@@ -4360,7 +4365,10 @@ func TestBackupScriptCountsFailedRemoteAutoConfiguration(t *testing.T) {
 	gcLogPath := writeDogFakeGC(t, binDir)
 	doltLogPath := writeAutoConfigureFakeDolt(t, binDir, 1)
 
-	out := runDogScript(t, "mol-dog-backup.sh", binDir, cityPath, dataDir)
+	// A failed sync is MEDIUM, so it goes to the triage mailbox rather than
+	// paging a person — the mail is only sent when one is configured.
+	out := runDogScript(t, "mol-dog-backup.sh", binDir, cityPath, dataDir,
+		"GC_ESCALATION_TRIAGE_RECIPIENT=triage-agent")
 	if !strings.Contains(out, "synced: 1/2") {
 		t.Fatalf("unexpected backup summary:\n%s", out)
 	}
@@ -4434,7 +4442,10 @@ esac
 exit 0
 `)
 
-	out := runDogScript(t, "mol-dog-doctor.sh", binDir, cityPath, dataDir, "GC_DOCTOR_BACKUP_STALE_S=1")
+	// The advisory is MEDIUM, so it is only mailed when a triage mailbox is
+	// configured — and the mail is this test's window into advisory content.
+	out := runDogScript(t, "mol-dog-doctor.sh", binDir, cityPath, dataDir,
+		"GC_DOCTOR_BACKUP_STALE_S=1", "GC_ESCALATION_TRIAGE_RECIPIENT=triage-agent")
 	if !strings.Contains(out, "server: ok") {
 		t.Fatalf("unexpected doctor output:\n%s", out)
 	}
@@ -4484,7 +4495,10 @@ esac
 exit 0
 `)
 
-	out := runDogScript(t, "mol-dog-doctor.sh", binDir, cityPath, dataDir, "GC_DOCTOR_BACKUP_STALE_S=1")
+	// The advisory is MEDIUM, so it is only mailed when a triage mailbox is
+	// configured — and the mail is this test's window into advisory content.
+	out := runDogScript(t, "mol-dog-doctor.sh", binDir, cityPath, dataDir,
+		"GC_DOCTOR_BACKUP_STALE_S=1", "GC_ESCALATION_TRIAGE_RECIPIENT=triage-agent")
 	if !strings.Contains(out, "server: ok") {
 		t.Fatalf("unexpected doctor output:\n%s", out)
 	}
@@ -4543,7 +4557,10 @@ esac
 exit 0
 `)
 
-	out := runDogScript(t, "mol-dog-doctor.sh", binDir, cityPath, dataDir, "GC_DOCTOR_BACKUP_STALE_S=1")
+	// The advisory is MEDIUM, so it is only mailed when a triage mailbox is
+	// configured — and the mail is this test's window into advisory content.
+	out := runDogScript(t, "mol-dog-doctor.sh", binDir, cityPath, dataDir,
+		"GC_DOCTOR_BACKUP_STALE_S=1", "GC_ESCALATION_TRIAGE_RECIPIENT=triage-agent")
 	if !strings.Contains(out, "server: ok") {
 		t.Fatalf("unexpected doctor output:\n%s", out)
 	}
@@ -4588,7 +4605,10 @@ esac
 exit 0
 `)
 
-	out := runDogScript(t, "mol-dog-doctor.sh", binDir, cityPath, dataDir, "GC_DOCTOR_BACKUP_STALE_S=1")
+	// The advisory is MEDIUM, so it is only mailed when a triage mailbox is
+	// configured — and the mail is this test's window into advisory content.
+	out := runDogScript(t, "mol-dog-doctor.sh", binDir, cityPath, dataDir,
+		"GC_DOCTOR_BACKUP_STALE_S=1", "GC_ESCALATION_TRIAGE_RECIPIENT=triage-agent")
 	if !strings.Contains(out, "orphans: 2") {
 		t.Fatalf("doctor should report doctest/doctortest orphan databases, output:\n%s", out)
 	}
@@ -4646,7 +4666,10 @@ esac
 exit 0
 `)
 
-	out := runDogScript(t, "mol-dog-doctor.sh", binDir, cityPath, dataDir, "GC_DOCTOR_BACKUP_STALE_S=1")
+	// The advisory is MEDIUM, so it is only mailed when a triage mailbox is
+	// configured — and the mail is this test's window into advisory content.
+	out := runDogScript(t, "mol-dog-doctor.sh", binDir, cityPath, dataDir,
+		"GC_DOCTOR_BACKUP_STALE_S=1", "GC_ESCALATION_TRIAGE_RECIPIENT=triage-agent")
 	if !strings.Contains(out, "server: ok") {
 		t.Fatalf("unexpected doctor output:\n%s", out)
 	}
@@ -4738,17 +4761,10 @@ exit 0
 	}
 }
 
-// TestDoctorScriptAdvisoryMailUsesGenericEscalation asserts the latency-WARN
-// advisory path goes through the generic escalation recipient.
-func TestDoctorScriptAdvisoryMailUsesGenericEscalation(t *testing.T) {
-	cityPath := t.TempDir()
-	dataDir := filepath.Join(cityPath, "dolt-data")
-	if err := os.MkdirAll(dataDir, 0o755); err != nil {
-		t.Fatalf("mkdir data dir: %v", err)
-	}
-
-	binDir := t.TempDir()
-	gcLogPath := writeDogFakeGC(t, binDir)
+// writeHealthyDoctorDolt installs a fake dolt that answers every doctor probe
+// successfully, so the script reaches its MEDIUM advisory path.
+func writeHealthyDoctorDolt(t *testing.T, binDir string) {
+	t.Helper()
 	writeExecutable(t, filepath.Join(binDir, "dolt"), `#!/usr/bin/env bash
 set -euo pipefail
 case "$*" in
@@ -4767,11 +4783,60 @@ case "$*" in
 esac
 exit 0
 `)
+}
+
+// TestDoctorScriptAdvisoryDoesNotPageHuman is the regression guard for gcy-pq2:
+// the latency-WARN advisory is MEDIUM, and MEDIUM must never reach the human
+// mailbox. Unrouted, it is reported rather than mailed — 84 of 89 unread human
+// messages were this one advisory before severity routing existed.
+func TestDoctorScriptAdvisoryDoesNotPageHuman(t *testing.T) {
+	cityPath := t.TempDir()
+	dataDir := filepath.Join(cityPath, "dolt-data")
+	if err := os.MkdirAll(dataDir, 0o755); err != nil {
+		t.Fatalf("mkdir data dir: %v", err)
+	}
+
+	binDir := t.TempDir()
+	gcLogPath := writeDogFakeGC(t, binDir)
+	writeHealthyDoctorDolt(t, binDir)
 
 	// LATENCY_WARN_S=0 makes the latency check fire on every run because
 	// PROBE_END - PROBE_START >= 0 always. That guarantees the advisory
-	// mail path executes regardless of probe duration.
+	// path executes regardless of probe duration.
 	out := runDogScript(t, "mol-dog-doctor.sh", binDir, cityPath, dataDir, "GC_DOCTOR_LATENCY_WARN_S=0")
+	if !strings.Contains(out, "server: ok") {
+		t.Fatalf("doctor should report server ok when probe succeeds, output:\n%s", out)
+	}
+	gcLog, err := os.ReadFile(gcLogPath)
+	if err != nil && !os.IsNotExist(err) {
+		t.Fatalf("read gc log: %v", err)
+	}
+	if strings.Contains(string(gcLog), "mail send human") {
+		t.Fatalf("MEDIUM advisory must never page the human mailbox, log:\n%s", gcLog)
+	}
+	// Not paging must not mean disappearing. With no triage mailbox
+	// configured the advisory is never mailed, so this run's own output is
+	// the only place a degraded Dolt is still visible.
+	if !strings.Contains(out, "health advisory:") || !strings.Contains(out, "WARN: latency") {
+		t.Fatalf("unrouted advisory must still be reported in the run output:\n%s", out)
+	}
+}
+
+// TestDoctorScriptAdvisoryRoutesToTriageMailbox asserts the advisory still
+// reaches an agent for triage once the city configures a triage mailbox.
+func TestDoctorScriptAdvisoryRoutesToTriageMailbox(t *testing.T) {
+	cityPath := t.TempDir()
+	dataDir := filepath.Join(cityPath, "dolt-data")
+	if err := os.MkdirAll(dataDir, 0o755); err != nil {
+		t.Fatalf("mkdir data dir: %v", err)
+	}
+
+	binDir := t.TempDir()
+	gcLogPath := writeDogFakeGC(t, binDir)
+	writeHealthyDoctorDolt(t, binDir)
+
+	out := runDogScript(t, "mol-dog-doctor.sh", binDir, cityPath, dataDir,
+		"GC_DOCTOR_LATENCY_WARN_S=0", "GC_ESCALATION_TRIAGE_RECIPIENT=triage-agent")
 	if !strings.Contains(out, "server: ok") {
 		t.Fatalf("doctor should report server ok when probe succeeds, output:\n%s", out)
 	}
@@ -4779,11 +4844,8 @@ exit 0
 	if err != nil {
 		t.Fatalf("read gc log: %v", err)
 	}
-	if !strings.Contains(string(gcLog), "Dolt health advisory") {
-		t.Fatalf("advisory mail did not fire; latency-WARN should have triggered, log:\n%s", gcLog)
-	}
-	if !strings.Contains(string(gcLog), "mail send human -s Dolt health advisory [MEDIUM]") {
-		t.Fatalf("advisory escalation must use the generic default recipient, log:\n%s", gcLog)
+	if !strings.Contains(string(gcLog), "mail send triage-agent -s Dolt health advisory [MEDIUM]") {
+		t.Fatalf("advisory must reach the configured triage mailbox tagged MEDIUM, log:\n%s", gcLog)
 	}
 }
 

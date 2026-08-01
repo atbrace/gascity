@@ -103,8 +103,9 @@ append_backup_stale() {
 send_escalation() {
     local subject="$1"
     local message="$2"
+    local severity="$3"
     local err
-    if ! err=$(dolt_escalate "$subject" "$message" 2>&1 >/dev/null); then
+    if ! err=$(dolt_escalate "$subject" "$message" "$severity" 2>&1 >/dev/null); then
         if [ -n "$err" ]; then
             echo "doctor: escalation failed: $err" >&2
         else
@@ -119,8 +120,9 @@ send_escalation() {
 PROBE_START_MS=$(now_ms)
 if ! dolt_sql -q "SELECT active_branch()" >/dev/null 2>&1; then
     if send_escalation \
-        "ESCALATION: Dolt server unreachable on port $PORT [CRITICAL]" \
-        "Doctor probe failed: server did not respond to active_branch() query."; then
+        "ESCALATION: Dolt server unreachable on port $PORT" \
+        "Doctor probe failed: server did not respond to active_branch() query." \
+        CRITICAL; then
         dolt_notify_done "doctor — server: UNREACHABLE (escalated)"
         echo "doctor: server unreachable on port $PORT (escalated)"
     else
@@ -209,6 +211,12 @@ fi
 
 WARNINGS="${LATENCY_WARN}${CONN_WARN}${ORPHAN_WARN}${BACKUP_STALE}"
 if [ -n "$WARNINGS" ]; then
+    # Report the advisory in this run's own output every tick it is active.
+    # MEDIUM does not page a person, and an unrouted advisory is not mailed at
+    # all, so this echo is the only thing that keeps a degraded Dolt visible
+    # when no triage mailbox is configured. It is deliberately outside the
+    # dedup below: dedup bounds mailbox volume, not per-run reporting.
+    echo "doctor: health advisory:$WARNINGS"
     # Dedup (#3409): key on which conditions are active — not their tick-volatile
     # values (exact latency ms, connection count, backup age) — and re-send only
     # when that set changes. Record after a successful send so a failed
@@ -221,11 +229,12 @@ if [ -n "$WARNINGS" ]; then
     if [ -n "$BACKUP_STALE" ]; then ADVISORY_SIG="${ADVISORY_SIG}backup "; fi
     if advisory_changed "$ADVISORY_SIG" "$ADVISORY_STATE_FILE"; then
         if send_escalation \
-            "Dolt health advisory [MEDIUM]" \
+            "Dolt health advisory" \
             "Latency: ${LATENCY_MS}ms${LATENCY_WARN}
 Connections: ${CONN_COUNT}/${CONN_MAX}${CONN_WARN}
 Disk: ${DISK_USAGE}
-Orphan DBs: ${ORPHAN_COUNT}${ORPHAN_WARN}${BACKUP_STALE}"; then
+Orphan DBs: ${ORPHAN_COUNT}${ORPHAN_WARN}${BACKUP_STALE}" \
+            MEDIUM; then
             advisory_record "$ADVISORY_SIG" "$ADVISORY_STATE_FILE"
         fi
     fi

@@ -135,7 +135,17 @@ COMMERCIAL_SURFACE="internal/cliauth internal/serviceproto cmd/gc/cmd_login.go"
 COMMERCIAL_FIELD_RE='json:"[^"]*(trial|billing|credit|plan|invoice|subscription|quota|coupon|entitlement)'
 commercial_fields=""
 for p in $COMMERCIAL_SURFACE; do
-	[ -e "$p" ] || continue
+	# A surface member that has not landed yet is skipped, but never SILENTLY:
+	# this file's contract is fail-closed (see header), and an unannounced skip
+	# is how a guard stays switched off after the package it guards arrives.
+	# internal/serviceproto is the current expected absence — it is planned for
+	# this module, not the hosted one (engdocs/plans/hosted-onboarding/DESIGN.md).
+	# If a name here is still reported once its package exists, the path is wrong
+	# and check (f) is scanning nothing.
+	if [ ! -e "$p" ]; then
+		note "(f) surface member not present, not scanned: $p"
+		continue
+	fi
 	hits=$(grep -rnE --include='*.go' "$COMMERCIAL_FIELD_RE" "$p" 2>/dev/null \
 		| grep -v '_test\.go:' | grep -v 'boundary:allow commercial')
 	if [ -n "$hits" ]; then

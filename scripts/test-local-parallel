@@ -22,6 +22,8 @@ repo_root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "$repo_root"
 # shellcheck source=lib/test-slice.sh
 source "$repo_root/scripts/lib/test-slice.sh"
+# shellcheck source=lib/common.sh
+source "$repo_root/scripts/lib/common.sh"
 gc_test_slice_reexec "$repo_root/scripts/test-local-parallel" "$@"
 
 # GC_DOLT_PORT / BEADS_DOLT_SERVER_PORT point bd at the live shared city Dolt
@@ -59,6 +61,7 @@ gotmpdir_val="$(go env GOTMPDIR)"
 goroot_val="$(go env GOROOT)"
 
 jobspecs=()
+cmd_gc_sharded=0
 
 add_job() {
   local label="$1"
@@ -81,6 +84,7 @@ add_cmd_gc_shards() {
   local gc_fast_unit="$2"
   local tags="$3"
   local i command
+  cmd_gc_sharded=1
   for i in $(seq 1 "$cmd_gc_total"); do
     command="GC_FAST_UNIT=${gc_fast_unit} GO_TEST_COUNT=1 GO_TEST_TIMEOUT=20m"
     if [[ -n "$tags" ]]; then
@@ -175,6 +179,35 @@ if command -v ionice >/dev/null 2>&1; then
 fi
 export TEST_LOCAL_NICE="$nice_prefix"
 
+# Compile ./cmd/gc's test binary ONCE, up front, and let every shard share it
+# (gcy-cmf). Previously each shard ran `go test ./cmd/gc -list '^Test'` to
+# discover which tests it owned, and `-list` must BUILD the test binary before
+# it can print any names -- so N shards compiled the same 503,559-line package
+# CONCURRENTLY purely to read out test names. On a memory-constrained host that
+# is ~4 GB per shard and pages the box to death. The shards' own -timeout cannot
+# save it: -timeout bounds test EXECUTION, not COMPILATION, so a livelocked
+# compile runs straight past a timeout that can never fire.
+#
+# This mirrors the pattern add_fsys_compile_job already uses for ./internal/fsys.
+# The CGO detection has to happen here too: unlike test-go-test-shard, this
+# script never sourced lib/common.sh, so without configure_cgo_platform_paths
+# the prebuild would link with no icu4c include path and fail on macOS with
+# undefined _uregex_* symbols (gcy-lcs).
+if [[ "$cmd_gc_sharded" -eq 1 ]]; then
+  cgo_cppflags="${CGO_CPPFLAGS:-}"
+  cgo_ldflags="${CGO_LDFLAGS:-}"
+  configure_cgo_platform_paths
+  export CGO_CPPFLAGS="$cgo_cppflags"
+  export CGO_LDFLAGS="$cgo_ldflags"
+
+  prebuilt_dir="$(mktemp -d "${TMPDIR:-/tmp}/gc-cmdgc-test.XXXXXX")"
+  trap 'rm -rf "$prebuilt_dir"' EXIT
+  echo "Compiling ./cmd/gc test binary once for ${cmd_gc_total} shard(s)"
+  # shellcheck disable=SC2086 # nice_prefix is an intentional word list
+  ${nice_prefix} go test -c -o "$prebuilt_dir/cmdgc.test" ./cmd/gc
+  export GO_TEST_PREBUILT_BIN="$prebuilt_dir/cmdgc.test"
+fi
+
 echo "Running ${#jobspecs[@]} ${mode} job(s) with LOCAL_TEST_JOBS=${local_jobs}"
 
 set +e
@@ -198,6 +231,7 @@ printf '%s\0' "${jobspecs[@]}" | xargs -0 -n1 -P "$local_jobs" bash -c '
     OBSERVABLE_TEST_LOG="${OBSERVABLE_TEST_LOG-}" \
     OBSERVABLE_FAILURE_LINES="${OBSERVABLE_FAILURE_LINES-}" \
     GC_TEST_NO_SLICE="${GC_TEST_NO_SLICE-}" \
+    GO_TEST_PREBUILT_BIN="${GO_TEST_PREBUILT_BIN-}" \
     XDG_RUNTIME_DIR="${XDG_RUNTIME_DIR:-}" \
     GOPATH="${TEST_LOCAL_GOPATH}" \
     GOCACHE="${TEST_LOCAL_GOCACHE}" \

@@ -66,6 +66,27 @@ func (r *Registry) Register(name string, f Factory) error {
 	return nil
 }
 
+// Rebind replaces the factory bound to an already-registered exact
+// selection name. It exists for factories that close over the registry they
+// resolve through: [Registry.Clone] copies such a factory by value, so the
+// copy still points at the original registry. City composition rebinds those
+// on the clone (see cmd/gc/runtime_registry.go) so they see the clone's own
+// registrations. Rebinding an unregistered name is an error — that is
+// [Registry.Register]'s job, and silently creating one would hide a typo.
+func (r *Registry) Rebind(name string, f Factory) error {
+	name = strings.TrimSpace(name)
+	if f == nil {
+		return fmt.Errorf("rebinding runtime provider %q: factory is nil", name)
+	}
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	if _, exists := r.exact[name]; !exists {
+		return fmt.Errorf("rebinding runtime provider %q: name is not registered", name)
+	}
+	r.exact[name] = f
+	return nil
+}
+
 // RegisterPrefix binds a selection-name prefix (which must end in ':',
 // e.g. "exec:") to a factory. The factory receives the full selection
 // name. Duplicate prefixes, malformed prefixes, and nil factories are
@@ -98,7 +119,24 @@ func (r *Registry) SetFallback(f Factory) {
 
 // New resolves a selection name and constructs its provider.
 func (r *Registry) New(name string, sc config.SessionConfig, cityName, cityPath string) (runtime.Provider, error) {
-	f := r.lookup(name)
+	return construct(name, r.lookup(name), sc, cityName, cityPath)
+}
+
+// NewStrict resolves like [Registry.New] but never reaches the fallback: a
+// name with no exact or prefix registration returns [ErrUnknownRuntime]
+// instead of the default provider. Callers that compose one provider out of
+// another use this, because for them the fallback is not a sane default but a
+// silent substitution — a hybrid whose configured remote arm quietly became
+// local tmux would run remote-matched sessions in the wrong place with no
+// signal.
+func (r *Registry) NewStrict(name string, sc config.SessionConfig, cityName, cityPath string) (runtime.Provider, error) {
+	return construct(name, r.lookupNoFallback(name), sc, cityName, cityPath)
+}
+
+// construct runs a resolved factory, or reports the name as unknown when
+// resolution found none. Shared by [Registry.New] and [Registry.NewStrict],
+// which differ only in whether the lookup may end at the fallback.
+func construct(name string, f Factory, sc config.SessionConfig, cityName, cityPath string) (runtime.Provider, error) {
 	if f == nil {
 		return nil, fmt.Errorf("%w: %q", ErrUnknownRuntime, name)
 	}
@@ -112,6 +150,23 @@ func (r *Registry) New(name string, sc config.SessionConfig, cityName, cityPath 
 func (r *Registry) lookup(name string) Factory {
 	r.mu.RLock()
 	defer r.mu.RUnlock()
+	if f := r.lookupLocked(name); f != nil {
+		return f
+	}
+	return r.fallback
+}
+
+// lookupNoFallback resolves like lookup but stops short of the fallback,
+// returning nil when no registration matches.
+func (r *Registry) lookupNoFallback(name string) Factory {
+	r.mu.RLock()
+	defer r.mu.RUnlock()
+	return r.lookupLocked(name)
+}
+
+// lookupLocked resolves exact name then longest matching prefix, returning
+// nil when neither matches. Callers hold r.mu.
+func (r *Registry) lookupLocked(name string) Factory {
 	if f, ok := r.exact[name]; ok {
 		return f
 	}
@@ -122,10 +177,7 @@ func (r *Registry) lookup(name string) Factory {
 			bestPrefix, best = prefix, f
 		}
 	}
-	if best != nil {
-		return best
-	}
-	return r.fallback
+	return best
 }
 
 // Clone returns a registry with the receiver's registrations that shares

@@ -2765,7 +2765,12 @@
         },
         "remote_match": {
           "type": "string",
-          "description": "RemoteMatch is a substring pattern for the hybrid provider to route\nsessions to the remote (K8s) backend. Sessions whose names contain\nthis pattern go to K8s; all others stay local (tmux).\nOverridden by the GC_HYBRID_REMOTE_MATCH env var if set."
+          "description": "RemoteMatch is a substring pattern for the hybrid provider to route\nsessions to the remote backend. Sessions whose names contain this\npattern go remote; all others stay local (tmux).\nOverridden by the GC_HYBRID_REMOTE_MATCH env var if set."
+        },
+        "hybrid_remote": {
+          "type": "string",
+          "description": "HybridRemote names the runtime the hybrid provider uses as its remote\nbackend — any registered selection name, including a pack-declared\n[runtimes.\u003cname\u003e] runtime. Empty defaults to \"k8s\", the historical\nhardcoded backend. Unlike the city-wide provider name, an unregistered\nvalue here is a construction error rather than the tmux fallback: a\nremote arm that silently became local tmux would run remote-matched\nsessions on the control-plane host with no signal.",
+          "default": "k8s"
         }
       },
       "additionalProperties": false,

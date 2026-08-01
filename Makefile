@@ -380,6 +380,16 @@ TEST_ENV = env -i \
 	CGO_LDFLAGS="$${CGO_LDFLAGS-}" \
 	$(EXTRA_TEST_ENV)
 
+# TEST_PKG_PARALLEL bounds `go test -p`: how many packages may be built and run
+# concurrently. The memory cost of a package is its test binary's LINK, not its
+# compile — measured on internal/beads, `go build` peaks at 65 MiB while
+# `go test -c` peaks at 1662 MiB. 58 of 149 test binaries link ~1.6 GiB because
+# their dep graph reaches github.com/dolthub/dolt/, and internal/api reaches
+# 2.44 GiB (gcy-z78). Lower this on memory-constrained hosts. Note it bounds
+# concurrency only; it cannot bound a single link, so on a host with less than
+# ~3 GiB free no value of -p makes the sweep fit. Default is unchanged.
+TEST_PKG_PARALLEL ?= 4
+
 ## test: run fast unit tests (skip integration-tagged and GC_FAST_UNIT-gated process tests)
 ## The skipped cmd/gc process-backed scenarios remain covered by
 ## `make test-cmd-gc-process` locally and the CI `cmd/gc process suite` job.
@@ -389,7 +399,7 @@ TEST_ENV = env -i \
 ## cache input hashes over local working files.
 ## Wrapped in $(TEST_ENV) — see comment above for why.
 test: test-fsys-darwin-compile
-	$(TEST_ENV) GC_FAST_UNIT=1 scripts/go-test-observable test -- -p=4 -count=1 -timeout 15m ./...
+	$(TEST_ENV) GC_FAST_UNIT=1 scripts/go-test-observable test -- -p=$(TEST_PKG_PARALLEL) -count=1 -timeout 15m ./...
 
 # MAC_UNIT_PKGS excludes cmd/gc from the Mac unit sweep; cmd/gc runs
 # sharded via the mac-cmd-gc-process CI matrix job instead.
@@ -397,7 +407,7 @@ MAC_UNIT_PKGS = $(shell go list ./... | grep -v '/cmd/gc$$')
 
 ## test-mac: Mac unit sweep with cmd/gc excluded; cmd/gc covered by the Mac sharded job.
 test-mac: test-fsys-darwin-compile
-	$(TEST_ENV) GC_FAST_UNIT=1 scripts/go-test-observable test-mac -- -p=4 -count=1 -timeout 15m $(MAC_UNIT_PKGS)
+	$(TEST_ENV) GC_FAST_UNIT=1 scripts/go-test-observable test-mac -- -p=$(TEST_PKG_PARALLEL) -count=1 -timeout 15m $(MAC_UNIT_PKGS)
 
 LOCAL_TEST_JOBS ?= $(shell nproc 2>/dev/null || getconf _NPROCESSORS_ONLN 2>/dev/null || sysctl -n hw.ncpu 2>/dev/null || echo 8)
 

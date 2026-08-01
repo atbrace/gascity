@@ -460,7 +460,13 @@ concurrent builds.
 Before considering any task complete:
 
 - Fast unit baseline passes (`make test`, or `make test-fast-parallel` on
-  machines where sharding is useful)
+  machines where sharding is useful — for broad local sweeps prefer the
+  sharded targets, per `TESTING.md` and the guidance above). On
+  memory-constrained hosts bound package concurrency with
+  `TEST_PKG_PARALLEL=<n> make test`: a package's memory cost is its test
+  binary's link rather than its compile, and 58 of 149 test binaries link
+  ~1.6 GiB with `internal/api` reaching 2.44 GiB (gcy-z78). `-p` bounds
+  concurrency only — it cannot bound a single link.
 - Broader process/integration coverage uses the sharded targets documented in
   `TESTING.md` instead of one monolithic `go test ./...` sweep
 - `go vet ./...` clean

@@ -24,7 +24,7 @@ import (
 	"github.com/gastownhall/gascity/internal/runtime"
 	sessionauto "github.com/gastownhall/gascity/internal/runtime/auto"
 	sessionhybrid "github.com/gastownhall/gascity/internal/runtime/hybrid"
-	sessionk8s "github.com/gastownhall/gascity/internal/runtime/k8s"
+	"github.com/gastownhall/gascity/internal/runtime/registry"
 	sessiontmux "github.com/gastownhall/gascity/internal/runtime/tmux"
 	"github.com/gastownhall/gascity/internal/session"
 	"github.com/gastownhall/gascity/internal/supervisor"
@@ -1111,17 +1111,42 @@ func openCityEventsProviderWithConfig(providerConfig func() config.EventsConfig,
 	return p, 0
 }
 
+// defaultHybridRemote is the runtime backing hybrid's remote arm when
+// [session] hybrid_remote is unset — the arm hybrid hardcoded before the
+// selection became configurable.
+const defaultHybridRemote = "k8s"
+
+// hybridRemoteName reports the selection name for hybrid's remote arm:
+// [session] hybrid_remote, or defaultHybridRemote when unset.
+func hybridRemoteName(sc config.SessionConfig) string {
+	if name := strings.TrimSpace(sc.HybridRemote); name != "" {
+		return name
+	}
+	return defaultHybridRemote
+}
+
 // newHybridProvider constructs a composite provider that routes sessions to
-// tmux (local) or k8s (remote) based on session name. The GC_HYBRID_REMOTE_MATCH
-// env var controls which sessions go to k8s. If unset, all sessions route to
-// local tmux.
-func newHybridProvider(sc config.SessionConfig, cityName, cityPath string) (runtime.Provider, error) {
-	// Cut-over: hybrid routes to the seam-backed tmux/k8s providers, so
-	// hybrid-routed sessions flow through the seams like every other path.
+// tmux (local) or a selected runtime (remote) based on session name. The
+// GC_HYBRID_REMOTE_MATCH env var controls which sessions go remote. If unset,
+// all sessions route to local tmux.
+//
+// The remote arm is [session] hybrid_remote, resolved through reg — the
+// registry hybrid itself was resolved from — so a pack-declared runtime
+// qualifies alongside the builtins. Resolution is strict: an unregistered
+// name is a construction error, because the registry's fallback is tmux and a
+// "remote" arm that silently became local would run remote-matched sessions
+// on the control-plane host with nothing to distinguish it from success.
+func newHybridProvider(reg *registry.Registry, sc config.SessionConfig, cityName, cityPath string) (runtime.Provider, error) {
+	// Cut-over: hybrid routes to seam-backed providers, so hybrid-routed
+	// sessions flow through the seams like every other path.
 	local := sessiontmux.NewSeamBackedWithConfig(tmuxConfigFromSession(sc, cityName, cityPath))
-	remote, err := sessionk8s.NewSeamBacked()
+	remoteName := hybridRemoteName(sc)
+	if remoteName == hybridRuntimeName {
+		return nil, fmt.Errorf("hybrid: hybrid_remote = %q would nest hybrid inside itself", remoteName)
+	}
+	remote, err := reg.NewStrict(remoteName, sc, cityName, cityPath)
 	if err != nil {
-		return nil, fmt.Errorf("hybrid: k8s backend: %w", err)
+		return nil, fmt.Errorf("hybrid: remote arm: %w", err)
 	}
 	pattern := sc.RemoteMatch
 	if v := os.Getenv("GC_HYBRID_REMOTE_MATCH"); v != "" {

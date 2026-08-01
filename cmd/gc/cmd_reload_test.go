@@ -1001,3 +1001,93 @@ func TestReloadConfigTracedRebuildsProviderWhenPackRuntimeCommandChanges(t *test
 		t.Fatalf("old executable still invoked after reload: ops=%q", data)
 	}
 }
+
+// TestReloadConfigTracedRebuildsProviderWhenHybridRemoteChanges pins the
+// reload half of RUNTIME-SEL-014: hybrid binds its remote arm at
+// construction, so repointing [session] hybrid_remote at a different runtime
+// must rebuild the provider. Without the rebuild the selection name stays
+// "hybrid", the reload looks applied, and remote-matched sessions keep
+// landing on the previous backend.
+func TestReloadConfigTracedRebuildsProviderWhenHybridRemoteChanges(t *testing.T) {
+	clearInheritedBeadsEnv(t)
+	t.Setenv("GC_BEADS", "")
+	t.Setenv("GC_SESSION", "")
+
+	dir := shortSocketTempDir(t, "gc-reload-hybrid-remote-")
+	disableManagedDoltRecoveryForTest(t)
+	cleanupManagedDoltTestCity(t, dir)
+
+	packDir := filepath.Join(dir, "packs", "rtpack")
+	scriptsDir := filepath.Join(packDir, "scripts")
+	if err := os.MkdirAll(scriptsDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	opsA := filepath.Join(t.TempDir(), "a.log")
+	opsB := filepath.Join(t.TempDir(), "b.log")
+	writeProbeScript := func(name, marker string) {
+		t.Helper()
+		script := fmt.Sprintf("#!/bin/sh\necho \"$1\" >> %q\ncase \"$1\" in is-running) echo false ;; *) exit 2 ;; esac\n", marker)
+		if err := os.WriteFile(filepath.Join(scriptsDir, name), []byte(script), 0o755); err != nil {
+			t.Fatal(err)
+		}
+	}
+	writeProbeScript("a.sh", opsA)
+	writeProbeScript("b.sh", opsB)
+
+	packToml := "[pack]\nname = \"rtpack\"\nschema = 1\n\n[runtimes.armA]\ncommand = \"scripts/a.sh\"\n\n[runtimes.armB]\ncommand = \"scripts/b.sh\"\n"
+	if err := os.WriteFile(filepath.Join(packDir, "pack.toml"), []byte(packToml), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	tomlPath := filepath.Join(dir, "city.toml")
+	writeHybridCityTOML := func(remote string) {
+		t.Helper()
+		cityToml := fmt.Sprintf("[workspace]\nname = \"test\"\n\n[imports.rtpack]\nsource = \"packs/rtpack\"\n\n[session]\nprovider = \"hybrid\"\nremote_match = \"probe\"\nhybrid_remote = %q\n", remote)
+		if err := os.WriteFile(tomlPath, []byte(cityToml), 0o644); err != nil {
+			t.Fatal(err)
+		}
+	}
+	writeHybridCityTOML("armA")
+
+	result, err := tryReloadConfig(tomlPath, "test", dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	cfg := result.Cfg
+	applyFeatureFlags(cfg)
+	var stdout, stderr bytes.Buffer
+	cr := &CityRuntime{
+		cityPath:   dir,
+		cityName:   "test",
+		configName: "test",
+		tomlPath:   tomlPath,
+		configRev:  result.Revision,
+		cfg:        cfg,
+		sp:         runtime.NewFake(),
+		dops:       newDrainOps(runtime.NewFake()),
+		rec:        events.Discard,
+		stdout:     &stdout,
+		stderr:     &stderr,
+		logPrefix:  "gc test",
+	}
+	lastProviderName := cfg.Session.Provider
+
+	// Same provider name ("hybrid"), different remote arm.
+	writeHybridCityTOML("armB")
+
+	reply := cr.reloadConfigTraced(context.Background(), &lastProviderName, dir, nil, reloadSourceManual)
+	if reply.Outcome != reloadOutcomeApplied {
+		t.Fatalf("reply.Outcome = %q, want %q; message=%q error=%q stderr=%q",
+			reply.Outcome, reloadOutcomeApplied, reply.Message, reply.Error, stderr.String())
+	}
+
+	// "probe" matches remote_match, so this op must reach the new remote arm.
+	cr.sp.IsRunning("probe")
+	if _, err := os.Stat(opsB); err != nil {
+		t.Fatalf("hybrid still bound to the old remote arm after reload: %v\nstdout:\n%s", err, stdout.String())
+	}
+	if _, err := os.Stat(opsA); err == nil {
+		data, _ := os.ReadFile(opsA)
+		t.Fatalf("old remote arm still invoked after reload: ops=%q", data)
+	}
+}

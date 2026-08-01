@@ -237,3 +237,114 @@ func TestCloneIsIndependentOfOriginal(t *testing.T) {
 		t.Error("clone must reject names already registered in the original")
 	}
 }
+
+func TestNewStrictNeverUsesFallback(t *testing.T) {
+	r := New()
+	fb, fallbackCalls := fakeFactory(t)
+	r.SetFallback(fb)
+
+	_, err := r.NewStrict("definitely-unregistered", config.SessionConfig{}, "city", t.TempDir())
+	if err == nil {
+		t.Fatal("NewStrict for an unregistered name succeeded, want error")
+	}
+	if !errors.Is(err, ErrUnknownRuntime) {
+		t.Fatalf("err = %v, want ErrUnknownRuntime", err)
+	}
+	if !strings.Contains(err.Error(), "definitely-unregistered") {
+		t.Fatalf("error %q does not name the unknown runtime", err)
+	}
+	if *fallbackCalls != 0 {
+		t.Fatalf("fallback calls = %d, want 0: NewStrict must not reach the fallback", *fallbackCalls)
+	}
+}
+
+func TestNewStrictResolvesExactAndPrefix(t *testing.T) {
+	r := New()
+	fb, fallbackCalls := fakeFactory(t)
+	r.SetFallback(fb)
+	exact, exactCalls := fakeFactory(t)
+	if err := r.Register("nomad", exact); err != nil {
+		t.Fatalf("Register: %v", err)
+	}
+	var gotPrefixName string
+	if err := r.RegisterPrefix("ssh:", func(name string, _ config.SessionConfig, _, _ string) (runtime.Provider, error) {
+		gotPrefixName = name
+		return runtime.NewFake(), nil
+	}); err != nil {
+		t.Fatalf("RegisterPrefix: %v", err)
+	}
+
+	if _, err := r.NewStrict("nomad", config.SessionConfig{}, "city", t.TempDir()); err != nil {
+		t.Fatalf("NewStrict(nomad): %v", err)
+	}
+	if *exactCalls != 1 {
+		t.Fatalf("exact factory calls = %d, want 1", *exactCalls)
+	}
+	if _, err := r.NewStrict("ssh:builder@host", config.SessionConfig{}, "city", t.TempDir()); err != nil {
+		t.Fatalf("NewStrict(ssh:builder@host): %v", err)
+	}
+	if gotPrefixName != "ssh:builder@host" {
+		t.Fatalf("prefix factory got name %q, want the full selection name", gotPrefixName)
+	}
+	if *fallbackCalls != 0 {
+		t.Fatalf("fallback calls = %d, want 0", *fallbackCalls)
+	}
+}
+
+func TestRebindReplacesRegisteredFactory(t *testing.T) {
+	r := New()
+	first, firstCalls := fakeFactory(t)
+	if err := r.Register("hybrid", first); err != nil {
+		t.Fatalf("Register: %v", err)
+	}
+	second, secondCalls := fakeFactory(t)
+	if err := r.Rebind("hybrid", second); err != nil {
+		t.Fatalf("Rebind: %v", err)
+	}
+	if _, err := r.New("hybrid", config.SessionConfig{}, "city", t.TempDir()); err != nil {
+		t.Fatalf("New: %v", err)
+	}
+	if *firstCalls != 0 {
+		t.Fatalf("replaced factory calls = %d, want 0", *firstCalls)
+	}
+	if *secondCalls != 1 {
+		t.Fatalf("rebound factory calls = %d, want 1", *secondCalls)
+	}
+}
+
+func TestRebindRejectsUnregisteredNameAndNilFactory(t *testing.T) {
+	r := New()
+	f, _ := fakeFactory(t)
+	err := r.Rebind("never-registered", f)
+	if err == nil {
+		t.Fatal("Rebind of an unregistered name succeeded, want error")
+	}
+	if !strings.Contains(err.Error(), "never-registered") {
+		t.Fatalf("error %q does not name the runtime", err)
+	}
+	if err := r.Register("hybrid", f); err != nil {
+		t.Fatalf("Register: %v", err)
+	}
+	if err := r.Rebind("hybrid", nil); err == nil {
+		t.Fatal("Rebind with nil factory succeeded, want error")
+	}
+}
+
+func TestRebindOnCloneLeavesOriginalUntouched(t *testing.T) {
+	orig := New()
+	first, firstCalls := fakeFactory(t)
+	if err := orig.Register("hybrid", first); err != nil {
+		t.Fatalf("Register: %v", err)
+	}
+	clone := orig.Clone()
+	second, secondCalls := fakeFactory(t)
+	if err := clone.Rebind("hybrid", second); err != nil {
+		t.Fatalf("Rebind: %v", err)
+	}
+	if _, err := orig.New("hybrid", config.SessionConfig{}, "city", t.TempDir()); err != nil {
+		t.Fatalf("orig.New: %v", err)
+	}
+	if *firstCalls != 1 || *secondCalls != 0 {
+		t.Fatalf("orig factory calls = %d/%d (orig/clone), want 1/0: rebinding a clone must not mutate the original", *firstCalls, *secondCalls)
+	}
+}

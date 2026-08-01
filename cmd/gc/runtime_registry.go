@@ -88,9 +88,7 @@ func buildRuntimeRegistry() *registry.Registry {
 		}
 		return sessionherdr.New(session, providerStateDir("herdr", cityPath), cityPath), nil
 	}))
-	must(r.Register("hybrid", func(_ string, sc config.SessionConfig, cityName, cityPath string) (runtime.Provider, error) {
-		return newHybridProvider(sc, cityName, cityPath)
-	}))
+	must(r.Register(hybridRuntimeName, hybridFactory(r)))
 	must(r.RegisterPrefix("exec:", func(name string, _ config.SessionConfig, _, _ string) (runtime.Provider, error) {
 		script := strings.TrimPrefix(name, "exec:")
 		if isLegacyT3BridgeExecScript(script) {
@@ -118,6 +116,20 @@ func buildRuntimeRegistry() *registry.Registry {
 	must(r.Register("tmux", tmuxFactory))
 	r.SetFallback(tmuxFactory)
 	return r
+}
+
+// hybridRuntimeName is the selection name of the composite provider whose
+// remote arm is itself a selection name (RUNTIME-SEL-014).
+const hybridRuntimeName = "hybrid"
+
+// hybridFactory returns the hybrid factory bound to reg, so hybrid's remote
+// arm resolves against the same registry hybrid was resolved from: builtins
+// for the process-global registry, builtins plus pack-declared runtimes for a
+// per-city clone.
+func hybridFactory(reg *registry.Registry) registry.Factory {
+	return func(_ string, sc config.SessionConfig, cityName, cityPath string) (runtime.Provider, error) {
+		return newHybridProvider(reg, sc, cityName, cityPath)
+	}
 }
 
 // validatePackRuntimeRegistrations fails city config loading when a
@@ -156,6 +168,13 @@ func runtimeRegistryForCity(cfg *config.City) (*registry.Registry, error) {
 			return nil, fmt.Errorf("pack %q: %w", rt.PackName, err)
 		}
 	}
+	// Clone copies the builtin hybrid factory by value, so it still resolves
+	// its remote arm against the builtin registry — where no pack runtime is
+	// registered. Rebind it to this clone so [session] hybrid_remote can name
+	// a pack-declared runtime (RUNTIME-SEL-014).
+	if err := r.Rebind(hybridRuntimeName, hybridFactory(r)); err != nil {
+		return nil, err
+	}
 	return r, nil
 }
 
@@ -176,4 +195,23 @@ func packRuntimeDeclarationChanged(oldCfg, newCfg *config.City, name string) boo
 		return true
 	}
 	return oldOK && (oldRT.Command != newRT.Command || oldRT.Protocol != newRT.Protocol)
+}
+
+// hybridRemoteChanged reports whether a hybrid city's remote arm differs
+// between two configs, either because [session] hybrid_remote now names a
+// different runtime or because the pack declaration behind an unchanged name
+// changed. hybrid binds its remote provider at construction, so both cases
+// need a session-provider rebuild: without one, editing hybrid_remote would
+// leave remote-matched sessions running on the previous backend until a
+// controller restart, with nothing to show the new config was ignored.
+func hybridRemoteChanged(oldCfg, newCfg *config.City, providerName string) bool {
+	if providerName != hybridRuntimeName || oldCfg == nil || newCfg == nil {
+		return false
+	}
+	oldRemote := hybridRemoteName(oldCfg.Session)
+	newRemote := hybridRemoteName(newCfg.Session)
+	if oldRemote != newRemote {
+		return true
+	}
+	return packRuntimeDeclarationChanged(oldCfg, newCfg, newRemote)
 }

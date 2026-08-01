@@ -1559,10 +1559,18 @@ type SessionConfig struct {
 	// automatically. Set explicitly to override.
 	Socket string `toml:"socket,omitempty"`
 	// RemoteMatch is a substring pattern for the hybrid provider to route
-	// sessions to the remote (K8s) backend. Sessions whose names contain
-	// this pattern go to K8s; all others stay local (tmux).
+	// sessions to the remote backend. Sessions whose names contain this
+	// pattern go remote; all others stay local (tmux).
 	// Overridden by the GC_HYBRID_REMOTE_MATCH env var if set.
 	RemoteMatch string `toml:"remote_match,omitempty"`
+	// HybridRemote names the runtime the hybrid provider uses as its remote
+	// backend — any registered selection name, including a pack-declared
+	// [runtimes.<name>] runtime. Empty defaults to "k8s", the historical
+	// hardcoded backend. Unlike the city-wide provider name, an unregistered
+	// value here is a construction error rather than the tmux fallback: a
+	// remote arm that silently became local tmux would run remote-matched
+	// sessions on the control-plane host with no signal.
+	HybridRemote string `toml:"hybrid_remote,omitempty" jsonschema:"default=k8s"`
 }
 
 // durationOr parses raw as a Go duration, returning def when raw is empty or

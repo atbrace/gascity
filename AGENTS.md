@@ -395,6 +395,19 @@ becoming more useful as models improve — it becomes LESS useful instead.
 
 ## Build Cache Conventions
 
+Much of this section describes **fleet Linux executors**, which are provisioned
+with a `go` shim and a tmpfs `/tmp`. A developer machine generally has neither,
+and nothing in this repo installs them. Verify before relying on any of it:
+
+```bash
+which -a go              # a shim appears ahead of the real toolchain
+go env GOCACHE GOTMPDIR  # shim: ~/.cache/go-build and /var/tmp/gotmp
+```
+
+If `go` is a single plain symlink and `GOTMPDIR` is empty, you are on an
+unshimmed host: the defaults described below are not in force, `/tmp` is
+probably ordinary disk rather than tmpfs, and cache hygiene is yours to manage.
+
 **Hard ban: never run `go clean -cache`** in any script, hook, or agent session.
 
 Running `go clean -cache` against a shared `GOCACHE` (the default when
@@ -404,15 +417,24 @@ full rebuild, and any that calls `go clean -cache` mid-flight invalidates all
 the others' in-progress caches. The incident (vp-g96b, 2026-06-13) produced
 ~10 cascading cache-miss errors across the executor pool.
 
-**Just run `go build` / `make` — do NOT set `GOCACHE` yourself.** The host `go`
-shim already routes the default `GOCACHE` to a shared **on-disk** cache
-(`~/.cache/go-build`) and pins compile/link temp to disk
-(`GOTMPDIR=/var/tmp/gotmp`). A warm shared cache is faster and is never
-corrupted by a normal build.
+**Just run `go build` / `make` — do NOT set `GOCACHE` yourself for an ordinary
+build.** Where the shim is present it routes the default `GOCACHE` to a shared
+**on-disk** cache (`~/.cache/go-build`) and pins compile/link temp to disk
+(`GOTMPDIR=/var/tmp/gotmp`). A warm shared cache is faster than a cold private
+one, and a build using the project's normal flags will not corrupt it.
 
-**Never point `GOCACHE` (or `TMPDIR`) at `/tmp`.** `/tmp` is a size-capped
-RAM-backed tmpfs (61G) shared by the whole fleet — including the harness's
-tool-output capture dir. A bare `mktemp -d` (no `-p` dir) resolves against the
+**A diagnostic build is not a normal build — give it a throwaway `GOCACHE`.**
+Any build that varies `CGO_CPPFLAGS`, `CGO_CXXFLAGS`, `-tags`, or the toolchain
+can leave objects that a later correct build silently reuses, and diagnosing a
+broken build is precisely when those get varied. Two agents nine hours apart
+poisoned the shared cache this way with `CGO_CXXFLAGS`-only go-icu-regex
+archives (gcy-lcs); each needed `nm` verification and surgical deletion, because
+nothing detects a poisoned entry — the resulting failure names the flags, never
+the cache. Use the isolated-build recipe below for anything exploratory.
+
+**Never point `GOCACHE` (or `TMPDIR`) at `/tmp`.** On a fleet executor `/tmp` is
+a size-capped RAM-backed tmpfs (61G) shared by the whole fleet — including the
+harness's tool-output capture dir. A bare `mktemp -d` (no `-p` dir) resolves against the
 unset `$TMPDIR`, which defaults to `/tmp` — one cold cache built there is
 2-3GB, and a concurrent build wave fills tmpfs and ENOSPCs every agent
 on the host (incident gm-tkz1r / ga-x9k9b9, 2026-07). The shim deliberately

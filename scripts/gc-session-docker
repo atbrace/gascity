@@ -5,7 +5,7 @@
 #   GC_SESSION=exec:scripts/gc-session-docker gc start
 #
 # Implements the Gas City exec session provider protocol (see
-# internal/session/exec/exec.go). Each agent runs in its own Docker
+# docs/reference/exec-session-provider.md). Each agent runs in its own Docker
 # container with tmux providing session management inside the container.
 #
 # Architecture:
@@ -41,8 +41,10 @@ TMUX_SOCK_DIR="/run/gc-tmux"
 
 # Controller-only env vars stripped from containers. These reference
 # controller-side resources (Unix sockets, localhost ports) that aren't
-# reachable from inside a container. Matches the K8s provider's skip list
-# in internal/session/k8s/pod.go buildPodEnv().
+# reachable from inside a container. This list is maintained here and is not
+# derived from any other provider — contrib/session-scripts/gc-session-k8s
+# carries no equivalent list, so add a var here when it names a
+# controller-local coordinate, without expecting a canonical copy elsewhere.
 # Strip controller-only connection coordinates; auth credentials
 # (GC_DOLT_USER, GC_DOLT_PASSWORD, BEADS_DOLT_SERVER_USER, BEADS_DOLT_PASSWORD)
 # pass through — agents need them to authenticate against Dolt.

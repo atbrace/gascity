@@ -196,12 +196,39 @@ func resetPendingCommittedAtInfo(info sessionpkg.Info) (string, time.Time, bool)
 	return raw, committedAt, true
 }
 
+// resetStallThreshold returns how long a committed reset may stay pending
+// before the reconciler reports it as stalled.
+//
+// The elapsed clock starts when RestartRequestPatch stamps reset_committed_at
+// during one reconciler tick, but the restart is deliberately deferred to the
+// following tick — the restart fold below excludes ResetCommittedAtKey because
+// "the durable reset marker is for the next tick". One full patrol interval is
+// therefore built into the window by design, and charging it against
+// startup_timeout alone leaves the budget unsatisfiable once patrol_interval
+// approaches startup_timeout: the timeout expires before the startup work
+// begins, so every healthy restart reports as stalled. That is gcy-fjd — at
+// patrol_interval == startup_timeout == 60s every restart completed (68-99s,
+// median 70s) and all 131 were reported stalled at 60-66s, with no overlap
+// between the two ranges. The threshold therefore covers both latencies it
+// spans: one patrol interval of scheduling delay plus the startup budget.
+//
+// A non-positive startupTimeout keeps stall detection disabled.
+func resetStallThreshold(startupTimeout, patrolInterval time.Duration) time.Duration {
+	if startupTimeout <= 0 {
+		return 0
+	}
+	if patrolInterval <= 0 {
+		return startupTimeout
+	}
+	return startupTimeout + patrolInterval
+}
+
 func recordResetStallIfDue(
 	info sessionpkg.Info,
 	template string,
 	name string,
 	alive bool,
-	startupTimeout time.Duration,
+	stallThreshold time.Duration,
 	now time.Time,
 	dt *drainTracker,
 	rec events.Recorder,
@@ -215,11 +242,11 @@ func recordResetStallIfDue(
 		}
 		return
 	}
-	if alive || startupTimeout <= 0 {
+	if alive || stallThreshold <= 0 {
 		return
 	}
 	elapsed := now.Sub(committedAt)
-	if elapsed <= startupTimeout {
+	if elapsed <= stallThreshold {
 		return
 	}
 	if dt != nil && !dt.markResetStall(info.ID) {
@@ -256,7 +283,7 @@ func recordResetStallIfDue(
 				"bead_id":            info.ID,
 				"elapsed_s":          elapsedSeconds,
 				"reset_committed_at": resetCommittedAt,
-				"startup_timeout_s":  int(startupTimeout / time.Second),
+				"stall_threshold_s":  int(stallThreshold / time.Second),
 			},
 		)
 	}
@@ -1262,6 +1289,11 @@ func reconcileSessionBeadsTracedWithNamedDemand(
 	if startupTimeout <= 0 && cfg != nil {
 		startupTimeout = cfg.Session.StartupTimeoutDuration()
 	}
+	var patrolInterval time.Duration
+	if cfg != nil {
+		patrolInterval = cfg.Daemon.PatrolIntervalDuration()
+	}
+	stallThreshold := resetStallThreshold(startupTimeout, patrolInterval)
 	maxAgeTr := reconcileOpts.maxSessionAgeTr
 	asyncStopTracker := reconcileOpts.asyncStopTracker
 	recordPhase := func(site TraceSiteCode, name string, start time.Time, fields map[string]any) {
@@ -2055,7 +2087,7 @@ func reconcileSessionBeadsTracedWithNamedDemand(
 			shadowTick.captureRuntime(id, "observeRuntimeProviderLiveness", name, triFromBool(running), triFromBool(alive))
 		}
 		peek := cachedSessionPeek(cityPath, store, sp, cfg, id, tp.Hints.ProcessNames)
-		recordResetStallIfDue(infoByID[id], tp.TemplateName, name, alive, startupTimeout, clk.Now().UTC(), dt, rec, stderr, trace)
+		recordResetStallIfDue(infoByID[id], tp.TemplateName, name, alive, stallThreshold, clk.Now().UTC(), dt, rec, stderr, trace)
 
 		// Zombie capture: session exists but process dead — grab scrollback for forensics.
 		// markProviderTerminalError persists + folds its write onto the snapshot in one

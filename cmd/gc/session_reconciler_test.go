@@ -9672,6 +9672,178 @@ func TestReconcileSessionBeads_BeadMetadataRestartRequestedWhenSessionDead(t *te
 	}
 }
 
+// TestResetStallThreshold covers the derivation that keeps the reset-stall
+// budget larger than the scheduling latency it measures. A committed reset
+// waits up to one patrol interval before the reconciler can even attempt the
+// restart, so a threshold of startup_timeout alone is spent before the startup
+// work begins.
+func TestResetStallThreshold(t *testing.T) {
+	tests := []struct {
+		name           string
+		startupTimeout time.Duration
+		patrolInterval time.Duration
+		want           time.Duration
+	}{
+		{
+			name:           "patrol equal to startup timeout",
+			startupTimeout: 60 * time.Second,
+			patrolInterval: 60 * time.Second,
+			want:           120 * time.Second,
+		},
+		{
+			name:           "default patrol interval",
+			startupTimeout: 60 * time.Second,
+			patrolInterval: 30 * time.Second,
+			want:           90 * time.Second,
+		},
+		{
+			name:           "disabled startup timeout stays disabled",
+			startupTimeout: 0,
+			patrolInterval: 60 * time.Second,
+			want:           0,
+		},
+		{
+			name:           "unknown patrol interval falls back to startup timeout",
+			startupTimeout: 60 * time.Second,
+			patrolInterval: 0,
+			want:           60 * time.Second,
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if got := resetStallThreshold(tt.startupTimeout, tt.patrolInterval); got != tt.want {
+				t.Fatalf("resetStallThreshold(%v, %v) = %v, want %v", tt.startupTimeout, tt.patrolInterval, got, tt.want)
+			}
+		})
+	}
+}
+
+// TestRecordResetStallIfDue_HealthyRestartWithinPatrolLatency pins the
+// regression from gcy-fjd: with patrol_interval == startup_timeout == 60s
+// every healthy restart took ~70s (one patrol tick of scheduling latency plus
+// the start itself) and was reported as stalled at 60s. A restart still in
+// flight inside the derived threshold must stay silent; one genuinely past it
+// must still report.
+func TestRecordResetStallIfDue_HealthyRestartWithinPatrolLatency(t *testing.T) {
+	const patrolInterval = 60 * time.Second
+	const startupTimeout = 60 * time.Second
+	threshold := resetStallThreshold(startupTimeout, patrolInterval)
+
+	newEnv := func(t *testing.T, elapsed time.Duration) (*reconcilerTestEnv, sessionpkg.Info, *events.Fake) {
+		t.Helper()
+		env := newReconcilerTestEnv()
+		rec := events.NewFake()
+		env.rec = rec
+		env.addDesired("worker", "worker", false)
+		session := env.createSessionBead("worker", "worker")
+		env.setSessionMetadata(&session, map[string]string{
+			"continuation_reset_pending":   "true",
+			sessionpkg.ResetCommittedAtKey: env.clk.Now().Add(-elapsed).UTC().Format(time.RFC3339),
+		})
+		return env, sessiontest.SeedBead(t, session), rec
+	}
+
+	t.Run("healthy restart in flight stays silent", func(t *testing.T) {
+		// 70s is the measured median for a restart committed on one patrol
+		// tick and started on the next.
+		env, info, rec := newEnv(t, 70*time.Second)
+		recordResetStallIfDue(info, "worker", "worker", false, threshold, env.clk.Now().UTC(), env.dt, rec, &env.stderr, nil)
+		if got := strings.TrimSpace(env.stderr.String()); got != "" {
+			t.Fatalf("stderr = %q, want silence for a restart still inside the threshold", got)
+		}
+		if len(rec.Events) != 0 {
+			t.Fatalf("recorded events = %d, want 0: %#v", len(rec.Events), rec.Events)
+		}
+	})
+
+	t.Run("startup timeout alone reports the same healthy restart", func(t *testing.T) {
+		// The pre-fix threshold. Kept as an executable statement of the
+		// regression: the identical 70s restart that must stay silent above
+		// fires here, which is what produced 131 false alarms in one window.
+		env, info, rec := newEnv(t, 70*time.Second)
+		recordResetStallIfDue(info, "worker", "worker", false, startupTimeout, env.clk.Now().UTC(), env.dt, rec, &env.stderr, nil)
+		if len(rec.Events) != 1 {
+			t.Fatalf("recorded events = %d, want 1 — the pre-fix threshold must fire here, or this test no longer pins the regression", len(rec.Events))
+		}
+	})
+
+	t.Run("genuinely stuck reset still reports", func(t *testing.T) {
+		env, info, rec := newEnv(t, threshold+30*time.Second)
+		recordResetStallIfDue(info, "worker", "worker", false, threshold, env.clk.Now().UTC(), env.dt, rec, &env.stderr, nil)
+		if got := strings.TrimSpace(env.stderr.String()); got == "" {
+			t.Fatal("stderr = empty, want a stall diagnostic past the threshold")
+		}
+		if len(rec.Events) != 1 {
+			t.Fatalf("recorded events = %d, want 1: %#v", len(rec.Events), rec.Events)
+		}
+		if rec.Events[0].Type != events.SessionResetStalled {
+			t.Fatalf("event type = %q, want %q", rec.Events[0].Type, events.SessionResetStalled)
+		}
+	})
+}
+
+// TestReconcileSessionBeads_HealthyRestartIsNotReportedStalled drives the full
+// reconciler with the city config that produced gcy-fjd (patrol_interval ==
+// startup_timeout == 60s) and a restart that has been pending for the measured
+// median of 70s. It pins the wiring, not just the derivation: the reconciler
+// must read patrol_interval off the config when it builds the threshold, or a
+// healthy in-flight restart is reported as stalled on every patrol cycle.
+func TestReconcileSessionBeads_HealthyRestartIsNotReportedStalled(t *testing.T) {
+	env := newReconcilerTestEnv()
+	rec := events.NewFake()
+	env.rec = rec
+	env.cfg = &config.City{
+		Workspace: config.Workspace{Name: "test-city"},
+		Agents:    []config.Agent{{Name: "worker", StartCommand: "true", MaxActiveSessions: intPtr(2)}},
+		Session:   config.SessionConfig{StartupTimeout: "60s"},
+		Daemon:    config.DaemonConfig{PatrolInterval: "60s"},
+	}
+	env.addDesired("worker", "worker", false)
+	session := env.createSessionBead("worker", "worker")
+	env.setSessionMetadata(&session, map[string]string{
+		"continuation_reset_pending":   "true",
+		sessionpkg.ResetCommittedAtKey: env.clk.Now().Add(-70 * time.Second).UTC().Format(time.RFC3339),
+		"wait_hold":                    "true",
+	})
+
+	reconcileSessionBeadsTraced(
+		context.Background(),
+		"",
+		[]beads.Bead{session},
+		env.desiredState,
+		configuredSessionNames(env.cfg, "", env.store),
+		env.cfg,
+		env.sp,
+		env.store,
+		nil,
+		nil,
+		nil,
+		nil,
+		env.dt,
+		map[string]int{"worker": 0},
+		false,
+		nil,
+		"test-city",
+		nil,
+		env.clk,
+		rec,
+		env.cfg.Session.StartupTimeoutDuration(),
+		0,
+		&env.stdout,
+		&env.stderr,
+		nil,
+	)
+
+	if got := strings.TrimSpace(env.stderr.String()); got != "" {
+		t.Fatalf("stderr = %q, want silence for a restart still inside the threshold", got)
+	}
+	for _, ev := range rec.Events {
+		if ev.Type == events.SessionResetStalled {
+			t.Fatalf("recorded %q for a healthy in-flight restart: %+v", events.SessionResetStalled, ev)
+		}
+	}
+}
+
 func TestReconcileSessionBeads_RecordsResetStallDiagnostic(t *testing.T) {
 	env := newReconcilerTestEnv()
 	rec := events.NewFake()
@@ -9680,10 +9852,14 @@ func TestReconcileSessionBeads_RecordsResetStallDiagnostic(t *testing.T) {
 		Workspace: config.Workspace{Name: "test-city"},
 		Agents:    []config.Agent{{Name: "worker", StartCommand: "true", MaxActiveSessions: intPtr(2)}},
 		Session:   config.SessionConfig{StartupTimeout: "60s"},
+		Daemon:    config.DaemonConfig{PatrolInterval: "60s"},
 	}
+	// The stall threshold spans one patrol interval of scheduling latency plus
+	// the startup budget (60s + 60s), so the elapsed wait must clear 120s.
+	stallThreshold := resetStallThreshold(env.cfg.Session.StartupTimeoutDuration(), env.cfg.Daemon.PatrolIntervalDuration())
 	env.addDesired("worker", "worker", false)
 	session := env.createSessionBead("worker", "worker")
-	committedAt := env.clk.Now().Add(-75 * time.Second).UTC().Format(time.RFC3339)
+	committedAt := env.clk.Now().Add(-135 * time.Second).UTC().Format(time.RFC3339)
 	env.setSessionMetadata(&session, map[string]string{
 		"continuation_reset_pending":   "true",
 		sessionpkg.ResetCommittedAtKey: committedAt,
@@ -9724,7 +9900,7 @@ func TestReconcileSessionBeads_RecordsResetStallDiagnostic(t *testing.T) {
 	)
 
 	wantMessage := fmt.Sprintf(
-		"session reconciler: reset stalled for worker: elapsed_s=75 reset_committed_at=%s bead_id=%s",
+		"session reconciler: reset stalled for worker: elapsed_s=135 reset_committed_at=%s bead_id=%s",
 		committedAt,
 		session.ID,
 	)
@@ -9745,8 +9921,8 @@ func TestReconcileSessionBeads_RecordsResetStallDiagnostic(t *testing.T) {
 	if err := json.Unmarshal(gotEvent.Payload, &payload); err != nil {
 		t.Fatalf("decode payload: %v", err)
 	}
-	if payload.SessionName != "worker" || payload.Template != "worker" || payload.ResetCommittedAt != committedAt || payload.ElapsedSeconds != 75 {
-		t.Fatalf("payload = %+v, want session/template worker, reset_committed_at %q, elapsed_s 75", payload, committedAt)
+	if payload.SessionName != "worker" || payload.Template != "worker" || payload.ResetCommittedAt != committedAt || payload.ElapsedSeconds != 135 {
+		t.Fatalf("payload = %+v, want session/template worker, reset_committed_at %q, elapsed_s 135", payload, committedAt)
 	}
 
 	foundTrace := false
@@ -9767,7 +9943,7 @@ func TestReconcileSessionBeads_RecordsResetStallDiagnostic(t *testing.T) {
 	}
 
 	env.stderr.Reset()
-	recordResetStallIfDue(sessiontest.SeedBead(t, session), "worker", "worker", false, env.cfg.Session.StartupTimeoutDuration(), env.clk.Now().UTC(), env.dt, rec, &env.stderr, trace)
+	recordResetStallIfDue(sessiontest.SeedBead(t, session), "worker", "worker", false, stallThreshold, env.clk.Now().UTC(), env.dt, rec, &env.stderr, trace)
 	if got := strings.TrimSpace(env.stderr.String()); got != "" {
 		t.Fatalf("second stalled pass stderr = %q, want debounce silence", got)
 	}
@@ -9779,13 +9955,13 @@ func TestReconcileSessionBeads_RecordsResetStallDiagnostic(t *testing.T) {
 		"continuation_reset_pending":   "",
 		sessionpkg.ResetCommittedAtKey: "",
 	})
-	recordResetStallIfDue(sessiontest.SeedBead(t, session), "worker", "worker", false, env.cfg.Session.StartupTimeoutDuration(), env.clk.Now().UTC(), env.dt, rec, &env.stderr, trace)
+	recordResetStallIfDue(sessiontest.SeedBead(t, session), "worker", "worker", false, stallThreshold, env.clk.Now().UTC(), env.dt, rec, &env.stderr, trace)
 	env.setSessionMetadata(&session, map[string]string{
 		"continuation_reset_pending":   "true",
 		sessionpkg.ResetCommittedAtKey: committedAt,
 	})
 	env.stderr.Reset()
-	recordResetStallIfDue(sessiontest.SeedBead(t, session), "worker", "worker", false, env.cfg.Session.StartupTimeoutDuration(), env.clk.Now().UTC(), env.dt, rec, &env.stderr, trace)
+	recordResetStallIfDue(sessiontest.SeedBead(t, session), "worker", "worker", false, stallThreshold, env.clk.Now().UTC(), env.dt, rec, &env.stderr, trace)
 	if got := strings.TrimSpace(env.stderr.String()); got != wantMessage {
 		t.Fatalf("re-stalled pass stderr = %q, want %q", got, wantMessage)
 	}

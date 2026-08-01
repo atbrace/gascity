@@ -7,8 +7,10 @@ set -euo pipefail
 # N-core host that is N concurrent compiles (~17 GB pressure, load >100,
 # I/O/compile storms and occasional livelocks on WSL) on EVERY commit.
 # GOFLAGS=-p=2 bounds build parallelism within one `go test` but not the outer
-# fan-out. Running the suite at push time fires it far less often, and only when
-# Go sources actually change.
+# fan-out, which is bounded below instead. Running the suite at push time fires
+# it far less often than per-commit, and a push that changes no Go source skips
+# it — except for the first push of a new branch, which has no cheap base to
+# diff against and always runs the suite regardless of what it touches.
 #
 # git feeds "<local ref> <local sha> <remote ref> <remote sha>" per pushed ref
 # on stdin (see githooks(5)).
@@ -35,7 +37,30 @@ if [ "$go_changed" -eq 0 ]; then
   exit 0
 fi
 
-# Bound the local fan-out by default so the suite stays friendly on developer
-# machines; an explicit LOCAL_TEST_JOBS (and CI's Makefile default) still wins.
-export LOCAL_TEST_JOBS="${LOCAL_TEST_JOBS:-3}"
+# Bound the outer fan-out. scripts/test-local-job-count is the canonical policy
+# because it derives the count from available memory as well as CPU, but it does
+# not exist on every branch, so a static fallback keeps a bound in force where it
+# is absent.
+#
+# The fallback is 1, not a larger guess, because a fixed count cannot see the
+# host's memory and one shard is already most of a small machine. Measured (peak
+# RSS, /usr/bin/time -v, linux/amd64, sys-3hem0): one ./cmd/gc compile is
+# 3.5-3.9 GiB, and per-job peak RSS stays FLAT as concurrency rises — 3.5-3.9
+# GiB whether it runs alone or five-up, because concurrent compiles do not share
+# compile memory. Three jobs measured at 11.3 GiB total. So on an 8 GiB host one
+# job is ~44-49% of the machine and two exceed it outright, before the OS. Note
+# a warm cache does not help here: it buys ~3.4x on wall time and ~3.6% on
+# memory, so the bound has to be on job COUNT.
+#
+# An explicit LOCAL_TEST_JOBS still wins over both paths.
+if [ -z "${LOCAL_TEST_JOBS:-}" ]; then
+  if [ -x scripts/test-local-job-count ]; then
+    LOCAL_TEST_JOBS="$(scripts/test-local-job-count)"
+  else
+    LOCAL_TEST_JOBS=1
+    echo "pre-push: scripts/test-local-job-count unavailable; bounding the" \
+      "suite to 1 job. Set LOCAL_TEST_JOBS=<n> to override." >&2
+  fi
+fi
+export LOCAL_TEST_JOBS
 exec make test-fast-parallel

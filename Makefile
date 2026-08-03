@@ -401,9 +401,19 @@ test-mac: test-fsys-darwin-compile
 
 LOCAL_TEST_JOBS ?= $(shell nproc 2>/dev/null || getconf _NPROCESSORS_ONLN 2>/dev/null || sysctl -n hw.ncpu 2>/dev/null || echo 8)
 
+# LOCAL_TEST_GO_PROCS bounds `go test -p` for the script's unit-core job, which
+# hands ~160 packages to a single `go test` (gcy-8fd). Like LOCAL_TEST_JOBS and
+# CMD_GC_PROCESS_TOTAL it MUST be named on every recipe that runs the unit-core
+# job — `fast` and `full` today. TEST_ENV is
+# an `env -i` wrapper, so a value merely exported into make's environment — by a
+# gc agent-env pin, a shell export, or `VAR=x make ...` — is stripped before the
+# script ever sees it, and the run silently falls back to the script default.
+# That failure is invisible: the suite passes, just with the wrong bound.
+LOCAL_TEST_GO_PROCS ?= 4
+
 ## test-fast-parallel: run the default fast suite with cmd/gc sharded locally
 test-fast-parallel:
-	$(TEST_ENV) LOCAL_TEST_JOBS=$(LOCAL_TEST_JOBS) CMD_GC_PROCESS_TOTAL=$(CMD_GC_PROCESS_TOTAL) ./scripts/test-local-parallel fast
+	$(TEST_ENV) LOCAL_TEST_JOBS=$(LOCAL_TEST_JOBS) CMD_GC_PROCESS_TOTAL=$(CMD_GC_PROCESS_TOTAL) LOCAL_TEST_GO_PROCS=$(LOCAL_TEST_GO_PROCS) ./scripts/test-local-parallel fast
 
 ## test-fsys-darwin-compile: cross-compile internal/fsys for macOS so
 ## unix.Stat_t field-type regressions fail in the default fast test path.
@@ -524,7 +534,7 @@ test-integration-shards-parallel:
 
 ## test-local-full-parallel: run fast unit, cmd/gc process, and integration shards concurrently
 test-local-full-parallel:
-	LOCAL_TEST_JOBS=$(LOCAL_TEST_JOBS) CMD_GC_PROCESS_TOTAL=$(CMD_GC_PROCESS_TOTAL) ./scripts/test-local-parallel full
+	LOCAL_TEST_JOBS=$(LOCAL_TEST_JOBS) CMD_GC_PROCESS_TOTAL=$(CMD_GC_PROCESS_TOTAL) LOCAL_TEST_GO_PROCS=$(LOCAL_TEST_GO_PROCS) ./scripts/test-local-parallel full
 
 ## test-integration-shards-cover: run the CI integration coverage shards sequentially
 test-integration-shards-cover: test-integration-packages-cover test-integration-review-formulas-cover test-integration-bdstore-cover test-integration-rest-smoke-cover test-integration-rest-full-cover

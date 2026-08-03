@@ -9,6 +9,7 @@ usage: scripts/test-local-parallel <fast|cmd-gc-process|integration|full>
 Environment:
   LOCAL_TEST_JOBS        max concurrent jobs (default: detected CPU count)
   CMD_GC_PROCESS_TOTAL  cmd/gc shard count (default: 6)
+  LOCAL_TEST_GO_PROCS   go test -p for the unit-core job (default: 4)
 USAGE
 }
 
@@ -44,6 +45,26 @@ detect_cpus() {
 
 local_jobs="${LOCAL_TEST_JOBS:-$(detect_cpus)}"
 cmd_gc_total="${CMD_GC_PROCESS_TOTAL:-6}"
+# LOCAL_TEST_JOBS bounds the JOB layer — xargs -P below — and nothing else. The
+# unit-core job is a SINGLE job that hands ~160 packages to ONE `go test`, which
+# builds and links them with its own internal parallelism. That parallelism
+# defaults to GOMAXPROCS, so on a 6-core host `LOCAL_TEST_JOBS=1` still permits
+# six concurrent linkers. Bounding the job layer while the Go layer runs free
+# buys nothing on the memory axis (gcy-8fd).
+#
+# Measured on an 8 GiB / 6-core host during a live refinery merge, with cmd/gc
+# already excluded and LOCAL_TEST_JOBS=1: 3 concurrent linkers, 2.67 GiB and
+# 3.05 GiB peak across two bursts, max single linker 1.03 GiB, against
+# 2.54-2.60 GiB available. Peak link demand exceeded available memory and the
+# swapfile grew 2048M -> 3072M. Three linkers was luck; the ceiling was six.
+#
+# The default of 4 matches the -p=4 that `make test` and `make test-mac` already
+# carry (Makefile). Before this knob existed, test-fast-parallel was the ONLY
+# test path in the tree with no -p bound at all — the least bounded path, not the
+# safest one. Hosts that cannot afford 4 concurrent ~1 GiB links should pin this
+# lower; note that -p bounds CONCURRENCY only and cannot bound a single link, so
+# below roughly 3 GiB free no value makes the sweep fit (gcy-z78).
+go_procs="${LOCAL_TEST_GO_PROCS:-4}"
 
 if ! [[ "$local_jobs" =~ ^[0-9]+$ && "$local_jobs" -gt 0 ]]; then
   echo "LOCAL_TEST_JOBS must be a positive integer" >&2
@@ -51,6 +72,10 @@ if ! [[ "$local_jobs" =~ ^[0-9]+$ && "$local_jobs" -gt 0 ]]; then
 fi
 if ! [[ "$cmd_gc_total" =~ ^[0-9]+$ && "$cmd_gc_total" -gt 0 ]]; then
   echo "CMD_GC_PROCESS_TOTAL must be a positive integer" >&2
+  exit 1
+fi
+if ! [[ "$go_procs" =~ ^[0-9]+$ && "$go_procs" -gt 0 ]]; then
+  echo "LOCAL_TEST_GO_PROCS must be a positive integer" >&2
   exit 1
 fi
 
@@ -76,7 +101,7 @@ add_fsys_compile_job() {
 
 add_unit_core_job() {
   add_job "unit-core" \
-    'GC_FAST_UNIT=1 go test $(go list ./... | grep -v '"'"'^github.com/gastownhall/gascity/cmd/gc$'"'"')'
+    'GC_FAST_UNIT=1 go test -p '"$go_procs"' $(go list ./... | grep -v '"'"'^github.com/gastownhall/gascity/cmd/gc$'"'"')'
 }
 
 add_cmd_gc_shards() {
@@ -208,7 +233,7 @@ if [[ "$cmd_gc_sharded" -eq 1 ]]; then
   export GO_TEST_PREBUILT_BIN="$prebuilt_dir/cmdgc.test"
 fi
 
-echo "Running ${#jobspecs[@]} ${mode} job(s) with LOCAL_TEST_JOBS=${local_jobs}"
+echo "Running ${#jobspecs[@]} ${mode} job(s) with LOCAL_TEST_JOBS=${local_jobs} LOCAL_TEST_GO_PROCS=${go_procs}"
 
 set +e
 printf '%s\0' "${jobspecs[@]}" | xargs -0 -n1 -P "$local_jobs" bash -c '

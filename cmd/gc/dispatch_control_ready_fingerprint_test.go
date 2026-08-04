@@ -141,12 +141,137 @@ func TestControlReadyCacheRebuildsWhenFingerprintChanges(t *testing.T) {
 	if second == first {
 		t.Fatalf("changed fingerprint reused the stale snapshot; want a rebuild")
 	}
-	if got := opens(); got != 2 {
-		t.Fatalf("opens after change = %d, want 2 (a changed fingerprint must rebuild)", got)
+	// A rebuild is a fresh SNAPSHOT, not a fresh backing store: the snapshot is
+	// what can go stale (PrimeActive absorbs and never evicts), while the store
+	// underneath holds only memoized capability probes. See
+	// TestControlReadyCacheReusesBackingStoreAcrossRebuilds.
+	if got := opens(); got != 1 {
+		t.Fatalf("opens after change = %d, want 1 (rebuild replaces the snapshot, reusing the store)", got)
 	}
 }
 
 func TestControlReadyCacheRebuildsPastMaxAgeEvenWhenFingerprintMatches(t *testing.T) {
+	cityDir, store := setUpControlReadyFileStoreCity(t)
+	probe := &fingerprintProbeStore{Store: store, fp: "n1|mx1|nb1|"}
+	opens := installControlReadyStore(t, probe)
+
+	first := controlReadyCacheFor(cityDir, cityDir, nil)
+	if first == nil {
+		t.Fatalf("first controlReadyCacheFor returned nil, want a primed cache")
+	}
+
+	entry := expireControlReadyEntry(t, cityDir, 2*controlReadyCacheTTL)
+	controlReadyCacheRegistry.mu.Lock()
+	entry.builtAt = entry.builtAt.Add(-2 * controlReadyCacheMaxAge)
+	controlReadyCacheRegistry.mu.Unlock()
+
+	second := controlReadyCacheFor(cityDir, cityDir, nil)
+	if second == nil {
+		t.Fatalf("second controlReadyCacheFor returned nil, want a rebuilt cache")
+	}
+	if second == first {
+		t.Fatalf("snapshot past max age was reused; want a rebuild")
+	}
+	if got := opens(); got != 1 {
+		t.Fatalf("opens past max age = %d, want 1 (rebuild replaces the snapshot, reusing the store)", got)
+	}
+}
+
+func TestControlReadyCacheRebuildsWhenProbeFailsOrIsUnavailable(t *testing.T) {
+	t.Run("probe error", func(t *testing.T) {
+		cityDir, store := setUpControlReadyFileStoreCity(t)
+		probe := &fingerprintProbeStore{Store: store, fp: "n1|mx1|nb1|"}
+		opens := installControlReadyStore(t, probe)
+
+		first := controlReadyCacheFor(cityDir, cityDir, nil)
+		if first == nil {
+			t.Fatalf("first controlReadyCacheFor returned nil, want a primed cache")
+		}
+		expireControlReadyEntry(t, cityDir, 2*controlReadyCacheTTL)
+
+		probe.mu.Lock()
+		probe.err = errProbeUnavailable
+		probe.mu.Unlock()
+
+		second := controlReadyCacheFor(cityDir, cityDir, nil)
+		if second == nil {
+			t.Fatalf("second controlReadyCacheFor returned nil, want a rebuilt cache")
+		}
+		if second == first {
+			t.Fatalf("snapshot reused despite an unusable probe; want a rebuild")
+		}
+		if got := opens(); got != 1 {
+			t.Fatalf("opens after probe error = %d, want 1 (rebuild replaces the snapshot, reusing the store)", got)
+		}
+	})
+
+	t.Run("store cannot fingerprint", func(t *testing.T) {
+		cityDir, store := setUpControlReadyFileStoreCity(t)
+		opens := installControlReadyStore(t, &plainProbeStore{Store: store})
+
+		first := controlReadyCacheFor(cityDir, cityDir, nil)
+		if first == nil {
+			t.Fatalf("first controlReadyCacheFor returned nil, want a primed cache")
+		}
+		expireControlReadyEntry(t, cityDir, 2*controlReadyCacheTTL)
+
+		second := controlReadyCacheFor(cityDir, cityDir, nil)
+		if second == nil {
+			t.Fatalf("second controlReadyCacheFor returned nil, want a rebuilt cache")
+		}
+		if second == first {
+			t.Fatalf("snapshot reused without a fingerprinter; no cheap path means rebuild")
+		}
+		if got := opens(); got != 1 {
+			t.Fatalf("opens without a fingerprinter = %d, want 1 (rebuild replaces the snapshot, reusing the store)", got)
+		}
+	})
+}
+
+// TestControlReadyCacheReusesBackingStoreAcrossRebuilds pins fix #1 on gcy-gla:
+// a rebuild must discard only the SNAPSHOT, not the backing store underneath
+// it. The backing BdStore memoizes its capability probes per instance
+// (bdReadyProjectionEnabled, conditionalWritesCapable), so opening a fresh one
+// per rebuild re-probes a cold gate and spawns `bd version` -- a full ~0.5s
+// process to re-read a string this process already knew. Measured live on the
+// dispatcher: 1 of every 8 bd execs per minute was exactly that.
+//
+// Reuse is safe precisely because BdStore caches capabilities, never bead
+// data: every read still shells out to bd, so a reused store cannot serve a
+// stale bead. The staleness trap this file guards lives in CachingStore (which
+// absorbs and never evicts), and that is still rebuilt from scratch here.
+func TestControlReadyCacheReusesBackingStoreAcrossRebuilds(t *testing.T) {
+	cityDir, store := setUpControlReadyFileStoreCity(t)
+	probe := &fingerprintProbeStore{Store: store, fp: "n1|mx1|nb1|"}
+	opens := installControlReadyStore(t, probe)
+
+	first := controlReadyCacheFor(cityDir, cityDir, nil)
+	if first == nil {
+		t.Fatalf("first controlReadyCacheFor returned nil, want a primed cache")
+	}
+	if got := opens(); got != 1 {
+		t.Fatalf("opens after first call = %d, want 1", got)
+	}
+
+	expireControlReadyEntry(t, cityDir, 2*controlReadyCacheTTL)
+	probe.set("n0|mx2|nb0|") // a real change: force the rebuild path
+
+	second := controlReadyCacheFor(cityDir, cityDir, nil)
+	if second == nil {
+		t.Fatalf("second controlReadyCacheFor returned nil, want a rebuilt cache")
+	}
+	if second == first {
+		t.Fatalf("changed fingerprint reused the stale snapshot; want a fresh one")
+	}
+	if got := opens(); got != 1 {
+		t.Fatalf("opens across a rebuild = %d, want 1 (the rebuild must reuse the retained backing store)", got)
+	}
+}
+
+// TestControlReadyCacheOpensAgainWhenBackingStoreIsLost covers the entry that
+// cannot offer a store to reuse -- there is nothing retained to build on, so
+// the rebuild must fall back to opening one rather than returning nil.
+func TestControlReadyCacheOpensAgainWhenBackingStoreIsLost(t *testing.T) {
 	cityDir, store := setUpControlReadyFileStoreCity(t)
 	probe := &fingerprintProbeStore{Store: store, fp: "n1|mx1|nb1|"}
 	opens := installControlReadyStore(t, probe)
@@ -157,56 +282,15 @@ func TestControlReadyCacheRebuildsPastMaxAgeEvenWhenFingerprintMatches(t *testin
 
 	entry := expireControlReadyEntry(t, cityDir, 2*controlReadyCacheTTL)
 	controlReadyCacheRegistry.mu.Lock()
-	entry.builtAt = entry.builtAt.Add(-2 * controlReadyCacheMaxAge)
+	entry.backing = nil
 	controlReadyCacheRegistry.mu.Unlock()
 
 	if controlReadyCacheFor(cityDir, cityDir, nil) == nil {
 		t.Fatalf("second controlReadyCacheFor returned nil, want a rebuilt cache")
 	}
 	if got := opens(); got != 2 {
-		t.Fatalf("opens past max age = %d, want 2 (max age must force a rebuild)", got)
+		t.Fatalf("opens with no retained store = %d, want 2 (nothing to reuse means open one)", got)
 	}
-}
-
-func TestControlReadyCacheRebuildsWhenProbeFailsOrIsUnavailable(t *testing.T) {
-	t.Run("probe error", func(t *testing.T) {
-		cityDir, store := setUpControlReadyFileStoreCity(t)
-		probe := &fingerprintProbeStore{Store: store, fp: "n1|mx1|nb1|"}
-		opens := installControlReadyStore(t, probe)
-
-		if controlReadyCacheFor(cityDir, cityDir, nil) == nil {
-			t.Fatalf("first controlReadyCacheFor returned nil, want a primed cache")
-		}
-		expireControlReadyEntry(t, cityDir, 2*controlReadyCacheTTL)
-
-		probe.mu.Lock()
-		probe.err = errProbeUnavailable
-		probe.mu.Unlock()
-
-		if controlReadyCacheFor(cityDir, cityDir, nil) == nil {
-			t.Fatalf("second controlReadyCacheFor returned nil, want a rebuilt cache")
-		}
-		if got := opens(); got != 2 {
-			t.Fatalf("opens after probe error = %d, want 2 (an unusable probe must rebuild)", got)
-		}
-	})
-
-	t.Run("store cannot fingerprint", func(t *testing.T) {
-		cityDir, store := setUpControlReadyFileStoreCity(t)
-		opens := installControlReadyStore(t, &plainProbeStore{Store: store})
-
-		if controlReadyCacheFor(cityDir, cityDir, nil) == nil {
-			t.Fatalf("first controlReadyCacheFor returned nil, want a primed cache")
-		}
-		expireControlReadyEntry(t, cityDir, 2*controlReadyCacheTTL)
-
-		if controlReadyCacheFor(cityDir, cityDir, nil) == nil {
-			t.Fatalf("second controlReadyCacheFor returned nil, want a rebuilt cache")
-		}
-		if got := opens(); got != 2 {
-			t.Fatalf("opens without a fingerprinter = %d, want 2 (no cheap path means rebuild)", got)
-		}
-	})
 }
 
 // TestControlReadyCacheWithinTTLDoesNotProbe pins the hot path: inside the TTL

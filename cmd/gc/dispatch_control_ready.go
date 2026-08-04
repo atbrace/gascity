@@ -331,6 +331,17 @@ type controlReadyCacheEntry struct {
 	fingerprint string
 }
 
+// reusableBacking returns the store a rebuild can build a fresh snapshot on
+// instead of opening its own, or nil when this entry has none to offer. The
+// nil receiver is the "no entry registered for this dir yet" case and is
+// deliberately supported so the caller needs no separate presence check.
+func (e *controlReadyCacheEntry) reusableBacking() beads.Store {
+	if e == nil {
+		return nil
+	}
+	return e.backing
+}
+
 // openControlReadyStore is a seam so tests can supply a store with known
 // fingerprint behaviour; production always uses openControlStoreAtForCity.
 var openControlReadyStore = openControlStoreAtForCity
@@ -370,9 +381,33 @@ func controlReadyCacheFor(dir, cityPath string, cfg *config.City) *beads.Caching
 		}
 	}
 
-	store, err := openControlReadyStore(dir, cityPath, cfg)
-	if err != nil {
-		return nil
+	// A rebuild replaces the SNAPSHOT, not the store beneath it. BdStore holds
+	// no bead data -- every read still shells out to bd, so a retained store
+	// cannot serve a stale bead -- and caches only capability verdicts: the
+	// ready-projection version gate and the conditional-write probe. Opening a
+	// fresh store per rebuild therefore buys no freshness and costs a cold
+	// version gate, i.e. a whole `bd version` process spawn (measured ~0.5s,
+	// as much as a real query) on every rebuild. That is the contradiction
+	// bdReadyProjectionEnabled's own doc comment describes when it says it
+	// probes "once per process": reusing the retained store is what makes that
+	// comment true, without package-global state that would leak across tests
+	// injecting runners with different bd versions.
+	//
+	// The staleness trap this cache guards lives in CachingStore, which absorbs
+	// and never evicts (see revalidateControlReadyCache); that is still built
+	// from scratch below, so the snapshot remains an exact point-in-time read.
+	//
+	// Consequence worth knowing: the store's scope resolution is done once, at
+	// first open, so a city.toml edit relocating this dir's scope is not picked
+	// up until the process restarts -- the same restart requirement the version
+	// gate already documents.
+	store := entry.reusableBacking()
+	if store == nil {
+		opened, err := openControlReadyStore(dir, cityPath, cfg)
+		if err != nil {
+			return nil
+		}
+		store = opened
 	}
 	// Take the fingerprint BEFORE priming, not after. Priming is several
 	// seconds of bd calls, and a write landing inside that window must not be
@@ -409,11 +444,12 @@ func controlReadyCacheFor(dir, cityPath string, cfg *config.City) *beads.Caching
 // revalidateControlReadyCache tries to extend an expired entry's life without
 // rebuilding it, returning the reusable cache or nil meaning "rebuild".
 //
-// Rebuilding costs six bd subprocesses -- a List per active status over
-// TierBoth, the ready-projection union scan, and the bd version gate a fresh
-// BdStore re-probes -- and on this workload each subprocess pays a ~0.5s
-// process-spawn floor regardless of how trivial its query is. The fingerprint
-// probe costs one. On a city where nothing changed since the last tick, which
+// Rebuilding costs several bd subprocesses -- a List per active status over
+// TierBoth plus the ready-projection union scan -- and on this workload each
+// subprocess pays a ~0.5s process-spawn floor regardless of how trivial its
+// query is. The fingerprint probe costs one. (Rebuilds no longer re-probe the
+// bd version gate: controlReadyCacheFor reuses the retained backing store,
+// whose capability verdicts are already memoized.) On a city where nothing changed since the last tick, which
 // is the overwhelmingly common case for a control-dispatcher wake, the
 // existing snapshot is not merely fresh enough: it is exactly correct, because
 // there is nothing for it to be stale about.

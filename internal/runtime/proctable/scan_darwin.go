@@ -23,9 +23,29 @@ func ScanBySessionID(id string) ([]runtime.LiveRuntime, error) {
 	if err != nil {
 		return []runtime.LiveRuntime{}, err
 	}
+	return rootsFromRecords(records, id), nil
+}
+
+// rootsFromRecords selects agent root processes from a process-table snapshot.
+// It is the darwin counterpart of the linux scanWithRoot seam: the selection
+// rules live here, away from the ps invocation, so they can be tested against a
+// synthetic table.
+func rootsFromRecords(records map[int]psRecord, id string) []runtime.LiveRuntime {
 	var out []runtime.LiveRuntime
 	for _, record := range records {
 		if record.pid <= 1 {
+			continue
+		}
+		// A runtime server is never an agent root. `ps eww` concatenates argv
+		// and envp with no delimiter, so the tmux server's own `-e KEY=VALUE`
+		// session-seeding flags parse as its environment (see
+		// parseInlineEnv) and it impersonates whichever session it was spawned
+		// to create. Left in, it becomes a kill target for that session's next
+		// restart -- killExistingOrphans terminates untracked same-session
+		// roots, and killing the server takes every session in the city with
+		// it. Skipping it here costs nothing: agent processes are pane
+		// children of the server, not the server itself.
+		if isInfrastructureCommand(record.command) {
 			continue
 		}
 		sessionID := record.env["GC_SESSION_ID"]
@@ -56,7 +76,7 @@ func ScanBySessionID(id string) ([]runtime.LiveRuntime, error) {
 	if out == nil {
 		out = []runtime.LiveRuntime{}
 	}
-	return out, nil
+	return out
 }
 
 // IsScanRoot reports whether pid is outside its GC_SESSION_ID parent's

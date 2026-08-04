@@ -69,6 +69,15 @@ const controlReadyFallbackLimit = 5000
 // for the life of the process.
 const controlReadyCacheTTL = 3 * time.Second
 
+// controlReadyCacheMaxAge hard-caps how long one built snapshot may keep being
+// served on the strength of a matching fingerprint alone (see
+// revalidateControlReadyCache). The fingerprint is a three-scalar summary, not
+// a hash of every field, so it can in principle alias -- two offsetting edits
+// inside the same second. Rebuilding unconditionally past this age bounds that
+// exposure to a known interval instead of letting a single aliased comparison
+// pin a stale snapshot for the life of the process.
+const controlReadyCacheMaxAge = 60 * time.Second
+
 // parsedControlReadyQuery holds the values workflowServeControlReadyQueryForBeads
 // bakes into its generated shell command as env-var prefix assignments.
 type parsedControlReadyQuery struct {
@@ -305,13 +314,33 @@ var controlReadyCacheRegistry = struct {
 }{byDir: make(map[string]*controlReadyCacheEntry)}
 
 type controlReadyCacheEntry struct {
-	cache    *beads.CachingStore
+	cache *beads.CachingStore
+	// backing is retained so an expired entry can be revalidated with a single
+	// cheap probe instead of opening a second store just to ask whether a
+	// rebuild is needed.
+	backing beads.Store
+	// primedAt is when the snapshot was last known-good, and is the base for
+	// controlReadyCacheTTL. A successful revalidation advances it without
+	// rebuilding.
 	primedAt time.Time
+	// builtAt is when the snapshot was actually constructed, and is the base
+	// for controlReadyCacheMaxAge. Revalidation never advances it.
+	builtAt time.Time
+	// fingerprint is the active-surface summary taken just before the prime
+	// that produced cache. Empty means "never reuse this entry".
+	fingerprint string
 }
+
+// openControlReadyStore is a seam so tests can supply a store with known
+// fingerprint behaviour; production always uses openControlStoreAtForCity.
+var openControlReadyStore = openControlStoreAtForCity
 
 // controlReadyCacheFor returns a short-lived, best-effort in-process ready
 // snapshot for dir, reusing one primed within controlReadyCacheTTL instead of
-// re-priming on every drain-loop tick. Returns nil whenever the cache cannot
+// re-priming on every drain-loop tick. Past the TTL it does not rebuild
+// immediately: revalidateControlReadyCache first asks, in one cheap probe,
+// whether the active surface changed at all, and only rebuilds when it did or
+// when the answer cannot be trusted. Returns nil whenever the cache cannot
 // be built or trusted; callers must treat nil as "fall back to a live bd
 // query", not as an error -- an unopenable store here is possible in scopes
 // this readiness scan does not normally run against (e.g. test fixtures with
@@ -335,10 +364,28 @@ func controlReadyCacheFor(dir, cityPath string, cfg *config.City) *beads.Caching
 	if fresh {
 		return entry.cache
 	}
+	if ok {
+		if cache := revalidateControlReadyCache(dir, entry); cache != nil {
+			return cache
+		}
+	}
 
-	store, err := openControlStoreAtForCity(dir, cityPath, cfg)
+	store, err := openControlReadyStore(dir, cityPath, cfg)
 	if err != nil {
 		return nil
+	}
+	// Take the fingerprint BEFORE priming, not after. Priming is several
+	// seconds of bd calls, and a write landing inside that window must not be
+	// able to produce an entry whose fingerprint already describes state the
+	// snapshot does not contain -- that would let the next tick match and
+	// serve a snapshot known to be stale. Sampling first means such a write
+	// instead shows up as a mismatch and forces a rebuild: a wasted prime,
+	// which is exactly what happens today anyway, rather than a stale answer.
+	fingerprint := ""
+	if fp, isFingerprinter := store.(beads.ActiveFingerprinter); isFingerprinter {
+		if current, fpErr := fp.ActiveFingerprint(); fpErr == nil {
+			fingerprint = current
+		}
 	}
 	cs := beads.NewCachingStore(store, nil)
 	if err := cs.PrimeActive(); err != nil {
@@ -346,10 +393,66 @@ func controlReadyCacheFor(dir, cityPath string, cfg *config.City) *beads.Caching
 		return nil
 	}
 
+	now := time.Now()
 	controlReadyCacheRegistry.mu.Lock()
-	controlReadyCacheRegistry.byDir[dir] = &controlReadyCacheEntry{cache: cs, primedAt: time.Now()}
+	controlReadyCacheRegistry.byDir[dir] = &controlReadyCacheEntry{
+		cache:       cs,
+		backing:     store,
+		primedAt:    now,
+		builtAt:     now,
+		fingerprint: fingerprint,
+	}
 	controlReadyCacheRegistry.mu.Unlock()
 	return cs
+}
+
+// revalidateControlReadyCache tries to extend an expired entry's life without
+// rebuilding it, returning the reusable cache or nil meaning "rebuild".
+//
+// Rebuilding costs six bd subprocesses -- a List per active status over
+// TierBoth, the ready-projection union scan, and the bd version gate a fresh
+// BdStore re-probes -- and on this workload each subprocess pays a ~0.5s
+// process-spawn floor regardless of how trivial its query is. The fingerprint
+// probe costs one. On a city where nothing changed since the last tick, which
+// is the overwhelmingly common case for a control-dispatcher wake, the
+// existing snapshot is not merely fresh enough: it is exactly correct, because
+// there is nothing for it to be stale about.
+//
+// This is deliberately NOT the "reuse the store and re-prime it" fix that
+// looks equivalent. CachingStore.PrimeActive absorbs rows and never evicts, so
+// re-priming a retained store would leave beads that have since closed sitting
+// in the cache and the dispatcher would keep seeing them as ready. Reuse here
+// is gated on the surface provably not having changed at all, so no eviction
+// question arises.
+//
+// Every uncertain outcome -- no fingerprinter, probe error, empty result,
+// mismatch, or an entry too old to trust a summary comparison -- returns nil
+// and rebuilds. Reuse requires a positive, matching answer.
+func revalidateControlReadyCache(dir string, entry *controlReadyCacheEntry) *beads.CachingStore {
+	if entry == nil || entry.cache == nil || entry.backing == nil || entry.fingerprint == "" {
+		return nil
+	}
+	if time.Since(entry.builtAt) >= controlReadyCacheMaxAge {
+		return nil
+	}
+	fp, ok := entry.backing.(beads.ActiveFingerprinter)
+	if !ok {
+		return nil
+	}
+	current, err := fp.ActiveFingerprint()
+	if err != nil || current == "" || current != entry.fingerprint {
+		return nil
+	}
+
+	controlReadyCacheRegistry.mu.Lock()
+	// Only advance the entry still registered for dir: a concurrent rebuild
+	// may have replaced it while the probe was in flight, and that newer
+	// snapshot must keep its own primedAt.
+	if live, present := controlReadyCacheRegistry.byDir[dir]; present && live == entry {
+		entry.primedAt = time.Now()
+	}
+	controlReadyCacheRegistry.mu.Unlock()
+	return entry.cache
 }
 
 // tryControlReadyFromCacheOrFallback answers a control-dispatcher readiness

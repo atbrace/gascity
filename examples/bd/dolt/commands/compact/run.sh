@@ -1224,6 +1224,68 @@ db_root_drift_within_verified_tables() {
   return 0
 }
 
+# db_root_drift_within_excluded_tables — prove a committed-root drift benign
+# when it lands on tables preflight deliberately excluded from verification.
+#
+# The flatten legitimately changes the committed table SET, and db_value_hash()
+# is DOLT_HASHOF_DB('HEAD') — pinned to the committed root — so any such change
+# drifts the aggregate hash while every verified table stays byte-identical:
+#
+#   • category 2 (dolt_ignore'd but force-inlined into HEAD, #3541/dolt#11131):
+#     DOLT_RESET('--soft', root) un-tracks them and -Am cannot re-stage a
+#     dolt_ignore'd table, so the flatten commit DROPS them. Guaranteed, every run.
+#   • category 1 (present in the working set, absent from the committed root):
+#     -Am DOES stage a non-ignored new table, so the flatten commit GAINS it.
+#     gc's own health probe table __gc_read_only_probe reaches HEAD this way.
+#
+# Both are structural, not races: they reproduce on every flatten of an affected
+# database, which is why deferring is not a fix — it starves GC exactly as a
+# quarantine does. preflight_counts already recorded both categories in
+# preflight_excluded_tables, so the drift is explained when every table named by
+# DOLT_DIFF_STAT is either verified (value proven equal) or excluded (outside the
+# flatten's preservation contract by construction). Their rows remain in the
+# working set, which DOLT_GC keeps reachable — no data is lost.
+#
+# Fails closed on anything else: an empty diff, a probe failure, or a drift table
+# that is neither verified nor excluded (a system table such as dolt_schemas)
+# keeps the quarantine.
+db_root_drift_within_excluded_tables() {
+  db="$1"
+  from="$2"
+  to="$3"
+  preflight_file="$4"
+  excluded="$5"
+  [ -n "$from" ] && [ -n "$to" ] || return 1
+  [ -n "$excluded" ] || return 1
+  stat_tmp=$(mktemp)
+  if ! dolt_query "$db" \
+    "SELECT table_name FROM DOLT_DIFF_STAT('$from', '$to')" \
+    > "$stat_tmp" 2>/dev/null; then
+    rm -f "$stat_tmp"
+    return 1
+  fi
+  drift_tables=$(awk 'NR>=4 && /^\|/ {gsub(/^\| | \|$/, ""); gsub(/ /, ""); if ($0 != "") print}' "$stat_tmp")
+  rm -f "$stat_tmp"
+  [ -n "$drift_tables" ] || return 1
+  saw_excluded=0
+  for drift_t in $drift_tables; do
+    case " $excluded " in
+      *" $drift_t "*)
+        saw_excluded=1
+        continue
+        ;;
+    esac
+    if ! awk -v t="$drift_t" '$1 == t {found=1} END {exit !found}' "$preflight_file"; then
+      return 1
+    fi
+  done
+  # Require at least one excluded table, so a verified-only drift still takes the
+  # existing absorbed-working-set defer path rather than proceeding straight to GC.
+  [ "$saw_excluded" = "1" ] || return 1
+  db_root_drift_excluded_tables="$drift_tables"
+  return 0
+}
+
 oldgen_has_files() {
   db="$1"
   oldgen_dir="$DOLT_DATA_DIR/$db/.dolt/noms/oldgen"
@@ -2447,16 +2509,28 @@ flatten_database() {
         rm -f "$preflight_tmp"
         return 0
       fi
-      printf 'compact: db=%s value hash changed without row-count increase before=%s after=%s — quarantine and investigate before GC\n' \
-        "$db" "$preflight_hash" "$postflight_hash" >&2
-      write_compact_marker "$quarantine_dir" "$db" "post-flatten value hash changed without row-count increase" || {
+      # The flatten also changes the committed table SET by design: it drops
+      # dolt_ignore'd tables force-inlined into HEAD and stages non-ignored
+      # tables the committed root lacked. Both are already recorded in
+      # preflight_excluded_tables. That drift is structural — it repeats every
+      # run — so proceed with GC rather than deferring, which would starve GC
+      # just as a quarantine does.
+      if db_root_drift_within_excluded_tables "$db" "$head" "$flatten_head" \
+        "$preflight_tmp" "$preflight_excluded_tables"; then
+        printf 'compact: db=%s committed-root drift confined to verification-excluded table(s) [%s] via DOLT_DIFF_STAT(%s..%s) with per-table verification passed — the flatten changed the committed table set by design (dolt_ignore'"'"'d tables cannot be re-staged by -Am; working-set-only tables are staged by it), not corruption; full GC allowed\n' \
+          "$db" "${db_root_drift_excluded_tables:-}" "$head" "$flatten_head" >&2
+      else
+        printf 'compact: db=%s value hash changed without row-count increase before=%s after=%s — quarantine and investigate before GC\n' \
+          "$db" "$preflight_hash" "$postflight_hash" >&2
+        write_compact_marker "$quarantine_dir" "$db" "post-flatten value hash changed without row-count increase" || {
+          preserve_head_after_integrity_failure "$db" "$flatten_head" || true
+          rm -f "$preflight_tmp"
+          return 1
+        }
         preserve_head_after_integrity_failure "$db" "$flatten_head" || true
         rm -f "$preflight_tmp"
         return 1
-      }
-      preserve_head_after_integrity_failure "$db" "$flatten_head" || true
-      rm -f "$preflight_tmp"
-      return 1
+      fi
     fi
   fi
   if [ "${verify_counts_saw_gain:-0}" = "1" ]; then

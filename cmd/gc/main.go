@@ -392,8 +392,11 @@ func newRootCmdWithOptions(stdout, stderr io.Writer, options rootCommandOptions)
 	materializeProductMetricsCobraDefaults(root)
 	applyProductionProductMetricsCommandCensus(root)
 
-	// Best-effort: discover pack CLI commands if we're inside a city.
-	if options.discoverPackCommands && options.eagerPackCommandDiscovery {
+	// Best-effort: discover pack CLI commands if we're inside a city. This is
+	// expensive (city resolution + config load, ~1.5 CPU-s), so only do it when
+	// this invocation might actually need pack commands on the tree.
+	if options.discoverPackCommands && options.eagerPackCommandDiscovery &&
+		shouldDiscoverPackCommands(root, options.invocationArgs) {
 		registerPackCommands(root, options.invocationArgs, stdout, stderr)
 	}
 
@@ -401,6 +404,44 @@ func newRootCmdWithOptions(stdout, stderr io.Writer, options rootCommandOptions)
 	installFlagGroupUsageErrors(root, stderr)
 
 	return root
+}
+
+// shouldDiscoverPackCommands reports whether this invocation needs pack CLI
+// commands eagerly registered on the root. Discovery is expensive (city
+// resolution + config load, ~1.5 CPU-s), so we skip it whenever argv targets a
+// concrete built-in command: packs are forbidden from shadowing built-ins, so a
+// built-in target can neither need nor be affected by pack commands.
+//
+// Discovery is still performed when there is no clear built-in target — a bare
+// `gc`, an unknown first token that might name a pack command, or a bare flag
+// invocation such as `--help` (all of which resolve to the root itself). Help
+// and completion also stay on the discover side: they enumerate the tree, so
+// they must see pack commands. Unlike upstream cobra, this root materializes
+// both eagerly (see materializeProductMetricsCobraDefaults above), so Find()
+// resolves them and they need an explicit exemption here.
+//
+// In the unknown-command case cobra falls through to the root RunE, whose
+// tryPackCommandFallback re-resolves and executes the pack command, so
+// execution is never lost even when discovery is skipped.
+func shouldDiscoverPackCommands(root *cobra.Command, argv []string) bool {
+	if len(argv) == 0 {
+		return true
+	}
+	target, _, err := root.Find(argv)
+	if err != nil || target == nil || target == root {
+		return true
+	}
+	// Resolve the top-level ancestor: `gc completion bash` finds the "bash" leaf,
+	// but it is the "completion" root child that decides tree enumeration.
+	topLevel := target
+	for topLevel.Parent() != nil && topLevel.Parent() != root {
+		topLevel = topLevel.Parent()
+	}
+	switch topLevel.Name() {
+	case "help", "completion":
+		return true
+	}
+	return false
 }
 
 func installArgUsageErrors(cmd *cobra.Command, stderr io.Writer) {

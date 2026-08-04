@@ -701,6 +701,17 @@ case "$query" in
       fi
       exit 0
     fi
+    if [ "$mode" = "ignored_committed_table_dropped_by_flatten" ]; then
+      # The flatten drops the force-inlined dolt_ignore'd table from the
+      # committed root, so the committed-root hash legitimately moves while
+      # HEAD never moves and every verified table stays byte-identical.
+      if [ "$(current_head)" = "compactcommit" ]; then
+        print_cell hash-root-after-tableset-change
+      else
+        print_cell hash-root-before
+      fi
+      exit 0
+    fi
     if [ "$mode" = "ignored_table_db_hash_drift" ]; then
       case "$query" in
         *"DOLT_HASHOF_DB('HEAD')"*)
@@ -795,7 +806,7 @@ case "$query" in
     # dolt#11131 heal but is still dolt_ignore'd — the fix must detect this and
     # exclude wisps from flatten verification (#3541).
     case "$mode" in
-      ignored_committed_table_drift)
+      ignored_committed_table_drift|ignored_committed_table_dropped_by_flatten)
         print_cell wisps
         ;;
       *)
@@ -824,6 +835,14 @@ case "$query" in
     # AS OF HEAD returns it — unlike the normal ignored_table_drift case where
     # wisps is absent from every commit root. Both queries return wisps here.
     if [ "$mode" = "ignored_committed_table_drift" ]; then
+      print_cells beads wisps
+      exit 0
+    fi
+    # ignored_committed_table_dropped_by_flatten: same force-healed store, but
+    # modelling what the flatten actually does to it — DOLT_RESET('--soft', root)
+    # un-tracks wisps and -Am cannot re-stage a dolt_ignore'd table, so the
+    # flatten commit DROPS it. wisps stays live in information_schema throughout.
+    if [ "$mode" = "ignored_committed_table_dropped_by_flatten" ]; then
       print_cells beads wisps
       exit 0
     fi
@@ -913,6 +932,12 @@ case "$query" in
     exit 0
     ;;
   *"DOLT_DIFF_STAT"*)
+    if [ "$mode" = "ignored_committed_table_dropped_by_flatten" ]; then
+      # The committed-root diff names exactly the excluded table the flatten
+      # dropped — nothing in the verified set moved.
+      print_cell wisps
+      exit 0
+    fi
     if [ "$mode" = "absorbed_ws_db_hash_drift" ]; then
       print_cell beads
       exit 0
@@ -2616,6 +2641,51 @@ func TestCompactScriptStillQuarantinesDbHashDriftBeyondVerifiedTables(t *testing
 	}
 	if strings.Contains(string(data), "DOLT_GC") {
 		t.Fatalf("unexplained db root drift must block full GC:\n%s", string(data))
+	}
+}
+
+// Production incident (hq 2026-08-03, sysadmin 2026-08-04): both databases were
+// quarantined with "post-flatten value hash changed without row-count increase"
+// on quiet stores with no writer anywhere near the flatten window.
+//
+// Cause is a committed table-SET change, not value drift. dolt_ignore'd tables
+// (wisps, wisp_%, local_metadata, repo_mtimes, ignored_schema_migrations) had
+// been force-inlined into HEAD (#3541/dolt#11131). preflight correctly excludes
+// them from per-table verification — but db_value_hash() is
+// DOLT_HASHOF_DB('HEAD'), pinned to the committed root, which still counts them.
+// The flatten's DOLT_RESET('--soft', root) un-tracks them and -Am cannot
+// re-stage a dolt_ignore'd table, so they are DROPPED from the flatten commit
+// and the aggregate hash moves while every verified table is byte-identical.
+//
+// This is structural, not a race: it reproduces on every flatten of an affected
+// database and never self-heals, which is why the fix must reach full GC rather
+// than defer — a permanent defer starves GC exactly as the quarantine did.
+func TestCompactScriptProceedsWhenFlattenDropsDoltIgnoredCommittedTable(t *testing.T) {
+	fixture := newCompactScriptFixture(t)
+	out, err := fixture.run(t, "ignored_committed_table_dropped_by_flatten", "GC_DOLT_COMPACT_THRESHOLD_COMMITS=500")
+	if err != nil {
+		t.Fatalf("flatten-dropped dolt_ignore'd committed table must not fail compaction: %v\n%s", err, out)
+	}
+	if !strings.Contains(out, "committed-root drift confined to verification-excluded table(s)") ||
+		!strings.Contains(out, "wisps") {
+		t.Fatalf("output missing excluded-table committed-root drift notice:\n%s", out)
+	}
+	quarantine := filepath.Join(fixture.cityPath, ".gc", "runtime", "packs", "dolt", "compact-quarantine", "beads")
+	if _, statErr := os.Stat(quarantine); !os.IsNotExist(statErr) {
+		t.Fatalf("committed table-set change must NOT write a quarantine marker; stat=%v", statErr)
+	}
+	// Structural drift repeats every run, so deferring would starve GC as badly
+	// as quarantining. The run must reclaim now, not book a retry.
+	pendingGC := filepath.Join(fixture.cityPath, ".gc", "runtime", "packs", "dolt", "compact-pending-gc", "beads")
+	if _, statErr := os.Stat(pendingGC); !os.IsNotExist(statErr) {
+		t.Fatalf("committed table-set change must proceed to GC, not defer; pending-GC stat=%v", statErr)
+	}
+	data, readErr := os.ReadFile(fixture.doltLog)
+	if readErr != nil {
+		t.Fatalf("read fake dolt log: %v", readErr)
+	}
+	if !strings.Contains(string(data), "DOLT_GC") {
+		t.Fatalf("committed table-set change must reach full GC:\n%s", string(data))
 	}
 }
 

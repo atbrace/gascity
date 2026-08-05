@@ -176,11 +176,34 @@ func contextUsageMessage(tokens, window int) string {
 		return fmt.Sprintf(
 			"Context usage: %s/%s (~%.0f%%). Approaching the recycle zone. Steer toward a clean seam: finish in-flight work, don't open new long-horizon tasks, and keep durable notes/work-items current so a handoff is cheap. Plan to hand off and reset before this climbs into the urgent band — a fresh session from durable notes outperforms riding lossy compaction.\n",
 			k(tokens), k(window), pct)
+	case sessionIsEphemeral():
+		// Pool/ephemeral workers do not own their own session lifecycle, so
+		// `gc session reset` is an unrehearsed instruction for them: the
+		// polecat contract's path is branch-ready -> refinery, or
+		// `gc runtime request-restart` (sys-ykx0c). The push to COMMIT is
+		// load-bearing rather than stylistic — uncommitted work in a polecat
+		// worktree currently survives only because the witness salvage scan is
+		// inert (sys-t4dfu), so telling a worker to stop without committing
+		// would start losing work the moment that scan is fixed.
+		return fmt.Sprintf(
+			"Context usage: %s/%s (~%.0f%%) — HIGH. You are a pool worker: do NOT `gc session reset` — that is the named-identity path. Drive to your formula's handoff seam and COMMIT: for a polecat that is branch-ready — commit and push your branch, set your work-item metadata, hand off to the refinery, then exit (or `gc runtime request-restart`). Work left uncommitted in a worktree is not durable; do not rely on it surviving. Do this once you are at a seam; do NOT abandon work mid-step. (If an operator has told you to stay up, honor that and just hold at a clean seam instead.)\n",
+			k(tokens), k(window), pct)
 	default:
 		return fmt.Sprintf(
 			"Context usage: %s/%s (~%.0f%%) — HIGH. Recycle this session now: reach a clean seam, run your handoff (durable notes + work-item updates + memory), then `gc session reset` yourself to resume fresh from that durable state. Repeated compaction degrades awareness — a clean reset beats running to compaction. Do this once you are at a seam; do NOT abandon work mid-step. (If an operator has told you to stay up, honor that and just hold at a clean seam instead of resetting.)\n",
 			k(tokens), k(window), pct)
 	}
+}
+
+// sessionIsEphemeral reports whether this session is a pool worker rather than
+// a configured named identity. gc stamps GC_SESSION_ORIGIN at spawn:
+// "ephemeral" is the default for pool agents (template_resolve.go), and named
+// identities are set to "named" (session_reconciler.go, build_desired_state.go).
+// Anything else — including unset, which is how a manual invocation outside a
+// managed session looks — is treated as named, so the conservative
+// self-reset guidance stays the default.
+func sessionIsEphemeral() bool {
+	return strings.EqualFold(strings.TrimSpace(os.Getenv("GC_SESSION_ORIGIN")), "ephemeral")
 }
 
 func thresholdPct(env string, def int) int {

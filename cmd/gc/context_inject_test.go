@@ -54,6 +54,11 @@ func TestContextInjectAdvisoryBand(t *testing.T) {
 
 func TestContextInjectUrgentBand(t *testing.T) {
 	t.Setenv("GC_INJECT_CONTEXT", "")
+	// Pin the origin: this case is the NAMED (persistent identity) contract.
+	// Without this the assertion would depend on the ambient GC_SESSION_ORIGIN
+	// of whatever session runs the suite — a polecat running `go test` is
+	// "ephemeral" and would legitimately get the other text.
+	t.Setenv("GC_SESSION_ORIGIN", "named")
 	// 900k of 1M = 90% — urgent band.
 	p := writeTranscript(t, usageLine("claude-opus-4-8[1m]", 50_000, 800_000, 50_000))
 	got := contextInjectLine(hookInputFor(p))
@@ -62,6 +67,56 @@ func TestContextInjectUrgentBand(t *testing.T) {
 	}
 	if !strings.Contains(got, "operator") {
 		t.Errorf("urgent line must preserve the operator-stay-up override: %q", got)
+	}
+}
+
+// A pool/ephemeral worker must NOT be told to `gc session reset`: that is the
+// named-identity path. The polecat contract's own path is branch-ready ->
+// refinery (or `gc runtime request-restart`), and `gc session reset` is an
+// unrehearsed instruction for it (sys-ykx0c).
+func TestContextInjectUrgentBandEphemeralUsesHandoffSeam(t *testing.T) {
+	t.Setenv("GC_INJECT_CONTEXT", "")
+	t.Setenv("GC_SESSION_ORIGIN", "ephemeral")
+	p := writeTranscript(t, usageLine("claude-opus-4-8[1m]", 50_000, 800_000, 50_000))
+	got := contextInjectLine(hookInputFor(p))
+	if !strings.Contains(got, "HIGH") {
+		t.Errorf("ephemeral urgent line must still be marked HIGH: %q", got)
+	}
+	// The named tier's imperative must be absent. An explicit PROHIBITION that
+	// names the command is wanted, though — an agent that has read "reset
+	// yourself" elsewhere needs to be told "not you", and a prohibition binds
+	// where silence does not (sys-fbumj).
+	if strings.Contains(got, "then `gc session reset` yourself") {
+		t.Errorf("ephemeral worker must not be given the named-identity reset imperative: %q", got)
+	}
+	if !strings.Contains(got, "do NOT `gc session reset`") {
+		t.Errorf("ephemeral line should explicitly prohibit the reset path, not just omit it: %q", got)
+	}
+	if !strings.Contains(got, "branch-ready") || !strings.Contains(got, "refinery") {
+		t.Errorf("ephemeral urgent line must name the branch-ready -> refinery seam: %q", got)
+	}
+	// sys-t4dfu: uncommitted work in a worktree survives only because the
+	// witness salvage/cleanup scan is inert. The nudge must push to COMMIT
+	// rather than trust the worktree, so this stays correct once that is fixed.
+	if !strings.Contains(got, "commit") {
+		t.Errorf("ephemeral urgent line must direct the worker to commit: %q", got)
+	}
+	if !strings.Contains(got, "operator") {
+		t.Errorf("ephemeral urgent line must preserve the operator-stay-up override: %q", got)
+	}
+}
+
+// The advisory tier is class-independent — it only says "steer toward a seam"
+// and names no reset mechanism, so it must read identically for both origins.
+func TestContextInjectAdvisoryBandIsClassIndependent(t *testing.T) {
+	t.Setenv("GC_INJECT_CONTEXT", "")
+	p := writeTranscript(t, usageLine("claude-opus-4-8[1m]", 50_000, 650_000, 50_000))
+	t.Setenv("GC_SESSION_ORIGIN", "named")
+	named := contextInjectLine(hookInputFor(p))
+	t.Setenv("GC_SESSION_ORIGIN", "ephemeral")
+	ephemeral := contextInjectLine(hookInputFor(p))
+	if named == "" || named != ephemeral {
+		t.Errorf("advisory tier must not vary by session origin:\n named=%q\n ephemeral=%q", named, ephemeral)
 	}
 }
 

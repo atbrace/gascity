@@ -79,6 +79,121 @@ if ! [[ "$go_procs" =~ ^[0-9]+$ && "$go_procs" -gt 0 ]]; then
   exit 1
 fi
 
+# === Total concurrency budget (gcy-bme) ======================================
+# LOCAL_TEST_JOBS and LOCAL_TEST_GO_PROCS are each individually bounded, each
+# individually defensible, and each individually documented above. The hazard
+# lives in their PRODUCT, which until now nothing computed and nothing printed:
+# `xargs -P $local_jobs` runs N jobs concurrently and EACH job is its own
+# `go test -p $go_procs`, so peak concurrent link actions is
+# local_jobs x go_procs.
+#
+# 2026-08-06: that product reached 3 x 4 = 12 concurrent linkers on this 6-core
+# host and drove the 1-minute load average to 251 — worse than the 102 that
+# opened this bead. Note the host has 16 GiB total but only ~6.6 GiB AVAILABLE
+# under a normal agent workload, which is why a total-memory rule of thumb does
+# not protect it and the check below reads available memory instead. Both
+# factors looked safe in isolation, and the plan
+# line this script printed ("LOCAL_TEST_JOBS=3 LOCAL_TEST_GO_PROCS=4") reads as
+# reassuring precisely because 3 and 4 are small numbers. Twelve concurrent
+# ~1.6 GiB links is not a small number. Bounding either factor alone cannot fix
+# this; only the product can be bounded.
+#
+# The binding constraint is MEMORY, not cores: a package's cost is its test
+# binary's LINK, not its compile (gcy-z78 — 58 of 149 test binaries link
+# ~1.6 GiB because their dep graph reaches dolthub/dolt, internal/api peaks at
+# 2.44 GiB), and -p bounds concurrency only, never a single link. So derive the
+# budget from AVAILABLE MEMORY and clamp the product to fit it.
+detect_avail_mib() {
+  if [[ -r /proc/meminfo ]]; then
+    awk '/^MemAvailable:/ { printf "%d\n", $2 / 1024; exit }' /proc/meminfo
+    return
+  fi
+  # macOS: free + inactive + speculative pages are what a new allocation can
+  # actually claim without swapping. Page counts carry a trailing period.
+  vm_stat 2>/dev/null | awk '
+    /page size of/ { for (i = 1; i <= NF; i++) if ($i ~ /^[0-9]+$/) { ps = $i; break } }
+    /^Pages free:/        { f = $3 }
+    /^Pages inactive:/    { iv = $3 }
+    /^Pages speculative:/ { sp = $3 }
+    END {
+      gsub(/\./, "", f); gsub(/\./, "", iv); gsub(/\./, "", sp)
+      if (ps == "") { ps = 4096 }
+      printf "%d\n", (f + iv + sp) * ps / 1048576
+    }'
+}
+
+link_mib="${LOCAL_TEST_LINK_MIB:-1600}"
+mem_reserve_pct="${LOCAL_TEST_MEM_RESERVE_PCT:-25}"
+if ! [[ "$mem_reserve_pct" =~ ^[0-9]+$ && "$mem_reserve_pct" -lt 100 ]]; then
+  echo "LOCAL_TEST_MEM_RESERVE_PCT must be an integer in 0..99" >&2
+  exit 1
+fi
+avail_mib="${LOCAL_TEST_AVAIL_MIB:-$(detect_avail_mib || true)}"
+if ! [[ "$avail_mib" =~ ^[0-9]+$ ]]; then
+  avail_mib=0
+fi
+
+# budget = how many concurrent links memory can hold. 0 means "unknown" — we
+# then refuse to clamp rather than guess, but say so, because a silent no-op
+# here is exactly the class of bug this bead is about.
+if [[ -n "${LOCAL_TEST_MAX_LINKS:-}" ]]; then
+  budget="$LOCAL_TEST_MAX_LINKS"
+  if ! [[ "$budget" =~ ^[0-9]+$ && "$budget" -gt 0 ]]; then
+    echo "LOCAL_TEST_MAX_LINKS must be a positive integer" >&2
+    exit 1
+  fi
+elif [[ "$avail_mib" -gt 0 ]]; then
+  # Reserve headroom. Spending 100% of available memory on linkers is not a
+  # bound, it is a stall: the rest of the machine (and on this host, several
+  # live agent sessions) still needs to allocate, and the estimate itself is
+  # an average — internal/api links at 2.44 GiB, well above the ~1.6 GiB mean.
+  # Observed 2026-08-06 on the first live run of this very check: 1 job x 4
+  # procs = 4 links, est. 6400 MiB against 6568 MiB available, which did NOT
+  # clamp because 4 <= 4. That is 97% of memory committed to linkers and is
+  # exactly the situation this bead exists to prevent.
+  usable_mib=$(( avail_mib * (100 - mem_reserve_pct) / 100 ))
+  budget=$(( usable_mib / link_mib ))
+  if [[ "$budget" -lt 1 ]]; then
+    budget=1
+  fi
+else
+  budget=0
+fi
+
+product=$(( local_jobs * go_procs ))
+if [[ "$budget" -gt 0 && "$product" -gt "$budget" ]]; then
+  new_go=$(( budget / local_jobs ))
+  if [[ "$new_go" -lt 1 ]]; then
+    new_go=1
+  fi
+  new_jobs="$local_jobs"
+  if [[ $(( new_jobs * new_go )) -gt "$budget" ]]; then
+    new_jobs=$(( budget / new_go ))
+    if [[ "$new_jobs" -lt 1 ]]; then
+      new_jobs=1
+    fi
+  fi
+  {
+    echo "test-local-parallel: CLAMPING concurrency to fit memory (gcy-bme)."
+    echo "  requested : ${local_jobs} jobs x ${go_procs} go procs = ${product} concurrent links"
+    echo "  est. peak : $(( product * link_mib )) MiB against ${avail_mib} MiB available (~${link_mib} MiB/link, gcy-z78)"
+    echo "  clamped to: ${new_jobs} jobs x ${new_go} go procs = $(( new_jobs * new_go )) (budget ${budget})"
+    echo "  override  : LOCAL_TEST_MAX_LINKS=<n> to set the budget, LOCAL_TEST_LINK_MIB=<n> if ~${link_mib} MiB/link is wrong."
+  } >&2
+  local_jobs="$new_jobs"
+  go_procs="$new_go"
+  product=$(( local_jobs * go_procs ))
+fi
+
+# Always announce the plan BEFORE fanning out, so a dangerous configuration is
+# visible in advance rather than reconstructed afterwards from `ps`. This line
+# is the one a human or an agent can act on.
+if [[ "$budget" -gt 0 ]]; then
+  echo "test-local-parallel: concurrency plan — ${local_jobs} jobs x ${go_procs} go procs = ${product} concurrent links, est. $(( product * link_mib )) MiB peak, ${avail_mib} MiB available."
+else
+  echo "test-local-parallel: WARNING — could not read available memory, so ${product} concurrent links (${local_jobs} jobs x ${go_procs} go procs, est. $(( product * link_mib )) MiB peak) is UNCLAMPED. Set LOCAL_TEST_MAX_LINKS to bound it."
+fi
+
 gopath_val="$(go env GOPATH)"
 gocache_val="$(go env GOCACHE)"
 gomodcache_val="$(go env GOMODCACHE)"

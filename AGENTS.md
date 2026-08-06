@@ -459,8 +459,14 @@ concurrent builds.
 
 Before considering any task complete:
 
-- Fast unit baseline passes (`make test`, or `make test-fast-parallel` on
-  machines where sharding is useful)
+- Fast unit baseline passes — use `make test-fast-parallel`, which reads
+  `LOCAL_TEST_JOBS`/`LOCAL_TEST_GO_PROCS` and clamps their product to available
+  memory. Plain `make test` is a single unbounded `go test -p ./...` sweep over
+  the whole module including `cmd/gc`; on a memory-constrained host it is the
+  dangerous choice, not the simple one (gcy-bme). This list previously named
+  `make test` first and unqualified, and agents kept picking it.
+  **On a shared or memory-constrained machine, run neither locally — push the
+  sweep to the cluster.**
 - Broader process/integration coverage uses the sharded targets documented in
   `TESTING.md` instead of one monolithic `go test ./...` sweep
 - `go vet ./...` clean

@@ -246,6 +246,7 @@ func buildDoctorChecks(cityPath string, cfg *config.City, cfgErr error, opts bui
 		register(doctor.NewServiceSecretsPermsCheck(cfg, cityPath))
 		register(doctor.NewSkillCollisionCheck(cfg, cityPath))
 		register(doctor.NewSkillDanglingSinkCheck(doctorSkillStaticSinks(cityPath, cfg), materialize.LegacyOwnedRootsFor(cityPath), doctorLiveSessionSinks(cityPath, cfg)))
+		register(doctor.NewOrderExecScriptsCheck(cfg, cityPath))
 		register(doctor.NewOrderFiringCurrentCheck(cfg, cityPath, doctor.WithOrderFiringCurrentLastRunFunc(doctorOrderFiringCurrentLastRunFunc(cityPath, cfg, opts.Stderr))))
 		register(newCodexHooksDriftCheck(cityPath, codexHookWorkDirs(cityPath, cfg)))
 		register(doctor.NewRigPackCoverageCheck(cfg, cityPath))

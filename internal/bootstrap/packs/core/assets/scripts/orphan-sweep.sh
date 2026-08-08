@@ -293,6 +293,20 @@ is_known_agent() {
     # claim. Exact match only: agents that merely start with "human" still
     # resolve through the normal paths below.
     if [ "$name" = "human" ]; then return 0; fi
+    # Any other human identity. `human` is the canonical alias, but it is not
+    # the only operator assignee that reaches a bead: an interactive claim or
+    # assignment by a person stamps the caller's git identity, so real beads
+    # carry display-name assignees like "Austin Brace". None of the identity
+    # forms below can contain whitespace — configured agent names are
+    # validated against ^[a-zA-Z0-9][a-zA-Z0-9_-]*$ (internal/config:
+    # validAgentName), qualified names only add "." and "/", and session
+    # identities are <pack>__<agent>-<sessionid>. So an assignee containing
+    # whitespace provably names no agent and no session; it is a person. Before
+    # this guard the sweep reset those beads to open/unassigned every cycle,
+    # silently stripping the operator's claim on their own in-progress work.
+    case "$name" in
+        *[[:space:]]*) return 0 ;;
+    esac
     # Direct match against a configured agent template name.
     if agent_exists "$name"; then return 0; fi
     # Pool instance: strip trailing -<digits> and check template name.

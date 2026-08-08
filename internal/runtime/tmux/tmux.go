@@ -2000,15 +2000,38 @@ func (t *Tmux) paneBusy(target string) (bool, error) {
 	return paneContainsBusyIndicator(lines), nil
 }
 
+// providersWithVerifiableBusyIndicator lists the provider families whose TUI
+// renders a busy indicator paneContainsBusyIndicator recognizes, so a submit
+// can be confirmed rather than fired blind. Claude was the original ga-bwm
+// case; codex renders the same "esc to interrupt" footer ("• Working (3s ·
+// esc to interrupt)", codex-cli 0.147.0), so a codex pane whose submit Enter
+// is lost is detectable exactly the same way. Providers absent from this list
+// keep best-effort single delivery.
+var providersWithVerifiableBusyIndicator = []string{"claude", "codex"}
+
+func providerHasVerifiableBusyIndicator(provider string) bool {
+	family := sessionlog.ProviderFamily(provider)
+	for _, verifiable := range providersWithVerifiableBusyIndicator {
+		if family == verifiable {
+			return true
+		}
+	}
+	return false
+}
+
 // submitVerifyEligible reports whether the target runs a provider whose busy
-// indicator is reliable enough to confirm a submit. Scoped to the Claude family
-// (the confirmed ga-bwm failure); other providers keep best-effort single
-// delivery so this change cannot regress them.
+// indicator is reliable enough to confirm a submit. A provider that is not
+// listed keeps best-effort single delivery so this cannot regress it.
 func (t *Tmux) submitVerifyEligible(target string) bool {
 	if provider := t.providerEnv(target); provider != "" {
-		return sessionlog.ProviderFamily(provider) == "claude"
+		return providerHasVerifiableBusyIndicator(provider)
 	}
-	return t.targetLooksLikeProvider(target, "claude")
+	for _, verifiable := range providersWithVerifiableBusyIndicator {
+		if t.targetLooksLikeProvider(target, verifiable) {
+			return true
+		}
+	}
+	return false
 }
 
 // nudgeSubmitKeySequence resolves target's declared submit key sequence (see

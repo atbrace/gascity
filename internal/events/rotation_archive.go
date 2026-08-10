@@ -123,15 +123,32 @@ func parseLegacyArchiveBasename(name string) (time.Time, error) {
 	return ts.UTC(), nil
 }
 
-// archiveOverlapsFilter reports whether the archive's seq range can
-// possibly contain events that satisfy filter. The skip-fast read path
-// uses this to avoid gunzipping archives whose entire window has
-// already been excluded by the caller's AfterSeq or BeforeSeq predicate.
+// archiveOverlapsFilter reports whether the archive can possibly contain
+// events that satisfy filter. The skip-fast read path uses this to avoid
+// gunzipping archives whose entire window has already been excluded by the
+// caller's predicates.
+//
+// Both a seq window and a time bound are checked. Gating on seq alone was not
+// enough: a purely TIME-filtered request — `since=5m`, which is what every
+// watcher sends — leaves AfterSeq and BeforeSeq at zero, so nothing could ever
+// be skipped and every archive was gunzipped and re-parsed in full on every
+// call.
 func archiveOverlapsFilter(info archiveInfo, filter Filter) bool {
 	if filter.AfterSeq > 0 && info.LastSeq <= filter.AfterSeq {
 		return false
 	}
 	if filter.BeforeSeq > 0 && info.FirstSeq >= filter.BeforeSeq {
+		return false
+	}
+	// Timestamp is stamped when the archive is CLOSED (recorder.go
+	// rotateLocked), so it is an upper bound on every event inside: a Since
+	// later than the stamp cannot match anything here. Migrated legacy
+	// archives are stamped with migration time, which is later still — a
+	// looser upper bound only skips less often, so the gate stays sound.
+	//
+	// There is deliberately no Until gate: the basename encodes no LOWER time
+	// bound, so an Until can never prove an archive irrelevant.
+	if !filter.Since.IsZero() && info.Timestamp.Before(filter.Since) {
 		return false
 	}
 	return true

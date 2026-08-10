@@ -1,6 +1,9 @@
 package events
 
 import (
+	"fmt"
+	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 )
@@ -136,4 +139,125 @@ func TestArchiveOverlapsFilter(t *testing.T) {
 			}
 		})
 	}
+}
+
+// TestArchiveOverlapsFilterSkipsOnSince pins the TIME gate.
+//
+// An archive's Timestamp is stamped at rotation (recorder.go rotateLocked:
+// ts = time.Now().UTC()), so every event inside it was appended strictly
+// before that moment. A Since later than the stamp therefore cannot match
+// anything in the archive and it must be skipped WITHOUT gunzipping.
+//
+// Why this test exists: the gate used to be seq-only, so a time-filtered
+// request — `since=5m`, which is what every watcher sends — could never skip
+// anything and re-parsed every archive in full on every call.
+func TestArchiveOverlapsFilterSkipsOnSince(t *testing.T) {
+	stamp := time.Date(2026, 5, 7, 0, 0, 0, 0, time.UTC)
+	info := archiveInfo{
+		Basename:  "events.jsonl.archive-20260507T000000Z-seq-100-200.gz",
+		Timestamp: stamp,
+		FirstSeq:  100,
+		LastSeq:   200,
+	}
+	tests := []struct {
+		name string
+		f    Filter
+		want bool
+	}{
+		{"Since after archive stamp skips", Filter{Since: stamp.Add(time.Hour)}, false},
+		{"Since before archive stamp reads", Filter{Since: stamp.Add(-time.Hour)}, true},
+		// Boundary stays inclusive: an event stamped exactly at rotation time
+		// satisfies `e.Ts.Before(Since) == false`, so it would match.
+		{"Since exactly at stamp reads", Filter{Since: stamp}, true},
+		// The basename encodes no LOWER time bound, so Until can never prove an
+		// archive irrelevant. Not gating on it is deliberate, not an oversight.
+		{"Until before archive does not skip", Filter{Until: stamp.Add(-time.Hour)}, true},
+		{"Since skip applies even when the seq range overlaps", Filter{AfterSeq: 100, Since: stamp.Add(time.Hour)}, false},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			got := archiveOverlapsFilter(info, tc.f)
+			if got != tc.want {
+				t.Errorf("overlap = %v, want %v", got, tc.want)
+			}
+		})
+	}
+}
+
+// writeSeqArchive writes a gzipped archive holding events seq 1..n, one second
+// apart starting at base, and returns its path.
+func writeSeqArchive(t *testing.T, dir string, n int, base time.Time) string {
+	t.Helper()
+
+	var body strings.Builder
+	for seq := 1; seq <= n; seq++ {
+		ts := base.Add(time.Duration(seq) * time.Second).UTC().Format(time.RFC3339Nano)
+		fmt.Fprintf(&body, `{"seq":%d,"type":"t","ts":%q,"actor":"a"}`+"\n", seq, ts)
+	}
+	path := filepath.Join(dir, formatArchiveBasename(base.Add(time.Duration(n+1)*time.Second), 1, uint64(n)))
+	writeGzipFile(t, path, body.String())
+	return path
+}
+
+// TestStreamArchiveHonorsFilter pins that streamArchive USES its Filter
+// argument. It used to be declared as `_ Filter` and discarded outright, so
+// every call decoded the whole archive even when the caller had already
+// bounded the window it wanted.
+//
+// The early exit is keyed on SEQ only. The log is append-only and seq-ordered
+// by construction, so "every later line has a higher seq" is guaranteed;
+// wall-clock ordering is not (a clock adjustment could invert two adjacent
+// timestamps), and exiting early on Until would silently drop events.
+func TestStreamArchiveHonorsFilter(t *testing.T) {
+	base := time.Date(2026, 5, 7, 0, 0, 0, 0, time.UTC)
+	path := writeSeqArchive(t, t.TempDir(), 5, base)
+
+	collect := func(f Filter) []uint64 {
+		t.Helper()
+		var seen []uint64
+		if err := streamArchive(path, f, func(e Event) bool {
+			seen = append(seen, e.Seq)
+			return true
+		}); err != nil {
+			t.Fatalf("streamArchive: %v", err)
+		}
+		return seen
+	}
+
+	t.Run("stops at BeforeSeq instead of decoding the tail", func(t *testing.T) {
+		got := collect(Filter{BeforeSeq: 3})
+		want := []uint64{1, 2}
+		if fmt.Sprint(got) != fmt.Sprint(want) {
+			t.Errorf("decoded %v, want %v — the tail past BeforeSeq must not be decoded", got, want)
+		}
+	})
+
+	t.Run("empty filter still streams everything", func(t *testing.T) {
+		got := collect(Filter{})
+		want := []uint64{1, 2, 3, 4, 5}
+		if fmt.Sprint(got) != fmt.Sprint(want) {
+			t.Errorf("decoded %v, want %v", got, want)
+		}
+	})
+
+	t.Run("Until does not truncate the stream", func(t *testing.T) {
+		got := collect(Filter{Until: base.Add(2 * time.Second)})
+		want := []uint64{1, 2, 3, 4, 5}
+		if fmt.Sprint(got) != fmt.Sprint(want) {
+			t.Errorf("decoded %v, want %v — Until must not drive the early exit", got, want)
+		}
+	})
+
+	t.Run("fn abort still wins", func(t *testing.T) {
+		var seen []uint64
+		if err := streamArchive(path, Filter{}, func(e Event) bool {
+			seen = append(seen, e.Seq)
+			return e.Seq < 2
+		}); err != nil {
+			t.Fatalf("streamArchive: %v", err)
+		}
+		if fmt.Sprint(seen) != fmt.Sprint([]uint64{1, 2}) {
+			t.Errorf("decoded %v, want [1 2]", seen)
+		}
+	})
 }

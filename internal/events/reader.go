@@ -323,7 +323,15 @@ func archiveFilesIn(dir string) ([]archiveInfo, error) {
 // as an Event and invoking fn for every event. fn returns false to
 // abort iteration early. Returns nil if iteration completed cleanly
 // or fn requested abort; errors from gzip / scanner are wrapped.
-func streamArchive(path string, _ Filter, fn func(Event) bool) error {
+//
+// filter bounds the scan: once the stream has passed the caller's upper seq
+// bound there is nothing left to find, so the remaining lines are neither
+// decoded nor handed to fn. The bound is SEQ-ONLY on purpose. The log is
+// append-only and seq-ordered by construction, so "every later line has a
+// higher seq" holds; wall-clock ordering does not (a clock adjustment can
+// invert adjacent timestamps), and exiting early on Until would silently drop
+// events. Time filtering therefore stays with matchesFilter in the caller.
+func streamArchive(path string, filter Filter, fn func(Event) bool) error {
 	f, err := os.Open(path)
 	if err != nil {
 		return err
@@ -342,6 +350,9 @@ func streamArchive(path string, _ Filter, fn func(Event) bool) error {
 		var e Event
 		if err := json.Unmarshal(scanner.Bytes(), &e); err != nil {
 			continue
+		}
+		if filter.BeforeSeq > 0 && e.Seq >= filter.BeforeSeq {
+			return nil
 		}
 		if !fn(e) {
 			return nil

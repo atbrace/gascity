@@ -30,6 +30,21 @@ var ErrUnknownRuntime = errors.New("unknown runtime provider")
 // (e.g. "exec:/path/to/script") and own its parsing.
 type Factory func(name string, sc config.SessionConfig, cityName, cityPath string) (runtime.Provider, error)
 
+// Resolver is the read-only resolution surface of a Registry. It exists so a
+// composite provider (hybrid, RUNTIME-SEL-014) can resolve its remote arm
+// against the registry it was registered in without holding a reference that
+// could mutate the catalog: the providerledger guard sanctions exactly one
+// registry escape from buildRuntimeRegistry — an explicit conversion to this
+// type — so the runtime catalog stays statically enumerable by construction.
+// Keep it resolution-only: no method may mutate the registry or expose a type
+// from which Register/RegisterPrefix/SetFallback is reachable.
+// TestResolverMethodSetIsResolutionOnly enforces the method set.
+type Resolver interface {
+	// NewStrict resolves name without consulting the fallback; an
+	// unregistered name is an error. See [Registry.NewStrict].
+	NewStrict(name string, sc config.SessionConfig, cityName, cityPath string) (runtime.Provider, error)
+}
+
 // Registry maps runtime selection names to provider factories.
 // The zero value is not usable; call [New].
 type Registry struct {
@@ -38,6 +53,8 @@ type Registry struct {
 	prefixes map[string]Factory
 	fallback Factory
 }
+
+var _ Resolver = (*Registry)(nil)
 
 // New returns an empty Registry.
 func New() *Registry {

@@ -448,6 +448,7 @@ func DiscoverRuntimeCatalog(source []byte) ([]RuntimeRegistration, error) {
 	if discoverErr != nil {
 		return nil, discoverErr
 	}
+	markResolverConversionUses(target.Body, registryObject, allowedRegistryUses, imports, bindings)
 	if err := validateBoundObjectUses(target.Body, registryObject, allowedRegistryUses, bindings, "registry binding escapes direct catalog operations"); err != nil {
 		return nil, err
 	}
@@ -566,6 +567,52 @@ func directTopLevelCalls(body *ast.BlockStmt) map[*ast.CallExpr]bool {
 		})
 	}
 	return calls
+}
+
+// The one sanctioned escape for the registry binding outside direct catalog
+// operations: an explicit conversion to the read-only resolution interface,
+// registry.Resolver. Resolution cannot extend the catalog, so passing the
+// converted value on preserves static enumerability BY TYPE — the compiler
+// guarantees the receiver can demand at most Resolver's method set. Matching
+// is on the conversion TYPE (import path + name), never on parameter name,
+// position, or the identity of the function receiving the value, so a
+// mutation-capable escape cannot copy the shape.
+const (
+	resolverConversionPackage = moduleImportPath + "/internal/runtime/registry"
+	resolverConversionName    = "Resolver"
+)
+
+// markResolverConversionUses allows registry-binding idents that appear as the
+// sole argument of an explicit registry.Resolver conversion. Every other use
+// outside direct catalog operations still fails validateBoundObjectUses.
+func markResolverConversionUses(body *ast.BlockStmt, object types.Object, allowed map[*ast.Ident]bool, imports map[string]string, bindings *bindingInfo) {
+	ast.Inspect(body, func(node ast.Node) bool {
+		call, ok := node.(*ast.CallExpr)
+		if !ok || len(call.Args) != 1 {
+			return true
+		}
+		selector, ok := call.Fun.(*ast.SelectorExpr)
+		if !ok || selector.Sel.Name != resolverConversionName {
+			return true
+		}
+		qualifier, ok := selector.X.(*ast.Ident)
+		if !ok {
+			return true
+		}
+		// Mirror resolveCallSymbol's shadow check: the qualifier must be the
+		// genuine imported package, so a local binding cannot smuggle a
+		// lookalike conversion past the type match.
+		pkgName, ok := bindings.ObjectOf(qualifier).(*types.PkgName)
+		if !ok || pkgName.Imported().Path() != resolverConversionPackage || imports[qualifier.Name] != resolverConversionPackage {
+			return true
+		}
+		arg, ok := call.Args[0].(*ast.Ident)
+		if !ok || bindings.ObjectOf(arg) != object {
+			return true
+		}
+		allowed[arg] = true
+		return true
+	})
 }
 
 func validateBoundObjectUses(body *ast.BlockStmt, object types.Object, allowed map[*ast.Ident]bool, bindings *bindingInfo, message string) error {

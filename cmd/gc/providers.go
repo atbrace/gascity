@@ -1136,7 +1136,7 @@ func hybridRemoteName(sc config.SessionConfig) string {
 // name is a construction error, because the registry's fallback is tmux and a
 // "remote" arm that silently became local would run remote-matched sessions
 // on the control-plane host with nothing to distinguish it from success.
-func newHybridProvider(reg *registry.Registry, sc config.SessionConfig, cityName, cityPath string) (runtime.Provider, error) {
+func newHybridProvider(reg registry.Resolver, sc config.SessionConfig, cityName, cityPath string) (runtime.Provider, error) {
 	// Cut-over: hybrid routes to seam-backed providers, so hybrid-routed
 	// sessions flow through the seams like every other path.
 	local := sessiontmux.NewSeamBackedWithConfig(tmuxConfigFromSession(sc, cityName, cityPath))

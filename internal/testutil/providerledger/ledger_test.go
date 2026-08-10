@@ -1622,3 +1622,103 @@ func repoRoot(t *testing.T) string {
 		dir = parent
 	}
 }
+
+// The registry may escape buildRuntimeRegistry only through an explicit
+// conversion to the read-only registry.Resolver interface (the composite
+// hybrid provider resolves its remote arm through it, RUNTIME-SEL-014).
+// Anything else that hands the binding out must still fail.
+func TestDiscoverRuntimeCatalogSanctionsResolverConversionEscape(t *testing.T) {
+	source := []byte(`package main
+import (
+	registryalias "github.com/gastownhall/gascity/internal/runtime/registry"
+	runtimealias "github.com/gastownhall/gascity/internal/runtime"
+)
+func buildRuntimeRegistry() {
+	r := registryalias.New()
+	factory := func() { return runtimealias.NewFake(), nil }
+	must(r.Register("fake", factory))
+	must(r.Register("hybrid", func() {
+		return newHybridProvider(registryalias.Resolver(r)), nil
+	}))
+	r.SetFallback(factory)
+	return r
+}`)
+
+	registrations, err := DiscoverRuntimeCatalog(source)
+	if err != nil {
+		t.Fatalf("DiscoverRuntimeCatalog() error = %v, want sanctioned Resolver conversion to pass", err)
+	}
+	if len(registrations) != 2 {
+		t.Fatalf("registrations = %d, want 2", len(registrations))
+	}
+}
+
+func TestDiscoverRuntimeCatalogStillRejectsUnconvertedRegistryEscape(t *testing.T) {
+	source := []byte(`package main
+import (
+	registryalias "github.com/gastownhall/gascity/internal/runtime/registry"
+	runtimealias "github.com/gastownhall/gascity/internal/runtime"
+)
+func buildRuntimeRegistry() {
+	r := registryalias.New()
+	factory := func() { return runtimealias.NewFake(), nil }
+	must(r.Register("fake", factory))
+	must(r.Register("hybrid", func() {
+		return newHybridProvider(r), nil
+	}))
+	r.SetFallback(factory)
+	return r
+}`)
+
+	_, err := DiscoverRuntimeCatalog(source)
+	if err == nil || !strings.Contains(err.Error(), "escapes direct catalog operations") {
+		t.Fatalf("DiscoverRuntimeCatalog() error = %v, want registry-escape error for the unconverted argument", err)
+	}
+}
+
+func TestDiscoverRuntimeCatalogRejectsResolverConversionFromForeignPackage(t *testing.T) {
+	source := []byte(`package main
+import (
+	registryalias "github.com/gastownhall/gascity/internal/runtime/registry"
+	otheralias "github.com/gastownhall/gascity/internal/runtime"
+)
+func buildRuntimeRegistry() {
+	r := registryalias.New()
+	factory := func() { return otheralias.NewFake(), nil }
+	must(r.Register("fake", factory))
+	must(r.Register("hybrid", func() {
+		return newHybridProvider(otheralias.Resolver(r)), nil
+	}))
+	r.SetFallback(factory)
+	return r
+}`)
+
+	_, err := DiscoverRuntimeCatalog(source)
+	if err == nil || !strings.Contains(err.Error(), "escapes direct catalog operations") {
+		t.Fatalf("DiscoverRuntimeCatalog() error = %v, want registry-escape error for a foreign Resolver type", err)
+	}
+}
+
+func TestDiscoverRuntimeCatalogRejectsShadowedResolverConversionQualifier(t *testing.T) {
+	source := []byte(`package main
+import (
+	registryalias "github.com/gastownhall/gascity/internal/runtime/registry"
+	runtimealias "github.com/gastownhall/gascity/internal/runtime"
+)
+func buildRuntimeRegistry() {
+	r := registryalias.New()
+	factory := func() { return runtimealias.NewFake(), nil }
+	must(r.Register("fake", factory))
+	must(r.Register("hybrid", func() {
+		registryalias := localConverter{}
+		return newHybridProvider(registryalias.Resolver(r)), nil
+	}))
+	r.SetFallback(factory)
+	return r
+}`)
+
+	_, err := DiscoverRuntimeCatalog(source)
+	if err == nil || !strings.Contains(err.Error(), "escapes direct catalog operations") {
+		t.Fatalf("DiscoverRuntimeCatalog() error = %v, want registry-escape error for a shadowed conversion qualifier", err)
+	}
+}

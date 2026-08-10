@@ -88,7 +88,15 @@ func buildRuntimeRegistry() *registry.Registry {
 		}
 		return sessionherdr.New(session, providerStateDir("herdr", cityPath), cityPath), nil
 	}))
-	must(r.Register(hybridRuntimeName, hybridFactory(r)))
+	// The providerledger guard requires a literal key and an inline factory
+	// whose constructor is a direct declared-function call, and it sanctions
+	// the registry escaping catalog operations ONLY through an explicit
+	// conversion to the read-only registry.Resolver — resolution cannot extend
+	// the catalog, so static enumerability holds by type. hybridRuntimeName
+	// mirrors the literal key below.
+	must(r.Register("hybrid", func(_ string, sc config.SessionConfig, cityName, cityPath string) (runtime.Provider, error) {
+		return newHybridProvider(registry.Resolver(r), sc, cityName, cityPath)
+	}))
 	must(r.RegisterPrefix("exec:", func(name string, _ config.SessionConfig, _, _ string) (runtime.Provider, error) {
 		script := strings.TrimPrefix(name, "exec:")
 		if isLegacyT3BridgeExecScript(script) {
@@ -126,7 +134,7 @@ const hybridRuntimeName = "hybrid"
 // arm resolves against the same registry hybrid was resolved from: builtins
 // for the process-global registry, builtins plus pack-declared runtimes for a
 // per-city clone.
-func hybridFactory(reg *registry.Registry) registry.Factory {
+func hybridFactory(reg registry.Resolver) registry.Factory {
 	return func(_ string, sc config.SessionConfig, cityName, cityPath string) (runtime.Provider, error) {
 		return newHybridProvider(reg, sc, cityName, cityPath)
 	}

@@ -13,10 +13,11 @@ import (
 )
 
 // buildBusyOnEnterBinary compiles a fake agent TUI that echoes stdin and, after
-// receiving GC_TEST_BUSY_AFTER Enter keystrokes (default 1), prints an
-// "esc to interrupt" busy footer — the same signal paneContainsBusyIndicator
-// uses to detect a live Claude turn. Each Enter also prints an "ENTER#<n>"
-// marker so a test can assert exactly how many submit keystrokes were delivered.
+// receiving GC_TEST_BUSY_AFTER Enter keystrokes (default 1), prints a busy
+// footer — GC_TEST_BUSY_LINE, defaulting to bare "esc to interrupt" — the same
+// signal paneContainsBusyIndicator uses to detect a live Claude turn. Each
+// Enter also prints an "ENTER#<n>" marker so a test can assert exactly how many
+// submit keystrokes were delivered.
 func buildBusyOnEnterBinary(t *testing.T, dir, name string) string {
 	t.Helper()
 	bin := dir + "/" + name
@@ -26,6 +27,8 @@ import ("bufio";"fmt";"os";"strconv")
 func main(){
 	busyAfter:=1
 	if v:=os.Getenv("GC_TEST_BUSY_AFTER"); v!=""{ if n,err:=strconv.Atoi(v); err==nil && n>0 { busyAfter=n } }
+	busyLine:=os.Getenv("GC_TEST_BUSY_LINE")
+	if busyLine==""{ busyLine="esc to interrupt" }
 	enters:=0
 	r:=bufio.NewReader(os.Stdin)
 	for{
@@ -34,7 +37,7 @@ func main(){
 		if b=='\r'||b=='\n'{
 			enters++
 			fmt.Printf("\nENTER#%d\n", enters)
-			if enters>=busyAfter { fmt.Print("esc to interrupt\n") }
+			if enters>=busyAfter { fmt.Print(busyLine+"\n") }
 			continue
 		}
 		_,_=os.Stdout.Write([]byte{b})
@@ -75,6 +78,46 @@ func TestNudgeSessionConfirmsSubmitForClaude(t *testing.T) {
 	time.Sleep(300 * time.Millisecond)
 
 	if err := tm.NudgeSession(sessionName, "hello-confirm"); err != nil {
+		t.Fatalf("NudgeSession: %v", err)
+	}
+
+	out, err := tm.CapturePaneAll(sessionName)
+	if err != nil {
+		t.Fatalf("CapturePaneAll: %v", err)
+	}
+	if !strings.Contains(out, "esc to interrupt") {
+		t.Fatalf("pane never reached submitted/busy state:\n%s", out)
+	}
+	if strings.Contains(out, "ENTER#2") {
+		t.Fatalf("issued a redundant Enter after the turn already submitted (double-submit):\n%s", out)
+	}
+}
+
+// TestNudgeSessionConfirmsSubmitForCodex is the codex counterpart: with codex
+// on the verified-submit path, a pane that renders codex's own busy footer
+// ("• Working (1s • esc to interrupt)", codex-cli 0.147.0) must confirm on the
+// first Enter — NudgeSession returns nil and issues no redundant second Enter.
+func TestNudgeSessionConfirmsSubmitForCodex(t *testing.T) {
+	if !hasTmux() {
+		t.Skip("tmux not installed")
+	}
+	tm := testTmux()
+	dir := t.TempDir()
+	fake := buildBusyOnEnterBinary(t, dir, "fakecodex")
+	sessionName := fmt.Sprintf("gt-test-nudge-confirm-codex-%d", time.Now().UnixNano()%100000)
+
+	_ = tm.KillSession(sessionName)
+	if err := tm.NewSessionWithCommandAndEnv(sessionName, dir, fake, map[string]string{
+		"GC_PROVIDER":        "codex",
+		"GC_TEST_BUSY_AFTER": "1",
+		"GC_TEST_BUSY_LINE":  "• Working (1s • esc to interrupt)",
+	}); err != nil {
+		t.Fatalf("NewSessionWithCommandAndEnv: %v", err)
+	}
+	defer func() { _ = tm.KillSession(sessionName) }()
+	time.Sleep(300 * time.Millisecond)
+
+	if err := tm.NudgeSession(sessionName, "hello-confirm-codex"); err != nil {
 		t.Fatalf("NudgeSession: %v", err)
 	}
 

@@ -2372,7 +2372,13 @@ func TestNudgeSessionSkipsEscapeForCodex(t *testing.T) {
 	defer func() { _ = tm.KillSession(sessionName) }()
 	time.Sleep(300 * time.Millisecond)
 
-	if err := tm.NudgeSession(sessionName, "hello"); err != nil {
+	// The "codex" provider is submit-verify-eligible, so NudgeSession waits to
+	// observe a busy indicator before reporting success — but the fake command
+	// here is plain `cat -v`, which can never produce one. That makes
+	// ErrNudgeSubmitUnconfirmed the correct, expected outcome. This test only
+	// cares whether Escape was sent before the paste, which is unaffected by
+	// the confirm outcome.
+	if err := tm.NudgeSession(sessionName, "hello"); err != nil && !errors.Is(err, ErrNudgeSubmitUnconfirmed) {
 		t.Fatalf("NudgeSession: %v", err)
 	}
 	time.Sleep(300 * time.Millisecond)
@@ -2433,7 +2439,11 @@ func main() {
 	defer func() { _ = tm.KillSession(sessionName) }()
 	time.Sleep(300 * time.Millisecond)
 
-	if err := tm.NudgeSession(sessionName, "hello"); err != nil {
+	// The codex process-sniff fallback makes this target submit-verify-eligible
+	// too, so NudgeSession waits for a busy indicator the byte-echo fixture can
+	// never render. ErrNudgeSubmitUnconfirmed is the expected outcome; the
+	// Escape assertion below is what this test is actually about.
+	if err := tm.NudgeSession(sessionName, "hello"); err != nil && !errors.Is(err, ErrNudgeSubmitUnconfirmed) {
 		t.Fatalf("NudgeSession: %v", err)
 	}
 	time.Sleep(300 * time.Millisecond)

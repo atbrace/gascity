@@ -9,6 +9,7 @@ import (
 	"sort"
 	"strconv"
 	"strings"
+	"sync/atomic"
 
 	"github.com/BurntSushi/toml"
 	"github.com/gastownhall/gascity/internal/agentutil"
@@ -18,6 +19,13 @@ import (
 	"github.com/gastownhall/gascity/internal/fsys"
 	"github.com/spf13/cobra"
 )
+
+// loadCityConfigCalls counts every full TOML load performed by
+// loadCityConfigFS (city.toml + all pack includes). Store-open call sites on
+// hot per-tick paths (order dispatch) must reuse an already-resolved
+// *config.City instead of driving this counter once per scope per tick
+// (ga-237xpr) — tests assert on this counter to guard against a regression.
+var loadCityConfigCalls atomic.Int64
 
 const agentAddPromptScaffold = `You are the {{ .AgentName }} agent.
 
@@ -37,6 +45,7 @@ func loadCityConfig(cityPath string, warningWriter ...io.Writer) (*config.City, 
 // filesystem implementation. Used by functions that take an fsys.FS parameter
 // for unit testing.
 func loadCityConfigFS(fs fsys.FS, tomlPath string, warningWriter ...io.Writer) (*config.City, error) {
+	loadCityConfigCalls.Add(1)
 	if err := ensureBuiltinPacksForConfigLoad(fs, tomlPath, resolveLoadCityConfigWarningWriter(warningWriter...)); err != nil {
 		return nil, err
 	}

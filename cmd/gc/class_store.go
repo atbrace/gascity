@@ -2,6 +2,7 @@ package main
 
 import (
 	"fmt"
+	"io"
 	"os"
 
 	"github.com/gastownhall/gascity/internal/beads"
@@ -9,6 +10,7 @@ import (
 	"github.com/gastownhall/gascity/internal/coordclass"
 	"github.com/gastownhall/gascity/internal/events"
 	"github.com/gastownhall/gascity/internal/extmsg"
+	"github.com/gastownhall/gascity/internal/formula"
 	"github.com/gastownhall/gascity/internal/mail"
 	"github.com/gastownhall/gascity/internal/session"
 )
@@ -61,18 +63,17 @@ func (cs *controllerState) nudgesBeadStore() beads.NudgesStore {
 }
 
 // ordersBeadStore returns the store that owns order-tracking bookkeeping beads
-// for the given scope (rig name, or "" for the city): the configured orders class
-// store when [beads.classes.orders] relocates orders, else the work store. The
-// scope is accepted so a future per-scope orders backend can route without a
-// call-site change. Identity to the work store at the default bd backend;
-// returned as the strongly-typed beads.OrdersStore so the orders class stays
-// statically visible. This is the city-scope simple case; per-order scope
-// (rig/pool-routed orders) resolves PER ORDER through resolveOrderStoreTarget
-// (the federated dispatch/sweep paths in order_store.go / order_dispatch.go).
+// for the given scope (rig name, or "" for the city). It delegates to the
+// exported OrdersBeadStore() accessor so the api.State surface and the
+// controller's own callers share one resolver. The scope is accepted so a future
+// per-scope orders backend can route without a call-site change. Identity to the
+// work store at the default bd backend; returned as the strongly-typed
+// beads.OrdersStore so the orders class stays statically visible. This is the
+// city-scope simple case; per-order scope (rig/pool-routed orders) resolves PER
+// ORDER through resolveOrderStoreTarget (the federated dispatch/sweep paths in
+// order_store.go / order_dispatch.go).
 func (cs *controllerState) ordersBeadStore(_ string) beads.OrdersStore {
-	cs.mu.RLock()
-	defer cs.mu.RUnlock()
-	return beads.OrdersStore{Store: resolveOrderStore(cs.storageRoutes, cs.cityBeadStore, cs.cfg, cs.cityPath, cs.eventProv)}
+	return cs.OrdersBeadStore()
 }
 
 // cityWorkStore returns the city-level store for ordinary WORK-class beads that
@@ -144,6 +145,16 @@ func (cr *CityRuntime) nudgesBeadStore() beads.NudgesStore {
 // in the federated dispatch/sweep paths.
 func (cr *CityRuntime) ordersBeadStore(_ string) beads.OrdersStore {
 	return beads.OrdersStore{Store: resolveOrderStore(cr.storageRoutes, cr.cityBeadStore(), cr.cfg, cr.cityPath, cr.rec)}
+}
+
+// relocatedOrdersStore returns the runtime's ORDERS-class binding store when
+// [storage] relocates the orders class, and nil when it does not — the
+// controller-side twin of relocatedOrdersClassStore (order_store.go), resolved
+// through the routes this process opened at boot rather than the one-shot CLI
+// funnel. nil is what keeps a federation on a single-store city byte-identical:
+// there is no second store to add.
+func (cr *CityRuntime) relocatedOrdersStore() beads.Store {
+	return resolveOrderStore(cr.storageRoutes, nil, cr.cfg, cr.cityPath, cr.rec)
 }
 
 // cityWorkStore returns the runtime's city-level WORK-class bead store. Work is
@@ -306,6 +317,55 @@ func resolveGraphStore(routes *storageRoutes, workStore beads.Store, cfg *config
 	return resolveClassStore(routes, workStore, cfg, cityPath, config.BeadClassGraph, rec)
 }
 
+// moleculeClassStore returns the store a compiled recipe's molecule must be
+// materialized in: graphStore when the beads instantiating it produces are
+// graph class, and the caller's own scope/work store otherwise.
+//
+// The question is the CLASSIFIER'S, not the compiler's. Routing on "did this
+// formula use the v2 compiler" is wrong in both directions. A v1 formula that
+// is root-only — `phase = "vapor"`, or no [[steps]] at all — compiles to a root
+// carrying gc.kind=wisp (internal/formula/compile.go), and that is the first
+// arm coordclass.Classify tests, so the bead is ClassGraph and belongs in the
+// binding. A v1 POURED formula compiles to a molecule container whose every
+// bead is ClassWork, and work stays on the work ledger even in a split city —
+// relocating it hides the steps from every work-scope reader, `gc hook`
+// included.
+func moleculeClassStore(recipe *formula.Recipe, workStore, graphStore beads.Store) beads.Store {
+	if recipeCoordClass(recipe) == coordclass.ClassGraph {
+		return graphStore
+	}
+	return workStore
+}
+
+// recipeCoordClass returns the coordination class of the beads that
+// instantiating recipe produces.
+//
+// molecule.Instantiate materializes a recipe as one atomic plan, so the plan is
+// classified wholesale exactly as coordclass.ClassifyGraphPlan does: a single
+// graph-marked node makes the whole molecule graph class, which keeps its
+// intra-plan edges inside one store. Steps a RootOnly recipe never creates are
+// skipped, matching the instantiate loop's own `if recipe.RootOnly && i > 0`
+// break.
+func recipeCoordClass(recipe *formula.Recipe) coordclass.Class {
+	if recipe == nil {
+		return coordclass.ClassWork
+	}
+	for i, step := range recipe.Steps {
+		if recipe.RootOnly && i > 0 {
+			break
+		}
+		stepType := step.Type
+		if stepType == "" {
+			stepType = "task"
+		}
+		bead := beads.Bead{Type: stepType, Labels: step.Labels, Metadata: step.Metadata}
+		if coordclass.Classify(bead) == coordclass.ClassGraph {
+			return coordclass.ClassGraph
+		}
+	}
+	return coordclass.ClassWork
+}
+
 // graphClassBinding returns the store these routes serve the graph class from,
 // and whether they relocate it at all — the same question resolveClassStore asks
 // to choose its branch, exposed for the callers that must BEHAVE differently
@@ -315,6 +375,34 @@ func resolveGraphStore(routes *storageRoutes, workStore beads.Store, cfg *config
 // relocated store and an unrelocated one are both just a beads.Store.
 func graphClassBinding(routes *storageRoutes) (beads.Store, bool) {
 	return routes.storeFor(coordclassFor(config.BeadClassGraph))
+}
+
+// cityQueryTopology answers the two questions a generated work_query or
+// pool-demand command has to be built against: the bd semantics the city is
+// configured for, and whether its claimable work is spread across stores a
+// single `bd ready` in the agent's work directory cannot reach.
+//
+// The second question is graphClassBinding's, not config's, and the difference
+// is not academic. storageSplitShapeOf reads [storage] alone and answers "no
+// split" for a city whose section was DELETED after it had already served one —
+// the exact edit storage_boot.go's bypass note exists to catch. That city's
+// graph beads are in a binding, its boot refuses, and its routes serve every
+// infrastructure class from refusedClassStore; asking config would build it a
+// `bd ready` command that reads the work ledger and reports "no work" forever,
+// while asking the routes builds it the federated command, which fails loud with
+// the refusal that names the remedy. Same authority as resolveClassStore, same
+// answer, one place.
+//
+// A nil cfg still resolves the routes: cliStorageRoutes reads the city's own
+// city.toml rather than the caller's snapshot, precisely because where a city
+// serves its classes from is a property of the CITY.
+func cityQueryTopology(cityPath string, cfg *config.City) config.QueryTopology {
+	topo := config.QueryTopology{}
+	if cfg != nil {
+		topo.Beads = cfg.Beads
+	}
+	_, topo.FederatedReady = graphClassBinding(cliStorageRoutes(cityPath))
+	return topo
 }
 
 // newCityMailProvider builds the controller's mail provider as a two-store mail
@@ -355,4 +443,29 @@ func newCityExtMsgServices(routes *storageRoutes, workStore beads.Store, cfg *co
 		return &unrouted
 	}
 	return &svc
+}
+
+// warnFederationBlindOverrides tells an operator that this agent's own
+// work_query or scale_check will not see the city's relocated coordination
+// class.
+//
+// A custom query is returned verbatim, which is the contract and is not being
+// changed here. What is being changed is the SILENCE around it: on a split city
+// the generated query reads every store and the operator's does not, so the two
+// disagree about what is claimable and the override's answer is a short array
+// with nothing to distinguish it from an empty queue. That is the precise
+// failure the federated reader exits non-zero to close, and an override walks
+// straight back into it.
+//
+// Nothing is printed on a city that relocates nothing, which is every city with
+// no [storage] section: FederationBlindOverrides returns nil there, so the
+// diagnostic cannot become per-tick noise on a legacy deployment.
+func warnFederationBlindOverrides(stderr io.Writer, a *config.Agent, topo config.QueryTopology) {
+	if stderr == nil || a == nil {
+		return
+	}
+	for _, key := range a.FederationBlindOverrides(topo) {
+		fmt.Fprintf(stderr, "gc hook: agent %q sets a custom %s, which reads one store; this city serves a coordination class from a relocated binding, so that command cannot see graph-class work (the generated query uses %q)\n", //nolint:errcheck // best-effort stderr
+			a.QualifiedName(), key, "gc ready")
+	}
 }

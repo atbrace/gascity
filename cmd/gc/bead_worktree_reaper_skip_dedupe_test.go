@@ -11,13 +11,19 @@ import (
 
 	"github.com/gastownhall/gascity/internal/beads"
 	"github.com/gastownhall/gascity/internal/events"
-	"github.com/gastownhall/gascity/internal/pathutil"
 )
 
 // skipReasonsFor returns, in order, the reasons carried by every
 // bead.worktree.reap_skipped event the fake recorded for worktreePath.
+//
+// Paths are matched canonically, not by raw string equality. The reaper
+// discovers worktrees through `git worktree list --porcelain`, and git reports
+// a fully symlink-resolved path — on macOS the /private/var spelling of the
+// /var path these tests build from t.TempDir(). Both spellings name the same
+// worktree, so comparing them raw found nothing on that host.
 func skipReasonsFor(t *testing.T, fake *events.Fake, worktreePath string) []string {
 	t.Helper()
+	want := canonicalTestPath(worktreePath)
 	var reasons []string
 	for _, e := range fake.Events {
 		if e.Type != events.BeadWorktreeReapSkipped {
@@ -27,7 +33,7 @@ func skipReasonsFor(t *testing.T, fake *events.Fake, worktreePath string) []stri
 		if err := json.Unmarshal(e.Payload, &p); err != nil {
 			t.Fatalf("unmarshal reap_skipped payload: %v", err)
 		}
-		if p.Path == worktreePath {
+		if canonicalTestPath(p.Path) == want {
 			reasons = append(reasons, p.Reason)
 		}
 	}
@@ -37,10 +43,18 @@ func skipReasonsFor(t *testing.T, fake *events.Fake, worktreePath string) []stri
 // countStderrProtecting returns how many "protecting" lines the reaper wrote
 // for worktreePath, so the log sink can be asserted on the same edge as the
 // event sink.
+// Paths are compared canonically for the same reason as skipReasonsFor: the
+// logged path is git's symlink-resolved spelling, not the one the test built.
 func countStderrProtecting(stderr string, worktreePath string) int {
+	want := canonicalTestPath(worktreePath)
 	n := 0
 	for _, line := range strings.Split(stderr, "\n") {
-		if strings.Contains(line, "protecting") && strings.Contains(line, worktreePath) {
+		_, rest, found := strings.Cut(line, "protecting ")
+		if !found {
+			continue
+		}
+		logged, _, _ := strings.Cut(rest, " (bead ")
+		if canonicalTestPath(logged) == want {
 			n++
 		}
 	}
@@ -58,7 +72,7 @@ func TestReapSkipTracker_SuppressesUnchangedRepeats(t *testing.T) {
 	wt := addClosedWorktree(t, rigRoot, cityPath, "builder", "ga-dedup01")
 	store := beads.NewMemStoreFrom(1, []beads.Bead{{ID: "ga-dedup01", Status: "closed"}}, nil)
 	cfg := reapTestConfig(rigRoot)
-	injectLiveness(t, liveWorktreeState{scanned: true, cwds: []string{pathutil.NormalizePathForCompare(wt)}})
+	injectLiveness(t, liveWorktreeState{scanned: true, cwds: []string{canonicalTestPath(wt)}})
 
 	fake := events.NewFake()
 	skips := newReapSkipTracker()
@@ -102,7 +116,7 @@ func TestReapSkipTracker_ReemitsWhenReasonChanges(t *testing.T) {
 	var stderr bytes.Buffer
 
 	// Pass 1 + 2: protected because a live process sits in the tree.
-	injectLiveness(t, liveWorktreeState{scanned: true, cwds: []string{pathutil.NormalizePathForCompare(wt)}})
+	injectLiveness(t, liveWorktreeState{scanned: true, cwds: []string{canonicalTestPath(wt)}})
 	reapClosedBeadWorktrees(cityPath, cfg, map[string]beads.Store{reapTestRigName: store}, nil, false, fake, skips, &stderr)
 	reapClosedBeadWorktrees(cityPath, cfg, map[string]beads.Store{reapTestRigName: store}, nil, false, fake, skips, &stderr)
 
@@ -138,7 +152,7 @@ func TestReapSkipTracker_ReemitsAfterWorktreeLeavesTheSweep(t *testing.T) {
 	// the reaper never evaluates it and the tracker must not keep its entry.
 	openStore := beads.NewMemStoreFrom(1, []beads.Bead{{ID: "ga-gap0001", Status: "open"}}, nil)
 	cfg := reapTestConfig(rigRoot)
-	injectLiveness(t, liveWorktreeState{scanned: true, cwds: []string{pathutil.NormalizePathForCompare(wt)}})
+	injectLiveness(t, liveWorktreeState{scanned: true, cwds: []string{canonicalTestPath(wt)}})
 
 	fake := events.NewFake()
 	skips := newReapSkipTracker()
@@ -162,7 +176,7 @@ func TestReapSkipTracker_NilTrackerEmitsEveryPass(t *testing.T) {
 	wt := addClosedWorktree(t, rigRoot, cityPath, "builder", "ga-nilt001")
 	store := beads.NewMemStoreFrom(1, []beads.Bead{{ID: "ga-nilt001", Status: "closed"}}, nil)
 	cfg := reapTestConfig(rigRoot)
-	injectLiveness(t, liveWorktreeState{scanned: true, cwds: []string{pathutil.NormalizePathForCompare(wt)}})
+	injectLiveness(t, liveWorktreeState{scanned: true, cwds: []string{canonicalTestPath(wt)}})
 
 	fake := events.NewFake()
 	var stderr bytes.Buffer
@@ -221,12 +235,12 @@ func TestReapSkipTracker_TracksPathsIndependently(t *testing.T) {
 	skips := newReapSkipTracker()
 	var stderr bytes.Buffer
 
-	live := []string{pathutil.NormalizePathForCompare(stable), pathutil.NormalizePathForCompare(changing)}
+	live := []string{canonicalTestPath(stable), canonicalTestPath(changing)}
 	injectLiveness(t, liveWorktreeState{scanned: true, cwds: live})
 	reapClosedBeadWorktrees(cityPath, cfg, map[string]beads.Store{reapTestRigName: store}, nil, false, fake, skips, &stderr)
 
 	// Only `changing` transitions; `stable` holds its liveness protection.
-	injectLiveness(t, liveWorktreeState{scanned: true, cwds: []string{pathutil.NormalizePathForCompare(stable)}})
+	injectLiveness(t, liveWorktreeState{scanned: true, cwds: []string{canonicalTestPath(stable)}})
 	if err := os.WriteFile(filepath.Join(changing, "dirty.txt"), []byte("wip\n"), 0o644); err != nil {
 		t.Fatalf("write uncommitted file: %v", err)
 	}

@@ -287,12 +287,14 @@ type memoryOrderDispatcher struct {
 	aa      []orders.Order
 	storeFn orderStoreFunc
 	// storageRoutes is the opened non-work storage binding this process
-	// resolved at boot. It is the graph leg of a wisp dispatch: the molecule a
-	// formula order materializes is graph class (coordclass classifies wisp
-	// roots as ClassGraph), while the order-tracking bead storeFn opens stays
-	// on the order/work side. A nil value relocates nothing, so graphStoreFor
-	// hands back the caller's own store and the dispatch is byte-identical to
-	// the single-store path.
+	// resolved at boot, and it carries BOTH classes a dispatch writes: the
+	// molecule a formula order materializes is graph class (coordclass
+	// classifies wisp roots as ClassGraph), and the order-tracking bead that
+	// gates repeat firing is orders class (coordclass.ClassOrders is defined as
+	// exactly those records). storeFn opens the order's TARGET scope, which is a
+	// work ledger; neither class belongs there on a split city. A nil value
+	// relocates nothing, so graphStoreFor/ordersStoreFor hand back the caller's
+	// own store and the dispatch is byte-identical to the single-store path.
 	storageRoutes        *storageRoutes
 	ep                   events.Provider
 	execRun              ExecRunner
@@ -535,29 +537,11 @@ func (m *memoryOrderDispatcher) dispatch(ctx context.Context, cityPath string, n
 			stores[storeKey] = store
 		}
 
-		storesForGate := []beads.Store{store}
 		legacyStore, legacyOK := m.legacyCityStoreForTarget(cityPath, target, stores)
 		if !legacyOK {
 			continue
 		}
-		if legacyStore != nil {
-			storesForGate = append(storesForGate, legacyStore)
-		}
-		storeKeysForGate := []string{storeKey}
-		if legacyStore != nil {
-			storeKeysForGate = append(storeKeysForGate, orderStoreTargetKey(legacyOrderCityTarget(cityPath, m.cfg)))
-		}
-		// A dispatched wisp root is graph class and carries this order's
-		// order-run label, so on a split city the single-flight gate, the
-		// cooldown clock and the event cursor all have to read the graph store
-		// as well — otherwise an order re-fires while its previous wisp is
-		// still open. When nothing is relocated the graph store IS the target
-		// store, the append is skipped, and the gate reads the exact store list
-		// it always did.
-		if graphStore := m.graphStoreFor(store); graphStore != nil && !storeListContains(storesForGate, graphStore) {
-			storesForGate = append(storesForGate, graphStore)
-			storeKeysForGate = append(storeKeysForGate, m.graphStoreKey())
-		}
+		storesForGate, storeKeysForGate := m.gateStoresFor(cityPath, store, storeKey, legacyStore)
 		scoped := a.ScopedName()
 		// NoWorkGate orders (pure probes/sweeps that track no beads) opt out of
 		// BOTH open-work gates entirely. The gates exist to suppress re-dispatch
@@ -621,7 +605,7 @@ func (m *memoryOrderDispatcher) dispatch(ctx context.Context, cityPath string, n
 			logDispatchError(m.stderr, "gc: order dispatch: building trigger env for %s: %s", a.ScopedName(), redacted)
 			// Leave this open so the existing open-work gate suppresses repeat
 			// ticks until the normal stale tracking sweep gives the order another try.
-			trackingBead, createErr := orders.NewStore(beads.OrdersStore{Store: store}).CreateRun(scoped, orders.RunOpts{Outcome: orders.RunOutcomeTriggerEnvFailed})
+			trackingBead, createErr := m.orderFrontDoorFor(store).CreateRun(scoped, orders.RunOpts{Outcome: orders.RunOutcomeTriggerEnvFailed})
 			if createErr != nil {
 				logDispatchError(m.stderr, "gc: order dispatch: creating trigger env failure tracking bead for %s: %v", scoped, createErr)
 			} else {
@@ -781,7 +765,7 @@ func (m *memoryOrderDispatcher) runDispatchGuarded(ctx context.Context, store be
 // A caller tracking its own WaitGroup must register it before calling and
 // release it in onDone (and, on a returned error, itself — nothing launched).
 func (m *memoryOrderDispatcher) launchResolvedDispatch(ctx context.Context, store beads.Store, target execStoreTarget, a orders.Order, cityPath string, vars, execEnv map[string]string, onDone func()) (orders.OrderRun, error) {
-	trackingRun, err := orders.NewStore(beads.OrdersStore{Store: store}).CreateRun(a.ScopedName(), orders.RunOpts{})
+	trackingRun, err := m.orderFrontDoorFor(store).CreateRun(a.ScopedName(), orders.RunOpts{})
 	if err != nil {
 		return orders.OrderRun{}, err
 	}
@@ -1195,7 +1179,11 @@ func (m *memoryOrderDispatcher) dispatchOne(ctx context.Context, store beads.Sto
 	// tracking bead outcome observable to a waiting drain.
 	defer m.doneInflight()
 	defer func() {
-		if err := closeOrderTrackingBead(ctx, store, trackingID); err != nil {
+		// The tracking bead was born in the orders store, so its close has to
+		// address that store: closing through the target scope on a split city
+		// finds nothing, and the marker that suppresses re-dispatch stays open
+		// forever.
+		if err := closeOrderTrackingBead(ctx, m.ordersStoreFor(store), trackingID); err != nil {
 			logDispatchError(m.stderr, "gc: order %s: closing tracking bead %s: %v", a.ScopedName(), trackingID, err)
 		}
 	}()
@@ -1229,9 +1217,9 @@ func (m *memoryOrderDispatcher) dispatchOne(ctx context.Context, store beads.Sto
 		// dispatchExec is order-only: hand it the typed order front door so the
 		// goroutine leaf has no raw beads.Store to misuse. Constructed here (the
 		// per-order coordination point that still holds the raw store for the
-		// closeOrderTrackingBead defer) from the same store, so the bead writes
-		// stay byte-identical.
-		front := orders.NewStore(beads.OrdersStore{Store: store})
+		// target-scoped exec env) from the orders class store, which is the store
+		// the tracking bead this leaf stamps was created in.
+		front := m.orderFrontDoorFor(store)
 		// The exec-env overlay is namespaced by an untrusted caller (webhook);
 		// nil means use the raw vars (tick/CLI), preserving prior behavior.
 		execOverlay := execEnv
@@ -1555,6 +1543,33 @@ func (m *memoryOrderDispatcher) graphStoreFor(store beads.Store) beads.Store {
 	return resolveGraphStore(m.storageRoutes, store, m.cfg, m.cityPath, m.rec)
 }
 
+// ordersStoreFor returns the store that owns the order-tracking bead a dispatch
+// writes, given the store the tick opened for the order's target scope.
+//
+// The tracking bead is the ORDERS class — coordclass.ClassOrders is defined as
+// "order-dispatch tracking beads (the order-tracking / order-run records that
+// gate repeat order firing)" — and on a split city that class is served by a
+// different database than the order's target scope, which is a work ledger.
+// Creating tracking beads through the target store puts orders-class beads in
+// the work ledger under the work prefix, which the city's own convergence check
+// then reads as infrastructure beads stranded off their binding, and stranded is
+// fatal to boot. When the routes relocate nothing — every single-store city —
+// resolveOrderStore returns the exact store value it was handed, so the dispatch
+// stays on the one store it always used.
+func (m *memoryOrderDispatcher) ordersStoreFor(store beads.Store) beads.Store {
+	return resolveOrderStore(m.storageRoutes, store, m.cfg, m.cityPath, m.rec)
+}
+
+// orderFrontDoorFor is the tracking-bead front door for a dispatch: the orders
+// class store this city serves, wrapped as the typed order store. Every
+// tracking-bead write and read in a dispatch goes through this one constructor,
+// so the bead a dispatch creates and the bead its outcome/close writes address
+// are the same bead in the same database by construction rather than by each
+// call site remembering to route.
+func (m *memoryOrderDispatcher) orderFrontDoorFor(store beads.Store) *orders.Store {
+	return orders.NewStore(beads.OrdersStore{Store: m.ordersStoreFor(store)})
+}
+
 // graphStoreKey is the gate/cooldown cache key for the graph store. It names the
 // binding rather than the order's target scope, because one graph binding serves
 // every scope: keying it per target would read the same database once per rig.
@@ -1569,12 +1584,77 @@ func (m *memoryOrderDispatcher) graphStoreKey() string {
 	return "graph\x00" + binding
 }
 
+// ordersStoreKey is the gate/cooldown cache key for the orders store. Like
+// graphStoreKey it names the binding rather than the order's target scope,
+// because one orders binding serves every scope: keying it per target would read
+// the same database once per rig.
+func (m *memoryOrderDispatcher) ordersStoreKey() string {
+	binding := ""
+	if m.storageRoutes != nil {
+		binding = m.storageRoutes.binding
+	}
+	if binding == "" {
+		binding = "orders"
+	}
+	return "orders\x00" + binding
+}
+
+// gateStoresFor returns the stores an order's open-work gate, cooldown clock and
+// event cursor read, with the cache key each one is memoized under.
+//
+// It is the order's target scope, the legacy city store when a rig order needs
+// the fallback, and then the two infrastructure bindings that hold the order-run
+// evidence a dispatch itself writes:
+//
+//   - GRAPH, because a dispatched wisp root carries the order's order-run label
+//     and is created in the graph binding. A gate that misses it re-fires the
+//     order while the previous wisp is still open.
+//   - ORDERS, because the tracking bead carries the same label and IS the
+//     single-flight marker, the cooldown clock and the cursor. A gate that
+//     misses it never sees the marker its own dispatch just wrote.
+//
+// Both appends are guarded by store identity, so a city that relocates nothing
+// gates on exactly the list it always did, and the whole-split shape this build
+// serves — where one binding serves both classes — reads that binding once
+// rather than twice per order per tick.
+func (m *memoryOrderDispatcher) gateStoresFor(cityPath string, store beads.Store, storeKey string, legacyStore beads.Store) ([]beads.Store, []string) {
+	storesForGate := []beads.Store{store}
+	storeKeysForGate := []string{storeKey}
+	if legacyStore != nil {
+		storesForGate = append(storesForGate, legacyStore)
+		storeKeysForGate = append(storeKeysForGate, orderStoreTargetKey(legacyOrderCityTarget(cityPath, m.cfg)))
+	}
+	if graphStore := m.graphStoreFor(store); graphStore != nil && !storeListContains(storesForGate, graphStore) {
+		storesForGate = append(storesForGate, graphStore)
+		storeKeysForGate = append(storeKeysForGate, m.graphStoreKey())
+	}
+	if ordersStore := m.ordersStoreFor(store); ordersStore != nil && !storeListContains(storesForGate, ordersStore) {
+		storesForGate = append(storesForGate, ordersStore)
+		storeKeysForGate = append(storeKeysForGate, m.ordersStoreKey())
+	}
+	return storesForGate, storeKeysForGate
+}
+
 // storeListContains reports whether stores already holds this exact store, so a
 // city whose classes collapse onto one store gates on one store rather than the
 // same one twice.
 func storeListContains(stores []beads.Store, want beads.Store) bool {
 	for _, store := range stores {
 		if store == want {
+			return true
+		}
+	}
+	return false
+}
+
+// sweepStoreListContains is storeListContains for a tracking-sweep store list,
+// whose entries carry a scope label around the store. The comparison has to look
+// through that wrapper: a bare identity check sees the label, decides the
+// binding is absent, and sweeps it a second time — which in dry-run tells the
+// operator twice as much work is stale as there is.
+func sweepStoreListContains(stores []beads.Store, want beads.Store) bool {
+	for _, store := range stores {
+		if unwrapOrderTrackingSweepStore(store) == want {
 			return true
 		}
 	}
@@ -1592,7 +1672,7 @@ func (m *memoryOrderDispatcher) dispatchWisp(ctx context.Context, store beads.St
 			Subject: scoped,
 			Message: err.Error(),
 		})
-		orders.NewStore(beads.OrdersStore{Store: store}).SetOutcome(trackingID, orders.RunOutcomeWispCanceled) //nolint:errcheck // best-effort
+		m.orderFrontDoorFor(store).SetOutcome(trackingID, orders.RunOutcomeWispCanceled) //nolint:errcheck // best-effort
 		return
 	}
 
@@ -1664,6 +1744,23 @@ func (m *memoryOrderDispatcher) dispatchWisp(ctx context.Context, store beads.St
 	// Everything from here on writes the molecule, which is graph class, so it
 	// goes to the graph store rather than the order-class store the tracking
 	// bead lives in. On a single-store city the two are the same value.
+	//
+	// KNOWN GAP, deliberately not closed here (ga-fk1a5). "Graph class" is true
+	// of a graph.v2 pour and a root-only wisp but NOT of a v1 POURED order
+	// formula, whose molecule container and assigned task steps are all
+	// ClassWork by coordclass.Classify — relocating those hides the assigned
+	// steps from `gc hook`, which reads the work scope. The CLI twin
+	// (doOrderRunWithJSON) gates this on moleculeClassStore and is correct.
+	// The dispatcher cannot simply follow, because this root is a TWO-CLASS
+	// object: it also carries the order:/seq: event-cursor labels, and
+	// orders.Store unions order-run evidence across the ORDERS and GRAPH legs
+	// only. Route the molecule by class and an event-triggered v1 poured order
+	// loses its cursor and re-fires; leave it and its steps stay unreachable.
+	// Closing it means persisting the cursor onto the orders-class tracking
+	// bead the way the exec arm already does (front.SetCursor at the exec
+	// branch above) — a production behavior change rather than wiring, so it is
+	// its own slice. TestOrderDispatchPouredV1MoleculeRelocatesWithTheGraphClass
+	// pins the current answer so that slice has a test to flip.
 	graphStore := m.graphStoreFor(store)
 
 	// Route before instantiation. A routing failure must not leave an
@@ -1737,7 +1834,7 @@ func (m *memoryOrderDispatcher) dispatchWisp(ctx context.Context, store beads.St
 	})
 
 	// Label tracking bead with outcome.
-	orders.NewStore(beads.OrdersStore{Store: store}).SetOutcome(trackingID, orders.RunOutcomeWisp) //nolint:errcheck // best-effort
+	m.orderFrontDoorFor(store).SetOutcome(trackingID, orders.RunOutcomeWisp) //nolint:errcheck // best-effort
 }
 
 // orderRigSuspended reports whether the order targets a suspended rig.
@@ -1765,7 +1862,7 @@ func (m *memoryOrderDispatcher) markTrackingFailure(store beads.Store, trackingI
 		c := orders.EventCursor(headSeq)
 		cursor = &c
 	}
-	front := orders.NewStore(beads.OrdersStore{Store: store})
+	front := m.orderFrontDoorFor(store)
 	if err := front.MarkFailed(trackingID, scoped, orders.RunOutcomeWispFailed, cursor); err != nil {
 		logDispatchError(m.stderr, "gc: order %s: failed to mark tracking bead %s as failed: %v", scoped, trackingID, err)
 	}
@@ -2360,7 +2457,7 @@ func sweepStaleOrderTrackingAcrossStoresLimitMode(stores []beads.Store, wispStor
 			result.sweptStoreKeys[key] = struct{}{}
 		}
 	}
-	if includeWispSubtrees && wispStore != nil && !storeListContains(stores, wispStore) {
+	if includeWispSubtrees && wispStore != nil && !sweepStoreListContains(stores, wispStore) {
 		n, err := sweepStaleOrderWispSubtreesMode(wispStore, now.Add(-staleAfter), onlyOrders, initiator, dryRun)
 		result.wispClosed += n
 		if err != nil {

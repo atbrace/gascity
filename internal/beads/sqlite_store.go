@@ -667,7 +667,7 @@ func (s *SQLiteStore) SetSequenceFloor(n int64) error {
 	if s.sequenceFloorBeforePersist != nil {
 		s.sequenceFloorBeforePersist()
 	}
-	persisted, err := persistSQLiteSequenceFloorAtLeast(s.path, s.sequenceFloorPath, n)
+	persisted, err := persistSQLiteSequenceFloorAtLeast(s.sequenceFloorPath, n)
 	if err != nil {
 		return fmt.Errorf("setting sqlite sequence floor: %w", err)
 	}

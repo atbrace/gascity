@@ -306,7 +306,9 @@ func waivedRuntime(constructor SymbolRef, owner, reason string) ContractClaim {
 		Disposition: DispositionWaived,
 		Waiver: &Waiver{
 			Owner:   owner,
-			Expires: time.Date(2026, time.August, 12, 0, 0, 0, 0, time.UTC),
+			// Renewed to upstream's horizon (#5198): the 2026-08-12 rollover
+			// turned main red repo-wide with no code change (gcy-9on).
+			Expires: time.Date(2026, time.August, 26, 0, 0, 0, 0, time.UTC),
 			Reason:  reason,
 		},
 	}

@@ -206,6 +206,7 @@ func applyEndpointKeyEditsToText(content string, edits []CityEndpointKeyEdit) (s
 	}
 	ops := make([]lineOp, 0, len(edits))
 	var appendDolt []string
+	removedCityDoltKey := false
 
 	for _, edit := range edits {
 		section, found := findEndpointEditSection(sections, edit)
@@ -234,6 +235,9 @@ func applyEndpointKeyEditsToText(content string, edits []CityEndpointKeyEdit) (s
 		}
 		if edit.Value == "" {
 			ops = append(ops, lineOp{index: keyLine, remove: true})
+			if edit.RigName == "" {
+				removedCityDoltKey = true
+			}
 			continue
 		}
 		replaced, ok := replaceEndpointEditValue(lines[keyLine], edit.Key, edit.Value)
@@ -256,7 +260,9 @@ func applyEndpointKeyEditsToText(content string, edits []CityEndpointKeyEdit) (s
 		}
 	}
 
-	lines = dropEmptiedDoltSection(lines)
+	if removedCityDoltKey {
+		lines = dropEmptiedDoltSection(lines)
+	}
 
 	edited := strings.Join(lines, "\n")
 	if len(appendDolt) > 0 {
@@ -278,6 +284,9 @@ func applyEndpointKeyEditsToText(content string, edits []CityEndpointKeyEdit) (s
 // whole point of this file is preserving those — so a section still holding one
 // keeps its header rather than orphaning the comment under the previous table.
 // [[rigs]] sections are never dropped; they carry identity beyond endpoint keys.
+// Narrow in one more way: the caller runs this only when this edit set removed a
+// city-level [dolt] key, so a table that was already empty before the edit — say
+// during a rig-only edit — is left exactly as the user wrote it.
 func dropEmptiedDoltSection(lines []string) []string {
 	for _, section := range scanEndpointEditSections(lines) {
 		if section.header != "dolt" || section.array {

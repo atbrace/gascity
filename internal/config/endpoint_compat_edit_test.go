@@ -164,6 +164,41 @@ name = "demo"
 	}
 }
 
+// TestApplyCityEndpointKeyEditsKeepsPreexistingEmptyDoltTableOnRigOnlyEdit: a
+// [dolt] table that was already bare before the edit is not this edit set's to
+// clean up. A rig-only edit must leave the header — and the comment above it —
+// exactly where the user put them.
+func TestApplyCityEndpointKeyEditsKeepsPreexistingEmptyDoltTableOnRigOnlyEdit(t *testing.T) {
+	original := `[workspace]
+name = "demo"
+
+# the endpoint lives in .beads/config.yaml; this table is intentionally bare
+[dolt]
+
+[[rigs]]
+name = "frontend"
+prefix = "fe"
+dolt_host = "stale.example.com"
+dolt_port = "3307"
+`
+	path := writeEndpointEditFixture(t, original)
+	ok, err := ApplyCityEndpointKeyEditsInPlace(fsys.OSFS{}, path, []CityEndpointKeyEdit{
+		{RigName: "frontend", Key: "dolt_host", Value: `"127.0.0.1"`},
+		{RigName: "frontend", Key: "dolt_port", Value: `"4406"`},
+	})
+	if err != nil || !ok {
+		t.Fatalf("ApplyCityEndpointKeyEditsInPlace = (%v, %v), want (true, nil)", ok, err)
+	}
+	got := readEndpointEditFixture(t, path)
+	want := strings.NewReplacer(
+		`dolt_host = "stale.example.com"`, `dolt_host = "127.0.0.1"`,
+		`dolt_port = "3307"`, `dolt_port = "4406"`,
+	).Replace(original)
+	if got != want {
+		t.Fatalf("rig-only edit disturbed the pre-existing [dolt] table:\n got: %q\nwant: %q", got, want)
+	}
+}
+
 // TestApplyCityEndpointKeyEditsKeepsDoltHeaderHoldingAComment: an emptied [dolt]
 // table whose body still carries a comment keeps its header. Dropping it would
 // reparent the comment under the previous table — the opposite of this file's

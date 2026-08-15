@@ -131,6 +131,68 @@ name = "demo"
 	}
 }
 
+// TestApplyCityEndpointKeyEditsRoundTripsAppendedDoltTable is the byte-identical
+// round trip: use-external appends a [dolt] table, use-managed removes its keys,
+// and the file must come back exactly as it started. Before the emptied-section
+// drop, removing the last key left a stray "[dolt]" header and its blank
+// separator behind — comments survived, but the round trip did not.
+func TestApplyCityEndpointKeyEditsRoundTripsAppendedDoltTable(t *testing.T) {
+	original := `# keep me
+[workspace]
+name = "demo"
+`
+	path := writeEndpointEditFixture(t, original)
+
+	ok, err := ApplyCityEndpointKeyEditsInPlace(fsys.OSFS{}, path, []CityEndpointKeyEdit{
+		{Key: "host", Value: `"db.example.com"`},
+		{Key: "port", Value: "4406"},
+	})
+	if err != nil || !ok {
+		t.Fatalf("append edits = (%v, %v), want (true, nil)", ok, err)
+	}
+
+	ok, err = ApplyCityEndpointKeyEditsInPlace(fsys.OSFS{}, path, []CityEndpointKeyEdit{
+		{Key: "host"},
+		{Key: "port"},
+	})
+	if err != nil || !ok {
+		t.Fatalf("removal edits = (%v, %v), want (true, nil)", ok, err)
+	}
+
+	if got := readEndpointEditFixture(t, path); got != original {
+		t.Fatalf("round trip not byte-identical:\n got: %q\nwant: %q", got, original)
+	}
+}
+
+// TestApplyCityEndpointKeyEditsKeepsDoltHeaderHoldingAComment: an emptied [dolt]
+// table whose body still carries a comment keeps its header. Dropping it would
+// reparent the comment under the previous table — the opposite of this file's
+// whole purpose.
+func TestApplyCityEndpointKeyEditsKeepsDoltHeaderHoldingAComment(t *testing.T) {
+	content := `[workspace]
+name = "demo"
+
+[dolt]
+# why this endpoint was pinned: incident 2026-07-14
+host = "db.example.com"
+`
+	path := writeEndpointEditFixture(t, content)
+	ok, err := ApplyCityEndpointKeyEditsInPlace(fsys.OSFS{}, path, []CityEndpointKeyEdit{{Key: "host"}})
+	if err != nil || !ok {
+		t.Fatalf("ApplyCityEndpointKeyEditsInPlace = (%v, %v), want (true, nil)", ok, err)
+	}
+	got := readEndpointEditFixture(t, path)
+	if !strings.Contains(got, "[dolt]") {
+		t.Fatalf("[dolt] header dropped, orphaning its comment: %q", got)
+	}
+	if !strings.Contains(got, "# why this endpoint was pinned") {
+		t.Fatalf("comment lost: %q", got)
+	}
+	if cfg := decodeEndpointEditConfig(t, got); cfg.Dolt.Host != "" {
+		t.Fatalf("dolt = %+v, want host cleared", cfg.Dolt)
+	}
+}
+
 func TestApplyCityEndpointKeyEditsRemovesKeysPreservingComments(t *testing.T) {
 	path := writeEndpointEditFixture(t, commentedCityToml)
 	ok, err := ApplyCityEndpointKeyEditsInPlace(fsys.OSFS{}, path, []CityEndpointKeyEdit{

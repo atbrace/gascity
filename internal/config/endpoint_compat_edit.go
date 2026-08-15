@@ -256,6 +256,8 @@ func applyEndpointKeyEditsToText(content string, edits []CityEndpointKeyEdit) (s
 		}
 	}
 
+	lines = dropEmptiedDoltSection(lines)
+
 	edited := strings.Join(lines, "\n")
 	if len(appendDolt) > 0 {
 		if edited != "" && !strings.HasSuffix(edited, "\n") {
@@ -264,6 +266,35 @@ func applyEndpointKeyEditsToText(content string, edits []CityEndpointKeyEdit) (s
 		edited += "\n[dolt]\n" + strings.Join(appendDolt, "\n") + "\n"
 	}
 	return edited, true
+}
+
+// dropEmptiedDoltSection removes a `[dolt]` header that the edits just emptied,
+// so removing the last dolt key is the exact inverse of the append above rather
+// than leaving a stray header behind. Without this, use-external followed by
+// use-managed does not restore city.toml byte-identically.
+//
+// Deliberately narrow: only the non-array [dolt] table, and only when nothing
+// but blank lines remains under it. A leftover comment is user content — the
+// whole point of this file is preserving those — so a section still holding one
+// keeps its header rather than orphaning the comment under the previous table.
+// [[rigs]] sections are never dropped; they carry identity beyond endpoint keys.
+func dropEmptiedDoltSection(lines []string) []string {
+	for _, section := range scanEndpointEditSections(lines) {
+		if section.header != "dolt" || section.array {
+			continue
+		}
+		for i := section.start + 1; i < section.end; i++ {
+			if strings.TrimSpace(lines[i]) != "" {
+				return lines
+			}
+		}
+		// The section's range already covers the header and the blank lines
+		// under it — including, when [dolt] is last, the one the append emitted
+		// as its leading separator, which sits inside the *previous* section's
+		// range and is what carries the file's trailing newline afterwards.
+		return append(lines[:section.start], lines[section.end:]...)
+	}
+	return lines
 }
 
 func scanEndpointEditSections(lines []string) []endpointEditSection {

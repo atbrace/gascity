@@ -1,0 +1,103 @@
+name: Temporary native Darwin amd64 artifact
+
+# One-shot dogfood artifact lane. This workflow is intentionally on a
+# temporary fork branch and checks out the exact requested source SHA below;
+# it must not become a release or a replacement for the normal workflows.
+on:
+  push:
+    branches:
+      - artifact/sys-1epho-macos-90c5b590
+
+permissions:
+  contents: read
+
+jobs:
+  native-darwin-amd64:
+    name: Native Darwin amd64 CGO artifact
+    runs-on: macos-15-intel
+    timeout-minutes: 45
+    steps:
+      - name: Checkout exact target source
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6
+        with:
+          ref: 90c5b59008fd38b018ec65c48da2cd143d337cfc
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Set up Go
+        uses: actions/setup-go@4a3601121dd01d1626a1e23e37211e3254c1c06c # v6
+        with:
+          go-version-file: go.mod
+          cache: false
+
+      - name: Install pinned ICU
+        shell: bash
+        run: |
+          set -euo pipefail
+          brew install icu4c@78
+
+      - name: Build and verify native artifact
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          target='90c5b59008fd38b018ec65c48da2cd143d337cfc'
+          test "$(git rev-parse HEAD)" = "$target"
+          test -z "$(git status --porcelain)"
+
+          icu="$(brew --prefix icu4c@78)"
+          export CGO_ENABLED=1
+          export CGO_CFLAGS="-I$icu/include"
+          export CGO_CXXFLAGS="-I$icu/include -std=c++17"
+          export CGO_LDFLAGS="-L$icu/lib"
+          export PKG_CONFIG_PATH="$icu/lib/pkgconfig"
+
+          short_commit="$(git rev-parse --short HEAD)"
+          build_date="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+          make build
+
+          mkdir -p artifact
+          cp bin/gc artifact/gc
+          file artifact/gc | tee artifact/file.txt
+          grep -Eq 'Mach-O 64-bit executable x86_64' artifact/file.txt
+
+          go version -m artifact/gc | tee artifact/buildinfo.txt
+          grep -Eq 'build[[:space:]]+CGO_ENABLED=1' artifact/buildinfo.txt
+          grep -Eq 'build[[:space:]]+GOARCH=amd64' artifact/buildinfo.txt
+          grep -Eq 'build[[:space:]]+GOOS=darwin' artifact/buildinfo.txt
+
+          otool -L artifact/gc | tee artifact/otool.txt
+          grep -Eiq 'libicu|icu4c' artifact/otool.txt
+
+          version_json="$(artifact/gc version --json --long)"
+          printf '%s\n' "$version_json" | tee artifact/version.json
+          printf '%s\n' "$version_json" | jq -e --arg commit "$short_commit" '.commit == $commit'
+
+          {
+            printf 'target_commit=%s\n' "$target"
+            printf 'short_commit=%s\n' "$short_commit"
+            printf 'build_date=%s\n' "$build_date"
+            printf 'cgo_enabled=1\n'
+            printf 'target=darwin/amd64\n'
+            printf 'icu_prefix=%s\n' "$icu"
+            printf 'binary='; file -b artifact/gc
+            printf 'sha256='; shasum -a 256 artifact/gc | awk '{print $1}'
+          } | tee artifact/manifest.txt
+
+          tar -czf "gc-darwin-amd64-${target}.tar.gz" -C artifact gc
+          shasum -a 256 "gc-darwin-amd64-${target}.tar.gz" > artifact/SHA256SUMS
+
+      - name: Upload native binary and verification manifest
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: gc-darwin-amd64-90c5b590
+          if-no-files-found: error
+          path: |
+            artifact/gc
+            artifact/SHA256SUMS
+            artifact/buildinfo.txt
+            artifact/file.txt
+            artifact/manifest.txt
+            artifact/otool.txt
+            artifact/version.json
+            gc-darwin-amd64-90c5b59008fd38b018ec65c48da2cd143d337cfc.tar.gz

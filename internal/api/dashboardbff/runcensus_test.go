@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"errors"
 	"path/filepath"
+	"sync"
 	"testing"
 	"time"
 
@@ -58,7 +59,8 @@ func TestRunProjectionSourceReturnsImmediatelyWhileColdLoadIsPending(t *testing.
 	p := New(Deps{Resolver: fakeResolver{paths: map[string]string{"alpha": dir}}})
 	started := make(chan struct{})
 	release := make(chan struct{})
-	defer close(release)
+	var releaseOnce sync.Once
+	releaseLoad := func() { releaseOnce.Do(func() { close(release) }) }
 	previous := readRunColdLoad
 	readRunColdLoad = func(*runproj.Projector, string) error {
 		close(started)
@@ -68,18 +70,22 @@ func TestRunProjectionSourceReturnsImmediatelyWhileColdLoadIsPending(t *testing.
 	t.Cleanup(func() { readRunColdLoad = previous })
 
 	p.Start(t.Context())
-	t.Cleanup(p.Stop)
-	select {
-	case <-started:
-	case <-time.After(testutil.GoroutineRaceTimeout):
-		t.Fatal("background cold load did not start")
-	}
+	t.Cleanup(func() {
+		releaseLoad()
+		p.Stop()
+	})
 
 	done := make(chan runproj.RunProjectionSnapshot, 1)
 	go func() {
 		projection, _ := p.RunProjection(context.Background(), "alpha")
 		done <- projection
 	}()
+
+	select {
+	case <-started:
+	case <-time.After(testutil.GoroutineRaceTimeout):
+		t.Fatal("first projection demand did not start the cold load")
+	}
 
 	select {
 	case projection := <-done:

@@ -284,6 +284,9 @@ func TestRunDetailWarmingDoesNotStartGraceClock(t *testing.T) {
 	// graced — its window starts now, not during warming.
 	p.Start(t.Context())
 	t.Cleanup(p.Stop)
+	// The pre-Start ensure above created the tailer but could not launch its
+	// loop. Once Start has enabled the manager, the first demand starts it.
+	tl = p.runTailers.ensure("alpha", cityEventsPath(dir))
 	select {
 	case <-tl.readyCh:
 	case <-time.After(5 * time.Second):

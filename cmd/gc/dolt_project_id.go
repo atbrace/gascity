@@ -16,9 +16,9 @@ import (
 
 	gcapi "github.com/gastownhall/gascity/internal/api"
 	"github.com/gastownhall/gascity/internal/beads/contract"
+	"github.com/gastownhall/gascity/internal/doltpool"
 	"github.com/gastownhall/gascity/internal/events"
 	"github.com/gastownhall/gascity/internal/fsys"
-	mysql "github.com/go-sql-driver/mysql"
 	"github.com/spf13/cobra"
 )
 
@@ -151,11 +151,11 @@ func ensureManagedDoltProjectIDWithRecorder(metadataPath, host, port, user, data
 	}
 	metadataOK := metadataProjectID != ""
 
+	// Pooled handle owned by internal/doltpool; do not Close.
 	db, err := managedDoltOpenDatabase(host, port, user, database)
 	if err != nil {
 		return managedDoltProjectIDReport{}, err
 	}
-	defer db.Close() //nolint:errcheck
 
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
@@ -491,6 +491,10 @@ func formatLegacyL2L3MismatchError(l2, l3 string) error {
 	)
 }
 
+// managedDoltOpenDatabase returns the shared pooled *sql.DB for a managed
+// Dolt database. The handle is owned by internal/doltpool — callers must
+// NOT Close it. The previous per-call sql.Open+Close pattern here was the
+// 2,618-TIME_WAIT hotspot (city-scale plan item 1.2).
 func managedDoltOpenDatabase(host, port, user, database string) (*sql.DB, error) {
 	return managedDoltOpenDatabaseWithPassword(host, port, user, database, managedDoltPassword())
 }
@@ -509,17 +513,7 @@ func managedDoltOpenDatabaseWithPassword(host, port, user, database, password st
 	if database == "" {
 		return nil, fmt.Errorf("missing database")
 	}
-	cfg := mysql.NewConfig()
-	cfg.User = user
-	cfg.Passwd = password
-	cfg.Net = "tcp"
-	cfg.Addr = host + ":" + port
-	cfg.DBName = database
-	cfg.Timeout = 5 * time.Second
-	cfg.ReadTimeout = 5 * time.Second
-	cfg.WriteTimeout = 5 * time.Second
-	cfg.AllowNativePasswords = true
-	return sql.Open("mysql", cfg.FormatDSN())
+	return doltpool.Open(host, port, user, password, database)
 }
 
 func readManagedMetadataProjectID(metadataPath string) (string, error) {

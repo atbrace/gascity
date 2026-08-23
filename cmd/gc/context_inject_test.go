@@ -38,10 +38,13 @@ func TestContextInjectSilentBelowAdvisory(t *testing.T) {
 
 func TestContextInjectAdvisoryBand(t *testing.T) {
 	t.Setenv("GC_INJECT_CONTEXT", "")
-	// 700k of 1M = 70% — advisory band.
-	p := writeTranscript(t, usageLine("claude-fable-5", 10_000, 680_000, 10_000))
+	// 150k of 200k = 75% — the percentage advisory band. Exercised on a 200k
+	// window because the absolute urgent floor (160k) sits below 60% of any
+	// larger window, so on a 1M window the percentage advisory band is
+	// subsumed by the absolute urgent tier (gcy-ty3, by design).
+	p := writeTranscript(t, usageLine("some-other-model", 10_000, 130_000, 10_000))
 	got := contextInjectLine(hookInputFor(p))
-	if !strings.Contains(got, "700k/1000k") || !strings.Contains(got, "~70%") {
+	if !strings.Contains(got, "150k/200k") || !strings.Contains(got, "~75%") {
 		t.Errorf("advisory line wrong: %q", got)
 	}
 	if !strings.Contains(got, "clean seam") || !strings.Contains(got, "reset") {
@@ -147,11 +150,11 @@ func TestContextInjectLastNonEmptyModelWins(t *testing.T) {
 		`{"type":"assistant","message":{"usage":{"input_tokens":10000,"cache_read_input_tokens":680000,"cache_creation_input_tokens":10000}}}`,
 	)
 	got := contextInjectLine(hookInputFor(p))
+	// The rendered denominator alone proves the window survived (700k/1000k vs
+	// 700k/200k). Tier is no longer a proxy for it: since gcy-ty3, 700k trips
+	// the absolute urgent floor on either window.
 	if !strings.Contains(got, "700k/1000k") {
 		t.Errorf("empty-model newest entry must retain the 1M window: %q", got)
-	}
-	if strings.Contains(got, "HIGH") {
-		t.Errorf("70%% of 1M is advisory, not urgent: %q", got)
 	}
 }
 
@@ -180,5 +183,133 @@ func TestContextInjectSidecarDoesNotShrinkWindow(t *testing.T) {
 	got := contextInjectLine(hookInputFor(p))
 	if !strings.Contains(got, "700k/1000k") {
 		t.Errorf("a 200k-classified newest entry must not shrink the 1M session window: %q", got)
+	}
+}
+
+// --- gcy-ty3: absolute-token companions to the percentage gate ---------------
+//
+// The percentage gate alone is window-relative, so a 1M-window agent was not
+// advised until 600k and not urged until 800k. These cover the absolute tier.
+
+// The measured defect (sysadmin refinery transcript e60663db): 500k of a 1M
+// window reads as 50% — below the 60% advisory — so the session ran 18.7h
+// without a single nudge. It must now trip the urgent tier on depth alone.
+func TestContextInjectMeasuredRefineryPeakIsUrgent(t *testing.T) {
+	t.Setenv("GC_INJECT_CONTEXT", "")
+	p := writeTranscript(t, usageLine("claude-opus-4-8[1m]", 10_000, 480_000, 10_000))
+	got := contextInjectLine(hookInputFor(p))
+	if !strings.Contains(got, "HIGH") {
+		t.Errorf("500k of 1M (50%%) must trip urgent on absolute depth, got %q", got)
+	}
+	if !strings.Contains(got, "500k/1000k") {
+		t.Errorf("expected 500k/1000k rendering, got %q", got)
+	}
+}
+
+// 150k of 1M is 15% — far below the 60% advisory — but past the 120k absolute
+// advisory. Must advise, and must NOT be marked urgent (150k <= 160k).
+func TestContextInject1MAdvisoryOnAbsoluteTokens(t *testing.T) {
+	t.Setenv("GC_INJECT_CONTEXT", "")
+	p := writeTranscript(t, usageLine("claude-fable-5", 10_000, 130_000, 10_000))
+	got := contextInjectLine(hookInputFor(p))
+	if got == "" {
+		t.Fatal("150k of 1M must trip the absolute advisory, got silence")
+	}
+	if strings.Contains(got, "HIGH") {
+		t.Errorf("150k is below the 160k urgent floor, must stay advisory: %q", got)
+	}
+	if !strings.Contains(got, "150k/1000k") || !strings.Contains(got, "clean seam") {
+		t.Errorf("advisory rendering wrong: %q", got)
+	}
+}
+
+// 700k of 1M is 70% — inside the percentage advisory band — but 4x past the
+// absolute urgent floor. Whichever trips FIRST wins, so this is urgent.
+func TestContextInject1MUrgentOnAbsoluteTokens(t *testing.T) {
+	t.Setenv("GC_INJECT_CONTEXT", "")
+	p := writeTranscript(t, usageLine("claude-fable-5", 10_000, 680_000, 10_000))
+	got := contextInjectLine(hookInputFor(p))
+	if !strings.Contains(got, "HIGH") || !strings.Contains(got, "gc session reset") {
+		t.Errorf("700k must trip urgent on absolute depth: %q", got)
+	}
+}
+
+// Non-regression guard (passes before AND after the fix): on a 200k window the
+// default absolute floors (120k/160k) coincide exactly with the default 60%/80%
+// gates, so the added conjuncts are redundant and every tier boundary — including
+// the inclusive-advisory / exclusive-urgent edges — is bit-for-bit unchanged.
+func TestContextInject200kWindowTiersUnchanged(t *testing.T) {
+	for _, env := range []string{
+		"GC_CONTEXT_ADVISORY_PCT", "GC_CONTEXT_URGENT_PCT",
+		"GC_CONTEXT_ADVISORY_TOKENS", "GC_CONTEXT_URGENT_TOKENS",
+	} {
+		t.Setenv(env, "")
+	}
+	for _, tc := range []struct {
+		tokens int
+		want   string
+	}{
+		{119_999, "silent"},
+		{120_000, "advisory"},
+		{160_000, "advisory"},
+		{160_001, "urgent"},
+	} {
+		got := contextUsageMessage(tc.tokens, 200_000)
+		var tier string
+		switch {
+		case got == "":
+			tier = "silent"
+		case strings.Contains(got, "HIGH"):
+			tier = "urgent"
+		default:
+			tier = "advisory"
+		}
+		if tier != tc.want {
+			t.Errorf("200k window, %d tokens: got %s, want %s", tc.tokens, tier, tc.want)
+		}
+	}
+}
+
+// The absolute knobs are env-overridable, and raising them makes a deep session
+// quieter — the escape hatch for operators who deliberately run long 1M sessions.
+func TestContextInjectAbsoluteThresholdOverrides(t *testing.T) {
+	t.Setenv("GC_INJECT_CONTEXT", "")
+	t.Setenv("GC_CONTEXT_ADVISORY_TOKENS", "300000")
+	t.Setenv("GC_CONTEXT_URGENT_TOKENS", "400000")
+	// 250k of 1M: 25% (below the 60% pct gate) and below the raised 300k floor.
+	p := writeTranscript(t, usageLine("claude-fable-5", 10_000, 230_000, 10_000))
+	if got := contextInjectLine(hookInputFor(p)); got != "" {
+		t.Errorf("raised absolute floors must silence 250k, got %q", got)
+	}
+	// 350k: past the raised advisory floor, below the raised urgent floor.
+	p = writeTranscript(t, usageLine("claude-fable-5", 10_000, 330_000, 10_000))
+	got := contextInjectLine(hookInputFor(p))
+	if got == "" || strings.Contains(got, "HIGH") {
+		t.Errorf("350k must be advisory under raised floors, got %q", got)
+	}
+}
+
+// The two knob families need separate parsers: thresholdPct's 1..100 clamp must
+// not silently swallow a token count typed into the percentage variable, and
+// thresholdTokens must accept values >100 that thresholdPct would reject.
+func TestContextInjectPctAndTokenKnobsParseSeparately(t *testing.T) {
+	t.Setenv("GC_INJECT_CONTEXT", "")
+	// Operator meant tokens but typed it into the _PCT knob. thresholdPct
+	// rejects >100 and falls back to 60 — the gate must NOT be disabled, and
+	// the absolute companion must still fire at its own default.
+	t.Setenv("GC_CONTEXT_ADVISORY_PCT", "120000")
+	p := writeTranscript(t, usageLine("claude-fable-5", 10_000, 120_000, 10_000))
+	if got := contextInjectLine(hookInputFor(p)); !strings.Contains(got, "140k/1000k") {
+		t.Errorf("out-of-range _PCT must fall back to its default, not disable the gate: %q", got)
+	}
+	// Same numeric value in the _TOKENS knob IS honored (thresholdPct would
+	// have rejected it), proving the parsers are distinct.
+	t.Setenv("GC_CONTEXT_ADVISORY_PCT", "")
+	t.Setenv("GC_CONTEXT_ADVISORY_TOKENS", "120000")
+	if got := contextUsageMessage(119_999, 1_000_000); got != "" {
+		t.Errorf("1 token below the honored absolute floor must be silent: %q", got)
+	}
+	if got := contextUsageMessage(120_000, 1_000_000); got == "" {
+		t.Error("120000 in the _TOKENS knob must be honored as an absolute floor")
 	}
 }

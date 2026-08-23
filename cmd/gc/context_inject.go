@@ -32,13 +32,28 @@ import (
 // handoff point", "run your handoff process now") and explicitly tells the
 // agent NOT to panic-stop at the advisory tier.
 //
-//	< advisory (default 60%)  : silent
-//	advisory..urgent (60–80%) : plan toward a clean handoff point
-//	> urgent (default 80%)    : trigger the canonical handoff now
+// Each tier has a percentage gate AND an absolute-token gate and fires on
+// whichever trips FIRST. A percentage-only gate is window-relative, so the same
+// 60/80 that means 120k/160k on a 200k window meant 600k/800k on a 1M one: a
+// measured session ran 18.7h to a 606k peak without a single nudge, because
+// 500k of 1M reads as 50% (gcy-ty3). Attention degrades with absolute context
+// depth rather than with fraction of window, so the absolute floors are what
+// bound a large-window session.
+//
+//	< advisory (60% or 120k) : silent
+//	advisory..urgent         : plan toward a clean handoff point
+//	> urgent (80% or 160k)   : trigger the canonical handoff now
+//
+// The absolute defaults are exactly 60%/80% of a 200k window, so on a 200k
+// window the two gates coincide at every token count and behaviour there is
+// unchanged. The corollary: raising only a _PCT knob no longer quiets a
+// large-window session — raise its _TOKENS companion too.
 //
 // Knobs: GC_INJECT_CONTEXT=0|false|off disables; GC_CONTEXT_ADVISORY_PCT and
-// GC_CONTEXT_URGENT_PCT override the thresholds; GC_CONTEXT_WINDOW_TOKENS
-// overrides the context-window size when model-string detection is wrong.
+// GC_CONTEXT_URGENT_PCT (1..100) plus GC_CONTEXT_ADVISORY_TOKENS and
+// GC_CONTEXT_URGENT_TOKENS (absolute counts) override the thresholds;
+// GC_CONTEXT_WINDOW_TOKENS overrides the context-window size when model-string
+// detection is wrong.
 // Fail-safe: any parse/read problem returns "" — never blocks a prompt.
 
 // hookStdinInput is the subset of the provider hook JSON we need.
@@ -163,19 +178,23 @@ func classifyWindow(model string) int {
 }
 
 // contextUsageMessage renders the guidance line for tokens used of window, or
-// "" below the advisory threshold.
+// "" below the advisory threshold. Each tier trips on its percentage gate OR
+// its absolute-token gate, whichever comes first — see the file header for why
+// a percentage-only gate under-nudges large windows.
 func contextUsageMessage(tokens, window int) string {
 	if window <= 0 {
 		return ""
 	}
-	advisory := thresholdPct("GC_CONTEXT_ADVISORY_PCT", 60)
-	urgent := thresholdPct("GC_CONTEXT_URGENT_PCT", 80)
+	advisoryPct := thresholdPct("GC_CONTEXT_ADVISORY_PCT", 60)
+	urgentPct := thresholdPct("GC_CONTEXT_URGENT_PCT", 80)
+	advisoryTokens := thresholdTokens("GC_CONTEXT_ADVISORY_TOKENS", 120_000)
+	urgentTokens := thresholdTokens("GC_CONTEXT_URGENT_TOKENS", 160_000)
 	pct := 100 * float64(tokens) / float64(window)
 	k := func(n int) string { return fmt.Sprintf("%dk", (n+500)/1000) }
 	switch {
-	case pct < float64(advisory):
+	case pct < float64(advisoryPct) && tokens < advisoryTokens:
 		return ""
-	case pct <= float64(urgent):
+	case pct <= float64(urgentPct) && tokens <= urgentTokens:
 		return fmt.Sprintf(
 			"Context usage: %s/%s (~%.0f%%). Approaching the recycle zone. Steer toward a clean seam: finish in-flight work, don't open new long-horizon tasks, and keep durable notes/work-items current so a handoff is cheap. Plan to hand off and reset before this climbs into the urgent band — a fresh session from durable notes outperforms riding lossy compaction.\n",
 			k(tokens), k(window), pct)
@@ -186,9 +205,25 @@ func contextUsageMessage(tokens, window int) string {
 	}
 }
 
+// thresholdPct parses a percentage threshold (1..100) from env, falling back to
+// def. Out-of-range values are rejected rather than clamped, so a token count
+// typed into a _PCT knob by mistake falls back to the documented default
+// instead of silently becoming an unreachable threshold.
 func thresholdPct(env string, def int) int {
 	if v := strings.TrimSpace(os.Getenv(env)); v != "" {
 		if n, err := strconv.Atoi(v); err == nil && n > 0 && n <= 100 {
+			return n
+		}
+	}
+	return def
+}
+
+// thresholdTokens parses an absolute-token threshold from env, falling back to
+// def. It is deliberately separate from thresholdPct: token counts are
+// legitimately far above 100, which thresholdPct rejects.
+func thresholdTokens(env string, def int) int {
+	if v := strings.TrimSpace(os.Getenv(env)); v != "" {
+		if n, err := strconv.Atoi(v); err == nil && n > 0 {
 			return n
 		}
 	}

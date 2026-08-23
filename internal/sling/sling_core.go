@@ -430,6 +430,19 @@ func attachFormulaToBead(opts SlingOpts, deps SlingDeps, querier BeadQuerier, be
 			if err != nil {
 				return result, fmt.Errorf("instantiating %s %q on %s: %w", errLabel, formulaName, beadID, err)
 			}
+			// The empty sourceBeadID is deliberate, and is NOT drift from the
+			// legacy sibling below (which passes beadID). A graph.v2 attachment
+			// is convoy-first (#2784): the source bead is bound to the workflow
+			// by membership in the root's gc.input_convoy_id, not by the legacy
+			// pair of gc.source_bead_id on the root and workflow_id on the
+			// source. Passing beadID here would stamp that legacy pair and, via
+			// checkLegacySourceWorkflowConflict, re-impose one-live-root-per-
+			// source — which graph.v2 deliberately dropped so distinct formulas
+			// can attach to the same bead, each with a fresh input convoy.
+			// Pinned by TestSlingAttachGraphFormulaCreatesConvoyFirstRoot
+			// (asserts both legacy keys stay empty) and the two
+			// AllowsDifferentLiveBareBeadRoots tests. Do not "fix" this to
+			// beadID: it fails those four tests. See gcy-cut.
 			wfResult, wfErr := doStartGraphWorkflow(mResult.RootID, "", a, method, deps)
 			wfResult.FormulaName = formulaName
 			if wfErr != nil {

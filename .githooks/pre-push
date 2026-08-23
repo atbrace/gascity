@@ -23,9 +23,34 @@ while read -r _local_ref local_sha _remote_ref remote_sha; do
   if [ "$local_sha" = "$zero" ]; then
     continue
   fi
-  # New remote branch: no cheap base to diff against — run the suite.
+  # New remote branch. There IS a cheap base: the merge-base with the upstream
+  # default branch. The old code assumed there was none and ran the FULL suite for
+  # ANY new branch — including a pure ref push with zero Go changes. On a 6-core
+  # macOS box that is a 3.5-3.9 GiB `go test -c ./cmd/gc` compile; it took jonesy
+  # from load 19.4 to 97.3 (gcy-aq1, 2026-08-17) and again from 41 to 97 with 15 MB
+  # free RAM (2026-08-23). Bounding concurrency does not rescue it: on the second
+  # detonation the machine-aware bound never ran and the static LOCAL_TEST_JOBS=1
+  # fallback applied, and ONE compile still reached load 97 (see gcy-auu).
+  #
+  # Every polecat branch is by definition a new remote branch on its first push, so
+  # this fired on essentially every dispatch that touched the repo at all.
+  #
+  # Fails SAFE: if no merge base can be resolved (unrelated history, missing
+  # origin ref), fall through to running the suite exactly as before.
   if [ "$remote_sha" = "$zero" ]; then
-    go_changed=1
+    base=""
+    for _ref in "$(git symbolic-ref --quiet --short refs/remotes/origin/HEAD 2>/dev/null || true)" origin/main origin/master; do
+      [ -n "$_ref" ] || continue
+      base=$(git merge-base "$local_sha" "$_ref" 2>/dev/null || true)
+      [ -n "$base" ] && break
+    done
+    if [ -z "$base" ]; then
+      go_changed=1
+      continue
+    fi
+    if git diff --name-only "$base" "$local_sha" -- '*.go' 2>/dev/null | grep -q .; then
+      go_changed=1
+    fi
     continue
   fi
   if git diff --name-only "$remote_sha" "$local_sha" -- '*.go' 2>/dev/null | grep -q .; then

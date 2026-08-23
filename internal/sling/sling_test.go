@@ -3296,6 +3296,106 @@ func TestDoSlingIdempotentDryRunSuppressesNudge(t *testing.T) {
 	}
 }
 
+func TestDoSlingGraphWorkflowPourHonorsNudge(t *testing.T) {
+	// A graph-v2 pour at a named singleton that is already alive gets no wake
+	// unless --nudge is honored here: the graph path pokes the controller and
+	// the control dispatcher, but neither delivers an execution-lane claim
+	// signal to a live lane. Without this the flag is accepted and silently
+	// dropped, and the lane sits on a workflow it was never told about.
+	formulaDir := t.TempDir()
+	writeGraphV2SlingFormula(t, formulaDir, "graph-work")
+	cfg := graphV2SlingTestConfig(t, formulaDir)
+	runner := newFakeRunner()
+	deps := testDeps(cfg, runtime.NewFake(), runner.run)
+	a := config.Agent{Name: "mayor", MaxActiveSessions: intPtr(1)}
+
+	result, err := DoSling(SlingOpts{
+		Target: a, BeadOrFormula: "graph-work", IsFormula: true, Nudge: true,
+	}, deps, deps.Store)
+	if err != nil {
+		t.Fatalf("DoSling: %v", err)
+	}
+	if result.WorkflowID == "" {
+		t.Fatalf("result = %+v, want a graph workflow launch", result)
+	}
+	if result.NudgeAgent == nil {
+		t.Fatal("expected NudgeAgent to be set on a graph workflow pour with Nudge")
+	}
+	if got := result.NudgeAgent.QualifiedName(); got != a.QualifiedName() {
+		t.Errorf("NudgeAgent = %q, want %q", got, a.QualifiedName())
+	}
+}
+
+func TestDoSlingGraphWorkflowAttachHonorsNudge(t *testing.T) {
+	// Same contract on the --on <graph-v2 formula> attach path.
+	formulaDir := t.TempDir()
+	writeGraphV2SlingFormula(t, formulaDir, "graph-work")
+	cfg := graphV2SlingTestConfig(t, formulaDir)
+	runner := newFakeRunner()
+	deps := testDeps(cfg, runtime.NewFake(), runner.run)
+	a := config.Agent{Name: "mayor", MaxActiveSessions: intPtr(1)}
+	source, err := deps.Store.Create(beads.Bead{Title: "work", Type: "task", Status: "open"})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	result, err := DoSling(SlingOpts{
+		Target: a, BeadOrFormula: source.ID, OnFormula: "graph-work", Nudge: true,
+	}, deps, deps.Store)
+	if err != nil {
+		t.Fatalf("DoSling: %v", err)
+	}
+	if result.WorkflowID == "" {
+		t.Fatalf("result = %+v, want a graph workflow attach", result)
+	}
+	if result.NudgeAgent == nil {
+		t.Fatal("expected NudgeAgent to be set on a graph workflow attach with Nudge")
+	}
+	if got := result.NudgeAgent.QualifiedName(); got != a.QualifiedName() {
+		t.Errorf("NudgeAgent = %q, want %q", got, a.QualifiedName())
+	}
+}
+
+func TestDoSlingGraphWorkflowWithoutNudgeStaysSilent(t *testing.T) {
+	// The nudge signal must stay opt-in: a graph launch without --nudge must
+	// not manufacture a wake.
+	formulaDir := t.TempDir()
+	writeGraphV2SlingFormula(t, formulaDir, "graph-work")
+	cfg := graphV2SlingTestConfig(t, formulaDir)
+	deps := testDeps(cfg, runtime.NewFake(), newFakeRunner().run)
+
+	result, err := DoSling(SlingOpts{
+		Target:        config.Agent{Name: "mayor", MaxActiveSessions: intPtr(1)},
+		BeadOrFormula: "graph-work", IsFormula: true,
+	}, deps, deps.Store)
+	if err != nil {
+		t.Fatalf("DoSling: %v", err)
+	}
+	if result.WorkflowID == "" {
+		t.Fatalf("result = %+v, want a graph workflow launch", result)
+	}
+	if result.NudgeAgent != nil {
+		t.Errorf("NudgeAgent = %+v, want nil without Nudge", result.NudgeAgent)
+	}
+}
+
+// writeGraphV2SlingFormula writes a minimal graph.v2 formula with no runtime
+// vars, usable for both the standalone pour and the --on attach paths.
+func writeGraphV2SlingFormula(t *testing.T, dir, name string) {
+	t.Helper()
+	if err := os.WriteFile(filepath.Join(dir, name+".formula.toml"), []byte(fmt.Sprintf(`
+formula = "%s"
+version = 2
+contract = "graph.v2"
+
+[[steps]]
+id = "step"
+title = "Do work"
+`, name)), 0o644); err != nil {
+		t.Fatal(err)
+	}
+}
+
 func TestDoSlingSuspendedAgentWarnsEvenOnFailure(t *testing.T) {
 	// Matches gastown-sling tutorial: sling to suspended agent, runner fails,
 	// but AgentSuspended should still be set so CLI prints the warning.

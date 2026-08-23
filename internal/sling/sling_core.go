@@ -350,7 +350,7 @@ func slingFormula(opts SlingOpts, deps SlingDeps) (SlingResult, error) {
 		return SlingResult{Target: a.QualifiedName()}, fmt.Errorf("instantiating formula %q: %w", opts.BeadOrFormula, err)
 	}
 	if mResult.GraphWorkflow || IsGraphWorkflowAttachment(deps.Store, mResult.RootID) {
-		wfResult, wfErr := doStartGraphWorkflow(mResult.RootID, "", a, method, deps)
+		wfResult, wfErr := doStartGraphWorkflow(mResult.RootID, "", a, method, deps, opts.Nudge)
 		wfResult.FormulaName = opts.BeadOrFormula
 		wfResult.Deprecations = append(wfResult.Deprecations, inv.Deprecations...)
 		return wfResult, wfErr
@@ -430,7 +430,7 @@ func attachFormulaToBead(opts SlingOpts, deps SlingDeps, querier BeadQuerier, be
 			if err != nil {
 				return result, fmt.Errorf("instantiating %s %q on %s: %w", errLabel, formulaName, beadID, err)
 			}
-			wfResult, wfErr := doStartGraphWorkflow(mResult.RootID, "", a, method, deps)
+			wfResult, wfErr := doStartGraphWorkflow(mResult.RootID, "", a, method, deps, opts.Nudge)
 			wfResult.FormulaName = formulaName
 			if wfErr != nil {
 				if rollbackErr := rollbackGraphV2ReplacementLaunch(deps.Store, mResult.RootID, replacedSnapshot); rollbackErr != nil {
@@ -464,7 +464,7 @@ func attachFormulaToBead(opts SlingOpts, deps SlingDeps, querier BeadQuerier, be
 		}
 		wispRootID := mResult.RootID
 		if mResult.GraphWorkflow || IsGraphWorkflowAttachment(deps.Store, wispRootID) {
-			wfResult, wfErr := doStartGraphWorkflow(mResult.RootID, beadID, a, method, deps)
+			wfResult, wfErr := doStartGraphWorkflow(mResult.RootID, beadID, a, method, deps, opts.Nudge)
 			wfResult.FormulaName = formulaName
 			return wfResult, wfErr
 		}
@@ -495,7 +495,7 @@ func attachFormulaToBead(opts SlingOpts, deps SlingDeps, querier BeadQuerier, be
 		if err != nil {
 			return pendingSourceWorkflowLaunch{}, fmt.Errorf("instantiating %s %q on %s: %w", errLabel, formulaName, beadID, err)
 		}
-		return pendingGraphWorkflowLaunch(mResult.RootID, beadID, a, method, formulaName, deps), nil
+		return pendingGraphWorkflowLaunch(mResult.RootID, beadID, a, method, formulaName, deps, opts.Nudge), nil
 	}
 	if !isGraph {
 		return run()
@@ -631,7 +631,7 @@ func validateBuiltInRouteStoreReachable(deps SlingDeps, beadID string, a config.
 }
 
 // doStartGraphWorkflow performs post-instantiation graph workflow setup.
-func doStartGraphWorkflow(rootID, sourceBeadID string, a config.Agent, method string, deps SlingDeps) (SlingResult, error) {
+func doStartGraphWorkflow(rootID, sourceBeadID string, a config.Agent, method string, deps SlingDeps, nudge bool) (SlingResult, error) {
 	var result SlingResult
 	result.Target = a.QualifiedName()
 	result.Method = method
@@ -668,6 +668,20 @@ func doStartGraphWorkflow(rootID, sourceBeadID string, a config.Agent, method st
 	if deps.Notify != nil {
 		deps.Notify.PokeControlDispatch(deps.CityPath)
 	}
+
+	// Signal nudge. The pokes above reach the controller and the control
+	// dispatcher, which drive orchestrator control beads -- neither delivers a
+	// claim signal to the execution lane. A pour at a live named singleton is
+	// therefore invisible to it: the lane holds a workflow nothing ever told it
+	// about. Honor --nudge here so the flag means on this path what it means on
+	// the legacy one; a redundant nudge is harmless because the claim path is
+	// idempotent/CAS-safe. Reached only on success, and DoSling/DoSlingBatch
+	// return on DryRun before any graph launch, so this never fires for a
+	// preview.
+	if nudge {
+		result.NudgeAgent = &a
+	}
+
 	return result, nil
 }
 
@@ -749,12 +763,12 @@ func listSourceWorkflowRoots(deps SlingDeps, sourceBeadID string) ([]sourceWorkf
 	return roots, nil
 }
 
-func pendingGraphWorkflowLaunch(rootID, sourceBeadID string, a config.Agent, method, formulaName string, deps SlingDeps) pendingSourceWorkflowLaunch {
+func pendingGraphWorkflowLaunch(rootID, sourceBeadID string, a config.Agent, method, formulaName string, deps SlingDeps, nudge bool) pendingSourceWorkflowLaunch {
 	return pendingSourceWorkflowLaunch{
 		workflowID: rootID,
 		storeRef:   strings.TrimSpace(deps.StoreRef),
 		finalize: func() (SlingResult, error) {
-			result, err := doStartGraphWorkflow(rootID, sourceBeadID, a, method, deps)
+			result, err := doStartGraphWorkflow(rootID, sourceBeadID, a, method, deps, nudge)
 			result.FormulaName = formulaName
 			return result, err
 		},
@@ -1078,7 +1092,7 @@ func attachBatchFormula(ctx context.Context, opts SlingOpts, deps SlingDeps, chi
 			return SlingResult{}, fmt.Errorf("instantiating %s %q on %s: %w", formulaLabel, formulaName, child.ID, err)
 		}
 		if mResult.GraphWorkflow || IsGraphWorkflowAttachment(deps.Store, mResult.RootID) {
-			wfResult, wfErr := doStartGraphWorkflow(mResult.RootID, child.ID, a, method, deps)
+			wfResult, wfErr := doStartGraphWorkflow(mResult.RootID, child.ID, a, method, deps, opts.Nudge)
 			wfResult.FormulaName = formulaName
 			return wfResult, wfErr
 		}
@@ -1104,7 +1118,7 @@ func attachBatchFormula(ctx context.Context, opts SlingOpts, deps SlingDeps, chi
 		if err != nil {
 			return pendingSourceWorkflowLaunch{}, fmt.Errorf("instantiating %s %q on %s: %w", formulaLabel, formulaName, child.ID, err)
 		}
-		return pendingGraphWorkflowLaunch(mResult.RootID, child.ID, a, method, formulaName, deps), nil
+		return pendingGraphWorkflowLaunch(mResult.RootID, child.ID, a, method, formulaName, deps, opts.Nudge), nil
 	}
 	if !isGraph {
 		return run()

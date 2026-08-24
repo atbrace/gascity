@@ -4399,6 +4399,85 @@ func TestRouteMailCheck_StaleBannerOver30s(t *testing.T) {
 	}
 }
 
+func emptyMailCheckHandler(_ *testing.T) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.Header().Set("X-GC-Cache-Age-S", "0")
+		w.Header().Set("Content-Type", "application/json")
+		json.NewEncoder(w).Encode(map[string]any{ //nolint:errcheck
+			"items": []map[string]any{},
+			"total": 0,
+		})
+	})
+}
+
+// An authoritative empty inbox must short-circuit on the API result instead of
+// re-opening the city mail store locally. This is the per-prompt
+// UserPromptSubmit hook path, where the local pass cost 4.85 CPU-s to discover
+// it had nothing to do (gcy-5o4). The local store here holds an auto-handoff
+// message that the fallback WOULD have archived; asserting it survives proves
+// the fallback was genuinely skipped rather than merely relogged.
+func TestRouteMailCheckInjectEmptyAPIInboxSkipsLocalFallback(t *testing.T) {
+	clearInheritedBeadsEnv(t)
+	cityPath := t.TempDir()
+	t.Setenv("GC_BEADS", "file")
+	t.Setenv("GC_BEADS_SCOPE_ROOT", "")
+	t.Setenv("GC_CITY_PATH", cityPath)
+	t.Setenv("GC_DEBUG", "1")
+	t.Setenv("GC_ALIAS", "mayor")
+	t.Setenv("GC_SESSION_NAME", "mayor")
+	if err := os.WriteFile(filepath.Join(cityPath, "city.toml"), []byte(`[workspace]
+name = "test-city"
+
+[[agent]]
+name = "mayor"
+`), 0o644); err != nil {
+		t.Fatalf("write city.toml: %v", err)
+	}
+	store, err := openCityStoreAt(cityPath)
+	if err != nil {
+		t.Fatalf("openCityStoreAt: %v", err)
+	}
+	if _, err := store.Create(beads.Bead{
+		Type:   "session",
+		Title:  "mayor",
+		Labels: []string{session.LabelSession},
+		Metadata: map[string]string{
+			"alias":        "mayor",
+			"session_name": "mayor",
+		},
+	}); err != nil {
+		t.Fatalf("Create session: %v", err)
+	}
+	auto, err := store.Create(beads.Bead{
+		Title:    "context cycle",
+		Type:     "message",
+		Assignee: "mayor",
+		From:     "mayor",
+		Labels:   []string{mail.AutoHandoffLabel, mail.ArchiveAfterInjectLabel},
+	})
+	if err != nil {
+		t.Fatalf("Create auto handoff: %v", err)
+	}
+	srv := httptest.NewServer(emptyMailCheckHandler(t))
+	defer srv.Close()
+	c := api.NewCityScopedClient(srv.URL, "test-city")
+
+	var stdout, stderr bytes.Buffer
+	if code := routeMailCheck(cityPath, nil, true, "", c, "", &stdout, &stderr); code != 0 {
+		t.Fatalf("exit = %d, stderr=%q", code, stderr.String())
+	}
+	assertMailRouteLog(t, stderr.String(), "api", "")
+	if strings.Contains(stderr.String(), "inject-local-side-effects") {
+		t.Fatalf("empty API inbox still took the local fallback:\n%s", stderr.String())
+	}
+	if stdout.Len() != 0 {
+		t.Fatalf("stdout = %q, want empty (nothing to inject)", stdout.String())
+	}
+	if _, err := store.Get(auto.ID); err != nil {
+		t.Fatalf("local fallback ran on an empty API inbox (auto handoff %s was touched): %v", auto.ID, err)
+	}
+}
+
 func TestRouteMailCheckInjectUsesLocalPathForArchiveSideEffects(t *testing.T) {
 	clearInheritedBeadsEnv(t)
 	cityPath := t.TempDir()

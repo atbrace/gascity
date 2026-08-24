@@ -569,6 +569,18 @@ func routeMailCheck(_ string, args []string, inject bool, hookFormat string, c *
 					_ = writeProviderHookContextForEvent(stdout, hookFormat, "UserPromptSubmit", notice)
 					return 0
 				}
+				// An authoritative empty inbox needs no local pass. The only
+				// side effect the fallback performs under --inject is
+				// archiveInjectedAutoHandoffMessages, and that is itself
+				// guarded by len(messages) > 0 (see doMailCheckTargetWithFormat),
+				// so with zero messages the fallback opens and re-parses the
+				// whole city mail store only to discover it has nothing to do.
+				// This is the per-prompt UserPromptSubmit hook path, so that
+				// wasted pass is paid on every turn of every agent (gcy-5o4).
+				if len(cr.Body.Items) == 0 {
+					logRoute(stderr, cmdName, "api", "")
+					return 0
+				}
 			} else if !api.ShouldFallbackForRead(c, err) {
 				logRoute(stderr, cmdName, "api", "error")
 				if api.IsStoreSlowError(err) {

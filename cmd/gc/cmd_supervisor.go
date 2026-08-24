@@ -13,6 +13,7 @@ import (
 	"os/exec"
 	"os/signal"
 	"path/filepath"
+	goruntime "runtime"
 	"strconv"
 	"strings"
 	"sync"
@@ -1226,6 +1227,19 @@ func notifySdState(stderr io.Writer, state string) {
 // starts a control socket, reads the registry, starts CityRuntimes,
 // and runs until canceled.
 func runSupervisor(stdout, stderr io.Writer) int {
+	// Go enables heap profiling by default (MemProfileRate = 512 KiB), and
+	// runtime.mProf_Flush walks the entire mprof bucket list inside
+	// stop-the-world GC mark termination on every cycle. Bucket count only
+	// grows over a process lifetime, and this daemon runs for weeks: a 90s
+	// profile of a 7-day-old supervisor found mProf_Flush was 100% of
+	// gcMarkTermination and ~23% of all on-CPU time — building a heap profile
+	// nothing reads, and paying for it in pauses that stall the reconciler.
+	// gc only serves pprof under GC_PPROF=1 (api.StartPprof), so reuse that
+	// same gate rather than introducing a second knob.
+	if os.Getenv("GC_PPROF") != "1" {
+		goruntime.MemProfileRate = 0
+	}
+
 	if pid := supervisorAlive(); pid != 0 {
 		fmt.Fprintf(stderr, "gc supervisor: supervisor already running (PID %d)\n", pid) //nolint:errcheck
 		return 1

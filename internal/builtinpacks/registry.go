@@ -476,12 +476,44 @@ func materializeFS(src fs.FS, dst string) error {
 	return nil
 }
 
+// packContentValidationMemo memoizes successful pack content validation,
+// keyed by (dst, pack name) and guarded by a stat signature over the pack's
+// files. Verifying content costs an os.ReadFile of every file in the pack, and
+// a single config load runs the full ValidateSyntheticRepo repeatedly -- 3x for
+// the gastown pack and 9-10x for bd/dolt, measured on one `gc config show`
+// (gcy-2asg), which was ~64% of every file open the process made. The
+// materialized cache is immutable for a given binary unless something rewrites
+// it, and any rewrite changes a file's size or mtime, so an unchanged signature
+// means the content verified earlier in this process is still on disk.
+//
+// The signature is deliberately RECOMPUTED ON EVERY CALL rather than trusting
+// the memo outright, because cmd/gc's
+// TestEnsureBuiltinRuntimeAssetsRehydratesCorruptedCache corrupts a cached file
+// and revalidates IN THE SAME PROCESS. That self-healing contract must keep
+// failing loudly: os.WriteFile changes both size and mtime, so the signature
+// differs and full content validation runs. Do not "optimize" this into a
+// plain memo lookup -- that is the same mistake as swapping this gate for
+// ValidateSyntheticRepoFast, which reads only the marker and cannot see
+// content corruption at all.
+//
+// The lstat that builds the signature is not extra work: validatePackFiles
+// already lstats every file to check its mode.
+var packContentValidationMemo sync.Map // dst+"\x00"+pack.Name -> signature string
+
 func validatePackFiles(pack Pack, dst string) error {
 	manifest, err := manifestForFS(pack.FS)
 	if err != nil {
 		return fmt.Errorf("reading bundled pack %q manifest: %w", pack.Name, err)
 	}
-	for rel, want := range manifest {
+	rels := make([]string, 0, len(manifest))
+	for rel := range manifest {
+		rels = append(rels, rel)
+	}
+	sort.Strings(rels)
+
+	var sig strings.Builder
+	for _, rel := range rels {
+		want := manifest[rel]
 		target := filepath.Join(dst, filepath.FromSlash(rel))
 		info, err := os.Lstat(target)
 		if err != nil {
@@ -490,12 +522,23 @@ func validatePackFiles(pack Pack, dst string) error {
 		if !info.Mode().IsRegular() || info.Mode().Perm() != want.perm.Perm() {
 			return fmt.Errorf("bundled pack cache %q file %s has mode %s, expected %s", pack.Name, rel, info.Mode().Perm(), want.perm.Perm())
 		}
-		got, err := os.ReadFile(target)
-		if err != nil {
-			return fmt.Errorf("reading bundled pack cache %q file %s: %w", pack.Name, rel, err)
-		}
-		if !bytes.Equal(got, want.data) {
-			return fmt.Errorf("bundled pack cache %q file %s content differs from current binary", pack.Name, rel)
+		fmt.Fprintf(&sig, "%s:%d:%d;", rel, info.Size(), info.ModTime().UnixNano())
+	}
+
+	memoKey := dst + "\x00" + pack.Name
+	signature := sig.String()
+	memoized, ok := packContentValidationMemo.Load(memoKey)
+	if !ok || memoized.(string) != signature {
+		for _, rel := range rels {
+			want := manifest[rel]
+			target := filepath.Join(dst, filepath.FromSlash(rel))
+			got, err := os.ReadFile(target)
+			if err != nil {
+				return fmt.Errorf("reading bundled pack cache %q file %s: %w", pack.Name, rel, err)
+			}
+			if !bytes.Equal(got, want.data) {
+				return fmt.Errorf("bundled pack cache %q file %s content differs from current binary", pack.Name, rel)
+			}
 		}
 	}
 	if err := filepath.WalkDir(dst, func(path string, entry os.DirEntry, err error) error {
@@ -517,6 +560,7 @@ func validatePackFiles(pack Pack, dst string) error {
 	}); err != nil {
 		return fmt.Errorf("validating bundled pack cache %q file set: %w", pack.Name, err)
 	}
+	packContentValidationMemo.Store(memoKey, signature)
 	return nil
 }
 

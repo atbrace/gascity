@@ -10,19 +10,29 @@ import (
 	"testing"
 )
 
-// writeSeqLog writes a monotonic append-only log of n events and returns its path.
-// Every other event is type "b" so filters have something to discriminate on.
+// writeSeqLog writes a monotonic append-only log of n events, seq 1..n, and
+// returns its path. Every other event is type "b" so filters have something to
+// discriminate on.
 func writeSeqLog(t *testing.T, n int) string {
+	t.Helper()
+	return writeSeqLogFrom(t, 1, n)
+}
+
+// writeSeqLogFrom writes n events whose seq starts at first. A log whose lowest
+// seq sits well above zero models the ordinary post-rotation active file, which
+// a stale cursor can point below.
+func writeSeqLogFrom(t *testing.T, first uint64, n int) string {
 	t.Helper()
 	dir := t.TempDir()
 	path := filepath.Join(dir, "events.jsonl")
 	var sb strings.Builder
-	for i := 1; i <= n; i++ {
+	for i := 0; i < n; i++ {
+		seq := first + uint64(i)
 		typ := "a"
-		if i%2 == 0 {
+		if seq%2 == 0 {
 			typ = "b"
 		}
-		fmt.Fprintf(&sb, `{"seq":%d,"type":%q,"ts":"2026-08-25T00:00:00Z","actor":"t","subject":"s%d"}`+"\n", i, typ, i)
+		fmt.Fprintf(&sb, `{"seq":%d,"type":%q,"ts":"2026-08-25T00:00:00Z","actor":"t","subject":"s%d"}`+"\n", seq, typ, seq)
 	}
 	if err := os.WriteFile(path, []byte(sb.String()), 0o644); err != nil {
 		t.Fatalf("write log: %v", err)
@@ -42,7 +52,7 @@ func TestActiveScanStart(t *testing.T) {
 	if err != nil {
 		t.Fatalf("open: %v", err)
 	}
-	defer f.Close()
+	defer f.Close() //nolint:errcheck // read-only file
 	st, err := f.Stat()
 	if err != nil {
 		t.Fatalf("stat: %v", err)
@@ -53,9 +63,20 @@ func TestActiveScanStart(t *testing.T) {
 	if got := activeScanStart(f, size, 0); got != 0 {
 		t.Fatalf("activeScanStart(afterSeq=0) = %d, want 0", got)
 	}
-	// A cursor below the first seq cannot skip anything.
-	if got := activeScanStart(f, size, 0); got != 0 {
-		t.Fatalf("activeScanStart(below first) = %d, want 0", got)
+	// A cursor below the log's first seq cannot skip anything: after a rotation
+	// the active file starts high and a stale cursor sits below every line in it.
+	rotated := writeSeqLogFrom(t, 5000, 100)
+	f2, err := os.Open(rotated)
+	if err != nil {
+		t.Fatalf("open rotated: %v", err)
+	}
+	defer f2.Close() //nolint:errcheck // read-only file
+	st2, err := f2.Stat()
+	if err != nil {
+		t.Fatalf("stat rotated: %v", err)
+	}
+	if got := activeScanStart(f2, st2.Size(), 100); got != 0 {
+		t.Fatalf("activeScanStart(below first seq) = %d, want 0", got)
 	}
 	// A cursor at or beyond the last seq skips the whole file.
 	if got := activeScanStart(f, size, n); got != size {

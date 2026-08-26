@@ -65,7 +65,7 @@ const (
 	// runtimeDoubleBoundaryPath is the designated runtime.Provider double source.
 	runtimeDoubleBoundaryPath = "internal/runtime/fake.go"
 	// runtimeContractWaiverOwner owns the remaining production-runtime gaps.
-	runtimeContractWaiverOwner = "ga-80po0c.3"
+	runtimeContractWaiverOwner = "ga-uz5t3a"
 
 	// MarkdownStart begins the generated TESTING.md table.
 	MarkdownStart = "<!-- BEGIN CHECKED RUNTIME PROVIDER LEDGER -->"
@@ -182,6 +182,7 @@ func Catalog() []Entry {
 			"acp", "exact:acp", nil,
 			waivedRuntime(
 				repoSymbol("internal/runtime/acp", "NewSeamBacked"),
+				time.Date(2026, time.September, 7, 0, 0, 0, 0, time.UTC),
 				"NewSeamBacked always uses shared os.TempDir()/gc-acp-<euid> state; the WithDir proof does not exercise that composition",
 			),
 			provedRuntime(
@@ -198,6 +199,7 @@ func Catalog() []Entry {
 			"t3bridge", "exact:t3bridge", nil,
 			waivedRuntime(
 				repoSymbol("internal/runtime/t3bridge", "NewSeamBacked"),
+				time.Date(2026, time.September, 7, 0, 0, 0, 0, time.UTC),
 				"the production T3 bridge composition has focused tests but no full shared runtime contract",
 			),
 		),
@@ -205,6 +207,7 @@ func Catalog() []Entry {
 			"k8s", "exact:k8s", nil,
 			waivedRuntime(
 				repoSymbol("internal/runtime/k8s", "NewSeamBacked"),
+				time.Date(2026, time.September, 7, 0, 0, 0, 0, time.UTC),
 				"the actual K8s production composition has no full shared runtime contract",
 			),
 		),
@@ -212,6 +215,7 @@ func Catalog() []Entry {
 			"herdr", "exact:herdr", nil,
 			waivedRuntime(
 				repoSymbol("internal/runtime/herdr", "New"),
+				time.Date(2026, time.September, 7, 0, 0, 0, 0, time.UTC),
 				"the existing full conformance run skips in short mode or when the herdr executable is absent",
 			),
 		),
@@ -219,6 +223,7 @@ func Catalog() []Entry {
 			"hybrid", "exact:hybrid", nil,
 			waivedRuntime(
 				repoSymbol("cmd/gc", "newHybridProvider"),
+				time.Date(2026, time.September, 7, 0, 0, 0, 0, time.UTC),
 				"cmd/gc.newHybridProvider is the selected registry construction boundary; its internal tmux, K8s, and hybrid constructors are not claimed here, and the wrapper has no full shared runtime contract",
 			),
 		),
@@ -234,6 +239,7 @@ func Catalog() []Entry {
 			),
 			waivedRuntime(
 				repoSymbol("internal/runtime/t3bridge", "NewSeamBacked"),
+				time.Date(2026, time.September, 7, 0, 0, 0, 0, time.UTC),
 				"the legacy gc-session-t3 prefix branch selects the T3 bridge composition, which has no full shared runtime contract",
 			),
 		),
@@ -241,6 +247,7 @@ func Catalog() []Entry {
 			"ssh", "prefix:ssh:", nil,
 			waivedRuntime(
 				repoSymbol("internal/runtime/ssh", "NewSeamBacked"),
+				time.Date(2026, time.September, 7, 0, 0, 0, 0, time.UTC),
 				"the production SSH composition has no full shared runtime contract",
 			),
 		),
@@ -248,6 +255,7 @@ func Catalog() []Entry {
 			"tmux", "exact:tmux", nil,
 			waivedRuntime(
 				repoSymbol("internal/runtime/tmux", "NewSeamBackedWithConfig"),
+				time.Date(2026, time.September, 7, 0, 0, 0, 0, time.UTC),
 				"the existing full conformance run skips when the tmux executable is absent",
 			),
 		),
@@ -324,33 +332,25 @@ func provedRuntimeScoped(constructor SymbolRef, file, test, scope string, allowe
 	return claim
 }
 
-// runtimeWaiverExpiry dates every remaining runtime.Provider waiver owned by
-// runtimeContractWaiverOwner. The prior 2026-08-12 date lapsed and turned the
-// whole ledger check red, so this is a renewal, not a first grant.
+// waivedRuntime builds a claim that defers proof of the runtime.Provider
+// contract to a dated waiver. Each call site supplies its own expires
+// literal rather than a shared expiry: a single shared expiry previously
+// caused every remaining waiver to lapse in lockstep and turn the whole
+// ledger check red at once (GitHub #5195), which was "fixed" by pushing
+// the one shared date forward instead of dating each gap independently.
 //
-// Each gap was re-checked against cmd/gc/runtime_registry.go at renewal: all
-// eight constructors are still live registrations, and none has gained a
-// runnable full contract, so none was retired as stale. The subprocess
-// default-directory composition is the one that could be contracted instead of
-// renewed, and it was.
-//
-// Two weeks, deliberately, and not the 90-day maxWaiverHorizon the validator
-// permits. ga-80po0c.3's only open child has not moved since 2026-07-18, and
-// the same nine waivers already lapsed once and were extended — not
-// re-decided — to this date to unblock an unrelated PR. A long horizon would
-// hide a stalled track behind a green run; a short one puts the question back
-// in front of the owner while the context is still fresh. Renewing again
-// without contracts landing is debt, and the next renewal should say so.
-var runtimeWaiverExpiry = time.Date(2026, time.August, 26, 0, 0, 0, 0, time.UTC)
-
-func waivedRuntime(constructor SymbolRef, reason string) ContractClaim {
+// Prefer a short horizon (weeks, not the 90-day maxWaiverHorizon the
+// validator allows): a long horizon hides a stalled contract behind a
+// green run, while a short one puts the question back in front of the
+// owner while the context is still fresh.
+func waivedRuntime(constructor SymbolRef, expires time.Time, reason string) ContractClaim {
 	return ContractClaim{
 		Constructor: constructor,
 		Contract:    ContractRuntimeProvider,
 		Disposition: DispositionWaived,
 		Waiver: &Waiver{
 			Owner:   runtimeContractWaiverOwner,
-			Expires: runtimeWaiverExpiry,
+			Expires: expires,
 			Reason:  reason,
 		},
 	}

@@ -28,7 +28,7 @@ func waitReady(t *testing.T, tl *cityRunTailer) {
 	t.Helper()
 	select {
 	case <-tl.readyCh:
-	case <-time.After(2 * time.Second):
+	case <-time.After(hangBudget):
 		t.Fatalf("cold replay for %q did not complete within deadline", tl.name)
 	}
 }
@@ -151,7 +151,7 @@ func TestFirstDemandColdLoadTimeoutRetriesAfterReady(t *testing.T) {
 	}()
 	select {
 	case <-started:
-	case <-time.After(time.Second):
+	case <-time.After(hangBudget):
 		t.Fatal("first summary demand did not trigger cold load")
 	}
 	var first runSummaryWire
@@ -163,7 +163,7 @@ func TestFirstDemandColdLoadTimeoutRetriesAfterReady(t *testing.T) {
 		if err := json.Unmarshal(rec.Body.Bytes(), &first); err != nil {
 			t.Fatalf("decode first summary: %v; body=%s", err, rec.Body.String())
 		}
-	case <-time.After(time.Second):
+	case <-time.After(hangBudget):
 		t.Fatal("first summary did not return the bounded warming response")
 	}
 	if !first.LanesPartial {
@@ -180,7 +180,7 @@ func TestFirstDemandColdLoadTimeoutRetriesAfterReady(t *testing.T) {
 	}
 	select {
 	case <-tl.readyCh:
-	case <-time.After(time.Second):
+	case <-time.After(hangBudget):
 		t.Fatal("cold load did not become ready after release")
 	}
 	second := getRunSummary(t, p, "alpha")

@@ -492,6 +492,10 @@ func formatLegacyL2L3MismatchError(l2, l3 string) error {
 }
 
 func managedDoltOpenDatabase(host, port, user, database string) (*sql.DB, error) {
+	return managedDoltOpenDatabaseWithPassword(host, port, user, database, managedDoltPassword())
+}
+
+func managedDoltOpenDatabaseWithPassword(host, port, user, database, password string) (*sql.DB, error) {
 	host = managedDoltConnectHost(host)
 	port = strings.TrimSpace(port)
 	if port == "" {
@@ -507,7 +511,7 @@ func managedDoltOpenDatabase(host, port, user, database string) (*sql.DB, error)
 	}
 	cfg := mysql.NewConfig()
 	cfg.User = user
-	cfg.Passwd = managedDoltPassword()
+	cfg.Passwd = password
 	cfg.Net = "tcp"
 	cfg.Addr = host + ":" + port
 	cfg.DBName = database

@@ -82,7 +82,7 @@ type (
 	hookDrainAckFunc           func(io.Writer) error
 	hookEmitClaimRejectedFunc  func(beadID, existingClaimant, attemptedClaimant string)
 	hookResolveWorkBranchFunc  func(dir string) string
-	hookInputDoneFunc          func(ctx context.Context, dir string, env []string, candidate beads.Bead) (string, bool, error)
+	hookInputDoneFunc          func(ctx context.Context, dir string, env []string, candidate beads.Bead, identityCandidates []string) (string, bool, error)
 	hookSkipDoneWorkflowFunc   func(ctx context.Context, dir string, env []string, rootID string) error
 	hookStampWorkMetaFunc      func(ctx context.Context, dir string, env []string, beadID, assignee string, patch map[string]string) error
 	hookPublishRunMapFunc      func(runID, beadID string, sessionKeys ...string) error
@@ -507,7 +507,7 @@ func hookSkipIfInputDone(candidate beads.Bead, opts hookClaimOptions, ops hookCl
 	}
 	ctx, cancel := context.WithTimeout(context.Background(), hookClaimMutationTimeout)
 	defer cancel()
-	rootID, done, err := ops.InputDone(ctx, dir, opts.Env, candidate)
+	rootID, done, err := ops.InputDone(ctx, dir, opts.Env, candidate, opts.IdentityCandidates)
 	if err != nil {
 		fmt.Fprintf(stderr, "gc hook --claim: checking input convoy for %s: %v\n", candidate.ID, err) //nolint:errcheck
 		return false
@@ -519,15 +519,18 @@ func hookSkipIfInputDone(candidate beads.Bead, opts hookClaimOptions, ops hookCl
 		fmt.Fprintf(stderr, "gc hook --claim: retiring workflow %s whose input work is already terminal: %v\n", rootID, err) //nolint:errcheck
 		return false
 	}
-	fmt.Fprintf(stderr, "gc hook --claim: skipped %s: workflow %s input convoy work is already terminal; root and open steps closed as skipped\n", candidate.ID, rootID) //nolint:errcheck
+	fmt.Fprintf(stderr, "gc hook --claim: skipped %s: workflow %s input convoy work is already terminal or handed off to another lane; root and open steps closed as skipped\n", candidate.ID, rootID) //nolint:errcheck
 	return true
 }
 
 // workflowInputDone resolves candidate to its workflow root (itself when it
 // carries gc.input_convoy_id, else via gc.root_bead_id) and reports whether
-// every member the root's input convoy tracks is terminal. A root with no
-// input convoy, or a convoy with no resolvable members, is never "done".
-func workflowInputDone(store beads.Store, candidate beads.Bead) (string, bool, error) {
+// every member the root's input convoy tracks is terminal, or non-terminal
+// but handed off to an assignee outside identityCandidates (no longer ours to
+// wait on). A member that is still unassigned, or still assigned to one of
+// identityCandidates, blocks. A root with no input convoy, or a convoy with
+// no resolvable members, is never "done".
+func workflowInputDone(store beads.Store, candidate beads.Bead, identityCandidates []string) (string, bool, error) {
 	root := candidate
 	if strings.TrimSpace(root.Metadata[beadmeta.InputConvoyIDMetadataKey]) == "" {
 		rootID := strings.TrimSpace(candidate.Metadata[beadmeta.RootBeadIDMetadataKey])
@@ -552,9 +555,13 @@ func workflowInputDone(store beads.Store, candidate beads.Bead) (string, bool, e
 		return root.ID, false, nil
 	}
 	for _, m := range members {
-		if !convoy.IsTerminalStatus(m.Status) {
-			return root.ID, false, nil
+		if convoy.IsTerminalStatus(m.Status) {
+			continue
 		}
+		if strings.TrimSpace(m.Assignee) != "" && !hookClaimHasIdentity(m.Assignee, identityCandidates) {
+			continue
+		}
+		return root.ID, false, nil
 	}
 	return root.ID, true, nil
 }
@@ -588,8 +595,8 @@ func skipDoneWorkflow(store beads.Store, rootID string) error {
 
 const hookSkipDoneWorkflowCloseReason = "hook --claim: input convoy work already terminal; nothing to do"
 
-func hookInputDoneWithBdStore(_ context.Context, dir string, env []string, candidate beads.Bead) (string, bool, error) {
-	return workflowInputDone(hookClaimBdStore(dir, env, ""), candidate)
+func hookInputDoneWithBdStore(_ context.Context, dir string, env []string, candidate beads.Bead, identityCandidates []string) (string, bool, error) {
+	return workflowInputDone(hookClaimBdStore(dir, env, ""), candidate, identityCandidates)
 }
 
 func hookSkipDoneWorkflowWithBdStore(_ context.Context, dir string, env []string, rootID string) error {

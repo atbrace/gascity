@@ -341,6 +341,7 @@ func newRootCmdWithOptions(stdout, stderr io.Writer, options rootCommandOptions)
 		newDoctorCmd(stdout, stderr),
 		newHookCmd(stdout, stderr),
 		newSlingCmd(stdout, stderr),
+		newSubmitCmd(stdout, stderr),
 		newConvoyCmd(stdout, stderr),
 		newWispCmd(stdout, stderr),
 		newMoleculeCmd(stdout, stderr),

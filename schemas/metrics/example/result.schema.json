@@ -205,7 +205,8 @@
               "login",
               "logout",
               "whoami",
-              "runtime-heartbeat"
+              "runtime-heartbeat",
+              "submit"
             ]
           },
           "event_id": {

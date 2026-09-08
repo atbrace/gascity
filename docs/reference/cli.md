@@ -79,6 +79,7 @@ gc [flags]
 | [gc start](#gc-start) | Start the city under the machine-wide supervisor |
 | [gc status](#gc-status) | Show city-wide status overview |
 | [gc stop](#gc-stop) | Stop all agent sessions in the city |
+| [gc submit](#gc-submit) | Hand a polecat's work to the refinery atomically (push, verify on origin, then reassign) |
 | [gc supervisor](#gc-supervisor) | Manage the machine-wide supervisor |
 | [gc suspend](#gc-suspend) | Suspend the city (all agents effectively suspended) |
 | [gc trace](#gc-trace) | Inspect and control session reconciler tracing |
@@ -4295,6 +4296,35 @@ gc stop [path|name] [flags]
 | `--force` | bool |  | skip the interrupt grace period and force-kill all sessions immediately |
 | `--json` | bool |  | emit JSONL summary |
 | `--timeout` | duration | `0s` | wall-clock cap for the stop sequence (0 = derive from city config) |
+
+## gc submit
+
+Perform the polecat -&gt; refinery handoff as one fail-closed operation.
+
+In order: resolve the work bead (--bead, or the single open member of
+--convoy); check the refinery target names a configured agent; assert HEAD is
+on the expected branch (metadata.branch, else polecat/&lt;bead&gt;) and not detached;
+assert the tree is clean; fetch the base and assert the branch has commits
+beyond it; push; read the ref back from origin with ls-remote and require it
+at the local HEAD. Only then does it write metadata.branch/target, clear
+gc.routed_to and reassign the bead to the refinery. Any failure before that
+point leaves the bead exactly as it was.
+
+If the bead carries metadata.auto_push=false the verb halts at branch-ready
+without pushing or reassigning, matching the previous formula contract.
+
+```
+gc submit [flags]
+```
+
+| Flag | Type | Default | Description |
+|------|------|---------|-------------|
+| `--base` | string | `main` | base branch the refinery merges into (metadata.target) |
+| `--bead` | string |  | work bead id (or use --convoy) |
+| `--convoy` | string |  | convoy whose single open member is the work bead |
+| `--dir` | string |  | worktree directory (default: cwd) |
+| `--json` | bool |  | JSON output |
+| `--refinery` | string |  | qualified refinery agent name to assign the bead to (required) |
 
 ## gc supervisor
 

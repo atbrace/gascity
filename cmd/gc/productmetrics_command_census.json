@@ -1,6 +1,6 @@
 {
   "schema_version": 1,
-  "next_id": 196,
+  "next_id": 197,
   "permanent_ids": [
     {
       "name": "help",
@@ -3886,6 +3886,21 @@
       "classification": "stop",
       "owner": "immediate",
       "id": 164
+    },
+    {
+      "path": "gc submit",
+      "aliases": [],
+      "conditional_modes": [],
+      "hidden": false,
+      "effective_hidden": false,
+      "disable_flag_parsing": false,
+      "shape": "runnable",
+      "recording_policy": "recordable",
+      "mode": "standard",
+      "notice_policy": "eligible",
+      "classification": "submit",
+      "owner": "immediate",
+      "id": 196
     },
     {
       "path": "gc supervisor",

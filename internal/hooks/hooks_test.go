@@ -1958,8 +1958,11 @@ func TestInstallPiHookUsesCurrentExtensionAPI(t *testing.T) {
 		`pi.on("session_start"`,
 		`pi.on("session_compact"`,
 		`pi.on("before_agent_start"`,
-		"const GC_PI_HOOK_VERSION = 7",
+		"const GC_PI_HOOK_VERSION = 8",
 		"gc hook --inject",
+		`pi.on("agent_end"`,
+		"startIdleDrain(pi, ctx)",
+		"pi.sendUserMessage(nudges)",
 		`run(["prime", "--hook"], ctx.cwd, providerSessionEnv(ctx))`,
 		"GC_PROVIDER_SESSION_ID",
 		"GC_PROVIDER_SESSION_ID_REQUIRED",
@@ -2020,7 +2023,7 @@ func TestPiHookNeedsUpgradeComparesParsedVersion(t *testing.T) {
 // gc prime --hook
 // gc hook --inject
 // gc handoff --auto
-const GC_PI_HOOK_VERSION = 7;
+const GC_PI_HOOK_VERSION = 8;
 run(["prime", "--hook"], ctx.cwd, providerSessionEnv(ctx));
 run(["hook", "--inject"], ctx.cwd);
 run(["handoff", "--auto", "context cycle"], ctx.cwd);
@@ -2030,8 +2033,8 @@ GC_PROVIDER_SESSION_ID_REQUIRED;
 stdio: ["ignore", "pipe", "inherit"];
 function providerSessionEnv(ctx) {}
 `)
-	stale := bytes.Replace(current, []byte("GC_PI_HOOK_VERSION = 7"), []byte("GC_PI_HOOK_VERSION = 6"), 1)
-	future := bytes.Replace(current, []byte("GC_PI_HOOK_VERSION = 7"), []byte("GC_PI_HOOK_VERSION = 8"), 1)
+	stale := bytes.Replace(current, []byte("GC_PI_HOOK_VERSION = 8"), []byte("GC_PI_HOOK_VERSION = 7"), 1)
+	future := bytes.Replace(current, []byte("GC_PI_HOOK_VERSION = 8"), []byte("GC_PI_HOOK_VERSION = 9"), 1)
 	missingStderrForward := bytes.Replace(current, []byte(`stdio: ["ignore", "pipe", "inherit"];
 `), nil, 1)
 

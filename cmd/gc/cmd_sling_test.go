@@ -329,6 +329,21 @@ func assertStoreRoutedTo(t *testing.T, store beads.Store, beadID, want string) {
 	}
 }
 
+// assertStoreNotRouted asserts no route was written for beadID. A skip leaves
+// the bead absent from the store entirely (nothing ever wrote to it), which is
+// the same "not routed" outcome as a present bead with empty gc.routed_to — so
+// a missing bead passes rather than failing the way assertStoreRoutedTo would.
+func assertStoreNotRouted(t *testing.T, store beads.Store, beadID string) {
+	t.Helper()
+	bead, err := store.Get(beadID)
+	if err != nil {
+		return
+	}
+	if got := bead.Metadata["gc.routed_to"]; got != "" {
+		t.Fatalf("%s gc.routed_to = %q, want no route written", beadID, got)
+	}
+}
+
 // sharedTestFormulaDir is a package-level temp directory containing minimal
 // formula TOML files for all formula names commonly used in sling tests.
 var (
@@ -3531,7 +3546,12 @@ func (q *fakeChildQuerier) List(query beads.ListQuery) ([]beads.Bead, error) {
 	return beads.ApplyListQuery(normalized, query), nil
 }
 
-func TestCheckBeadStateAssigneeWarns(t *testing.T) {
+// TestCheckBeadStateAssigneeSkipsInFlight: a bead held by another actor is in
+// flight and must NOT be routed (sys-dpeoz). This test previously asserted the
+// opposite — warn on stderr, then route anyway — which is the defect itself:
+// re-slinging a claimed bead poured a second molecule for work already under
+// way. The skip is a clean exit 0, and the routing metadata must be untouched.
+func TestCheckBeadStateAssigneeSkipsInFlight(t *testing.T) {
 	runner := newFakeRunner()
 	sp := runtime.NewFake()
 	cfg := &config.City{Workspace: config.Workspace{Name: "test-city"}}
@@ -3545,13 +3565,16 @@ func TestCheckBeadStateAssigneeWarns(t *testing.T) {
 	if code != 0 {
 		t.Fatalf("doSling returned %d, want 0", code)
 	}
-	if !strings.Contains(stderr.String(), "already assigned to \"other-agent\"") {
-		t.Errorf("stderr = %q, want assignee warning", stderr.String())
+	if !strings.Contains(stdout.String(), "in flight (assigned to other-agent)") {
+		t.Errorf("stdout = %q, want in-flight skip naming the holder", stdout.String())
+	}
+	if !strings.Contains(stdout.String(), "--reassign") {
+		t.Errorf("stdout = %q, want the skip to name the flag that overrides it", stdout.String())
 	}
 	if len(runner.calls) != 0 {
 		t.Errorf("got %d runner calls, want 0 for built-in routing", len(runner.calls))
 	}
-	assertStoreRoutedTo(t, deps.Store, "MY-42", "mayor")
+	assertStoreNotRouted(t, deps.Store, "MY-42")
 }
 
 func TestCheckBeadStatePoolLabelWarns(t *testing.T) {
@@ -3573,7 +3596,43 @@ func TestCheckBeadStatePoolLabelWarns(t *testing.T) {
 	}
 }
 
+// TestCheckBeadStateBothWarnings covers warning ACCUMULATION — that a bead
+// carrying several kinds of stale routing state reports all of them, not just
+// the first. It used to use assignee + pool label, but an assignee now means
+// in flight and short-circuits to a skip before any warning is built
+// (sys-dpeoz), so the accumulation case is expressed with the two kinds of
+// state that still warn: routed somewhere else, and a foreign pool label.
 func TestCheckBeadStateBothWarnings(t *testing.T) {
+	runner := newFakeRunner()
+	sp := runtime.NewFake()
+	cfg := &config.City{Workspace: config.Workspace{Name: "test-city"}}
+	a := config.Agent{Name: "mayor", MaxActiveSessions: intPtr(1)}
+	q := &fakeQuerier{bead: beads.Bead{
+		ID:       "BL-42",
+		Metadata: map[string]string{"gc.routed_to": "someone-else"},
+		Labels:   []string{"pool:hw/polecat"},
+	}}
+
+	deps, stdout, stderr := testDeps(cfg, sp, runner.run)
+	opts := testOpts(a, "BL-42")
+	code := doSling(opts, deps, q, stdout, stderr)
+
+	if code != 0 {
+		t.Fatalf("doSling returned %d, want 0", code)
+	}
+	if !strings.Contains(stderr.String(), "already routed to") {
+		t.Errorf("stderr = %q, want routed-to warning", stderr.String())
+	}
+	if !strings.Contains(stderr.String(), "already has pool label") {
+		t.Errorf("stderr = %q, want pool label warning", stderr.String())
+	}
+}
+
+// TestCheckBeadStateAssigneeBeatsPoolLabel: an assignee outranks the other
+// routing state on the bead. A bead that is both held by another actor and
+// carries a foreign pool label is in flight, and the in-flight skip must win
+// over the warn-and-route path that the pool label alone would take.
+func TestCheckBeadStateAssigneeBeatsPoolLabel(t *testing.T) {
 	runner := newFakeRunner()
 	sp := runtime.NewFake()
 	cfg := &config.City{Workspace: config.Workspace{Name: "test-city"}}
@@ -3591,12 +3650,10 @@ func TestCheckBeadStateBothWarnings(t *testing.T) {
 	if code != 0 {
 		t.Fatalf("doSling returned %d, want 0", code)
 	}
-	if !strings.Contains(stderr.String(), "already assigned") {
-		t.Errorf("stderr = %q, want assignee warning", stderr.String())
+	if !strings.Contains(stdout.String(), "in flight (assigned to other-agent)") {
+		t.Errorf("stdout = %q, want in-flight skip", stdout.String())
 	}
-	if !strings.Contains(stderr.String(), "already has pool label") {
-		t.Errorf("stderr = %q, want pool label warning", stderr.String())
-	}
+	assertStoreNotRouted(t, deps.Store, "BL-42")
 }
 
 func TestCheckBeadStateCleanNoWarning(t *testing.T) {
@@ -6801,13 +6858,33 @@ func TestCheckBeadStateCustomQueryNoIdempotency(t *testing.T) {
 	}
 }
 
+// TestCheckBeadStateDifferentAssignee: an assignee that is not the sling
+// target means the bead is in flight, so the check reports a skip and names
+// the holder. It used to assert Idempotent=false plus a warning, i.e. "warn,
+// then route it anyway" — the sys-dpeoz defect.
 func TestCheckBeadStateDifferentAssignee(t *testing.T) {
 	q := &fakeQuerier{bead: beads.Bead{ID: "BL-42", Assignee: "other-agent"}}
 	a := config.Agent{Name: "mayor", MaxActiveSessions: intPtr(1)}
 
 	result := checkBeadState(q, "BL-42", a)
+	if !result.Idempotent {
+		t.Error("expected Idempotent=true for a bead held by a different assignee")
+	}
+	if result.InFlightOwner != "other-agent" {
+		t.Errorf("InFlightOwner = %q, want %q", result.InFlightOwner, "other-agent")
+	}
+}
+
+// TestCheckBeadStateDifferentAssigneeReassign: --reassign is the deliberate
+// "take this bead from its current owner" verb, so it must route past the
+// in-flight skip rather than be stopped by it.
+func TestCheckBeadStateDifferentAssigneeReassign(t *testing.T) {
+	q := &fakeQuerier{bead: beads.Bead{ID: "BL-42", Assignee: "other-agent"}}
+	a := config.Agent{Name: "mayor", MaxActiveSessions: intPtr(1)}
+
+	result := sling.CheckBeadStateWithOptions(q, "BL-42", a, sling.SlingDeps{}, sling.BeadCheckOptions{Reassign: true})
 	if result.Idempotent {
-		t.Error("expected Idempotent=false for different assignee")
+		t.Error("expected Idempotent=false: --reassign must route through the in-flight skip")
 	}
 	if len(result.Warnings) != 1 {
 		t.Fatalf("expected 1 warning, got %d: %v", len(result.Warnings), result.Warnings)

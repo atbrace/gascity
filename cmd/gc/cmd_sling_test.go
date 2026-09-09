@@ -5423,6 +5423,48 @@ description = "Target: {{target_id}}, workspace: {{workspace}}"
 	}
 }
 
+// TestOnFormulaInFlightBeadWithNoMoleculeSkips pins the ORDER between the two
+// guards, which is the subtle half of sys-dpeoz.
+//
+// The in-flight skip must not preempt the attachment path's refusals: an
+// existing molecule is reported by name and exits 1 (see the three
+// TestOnFormula*Errors tests, whose fixtures deliberately carry an assignee to
+// mark the molecule as legitimate). Downgrading those to a quiet exit-0 skip
+// loses a correct, specific error.
+//
+// But the reverse gap is the actual re-pour: a bead a polecat has claimed
+// carries an assignee and NO molecule, because the claim cleared gc.routed_to
+// and nothing is attached yet. It passes every attachment check. If the skip
+// did not land after them, this sling would attach a second molecule for work
+// already under way — which is exactly what happened four times in one day on
+// the sysadmin rig.
+func TestOnFormulaInFlightBeadWithNoMoleculeSkips(t *testing.T) {
+	runner := newFakeRunner()
+	sp := runtime.NewFake()
+	cfg := &config.City{Workspace: config.Workspace{Name: "test-city"}}
+	a := config.Agent{Name: "mayor", MaxActiveSessions: intPtr(1)}
+
+	q := newFakeChildQuerier()
+	// Held by another actor, but nothing attached — the claimed-bead shape.
+	q.beadsByID["BL-42"] = beads.Bead{ID: "BL-42", Type: "task", Status: "open", Assignee: "other-agent"}
+
+	deps, stdout, stderr := testDeps(cfg, sp, runner.run)
+	opts := testOpts(a, "BL-42")
+	opts.OnFormula = "code-review"
+	code := doSling(opts, deps, q, stdout, stderr)
+
+	if code != 0 {
+		t.Fatalf("doSling returned %d, want 0; stdout=%s stderr=%s", code, stdout.String(), stderr.String())
+	}
+	if !strings.Contains(stdout.String(), "in flight (assigned to other-agent)") {
+		t.Errorf("stdout = %q, want in-flight skip", stdout.String())
+	}
+	if len(runner.calls) != 0 {
+		t.Errorf("got %d runner calls, want 0 — the skip must not attach a formula", len(runner.calls))
+	}
+	assertStoreNotRouted(t, deps.Store, "BL-42")
+}
+
 func TestOnFormulaExistingMoleculeErrors(t *testing.T) {
 	runner := newFakeRunner()
 	sp := runtime.NewFake()

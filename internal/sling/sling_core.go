@@ -174,9 +174,16 @@ func resolveIdempotentShortCircuit(opts SlingOpts, a config.Agent, deps SlingDep
 		NoConvoy: opts.NoConvoy,
 		Reassign: opts.Reassign,
 	})
-	// An in-flight skip must not fall into the --on attachment path: the bead
-	// belongs to another actor, so attaching a formula to it is the very
-	// duplicate pour this skip exists to stop.
+	// An in-flight bead on a formula-backed route must NOT short-circuit here.
+	// The attachment path owns the louder, more specific refusals — an existing
+	// molecule is reported by name, a malformed --on reports the missing
+	// variable — and those must win over a quiet exit-0 skip. Short-circuiting
+	// here would downgrade a correct, named error into silence. The skip is
+	// re-applied in attachFormulaToBead once those checks have passed, so an
+	// in-flight bead with nothing attached still never gets a second molecule.
+	if check.InFlightOwner != "" && usesFormulaBackedRoute(opts) {
+		return false
+	}
 	if check.Idempotent && check.InFlightOwner == "" {
 		needsAttach, probeErr := onFormulaNeedsAttachment(opts, querier, deps)
 		switch {
@@ -410,6 +417,30 @@ func slingDefaultFormula(opts SlingOpts, deps SlingDeps, querier BeadQuerier, be
 // caller supplies the formula name, the sling method, and the error-label
 // prefix ("formula" vs "default formula"); graph-vs-legacy behavior is
 // byte-identical across both entry points.
+// inFlightSkipResult re-applies the in-flight skip at the attachment seam.
+// preflight deliberately lets a formula-backed route past the skip so the
+// checks above can raise their specific refusals first; this is where the skip
+// lands for a bead that passed them but is still held by another actor.
+// Without it, a re-sling of claimed work would simply become a second molecule
+// — the sys-dpeoz duplicate pour.
+func inFlightSkipResult(querier BeadQuerier, opts SlingOpts, deps SlingDeps, beadID string, result SlingResult) (SlingResult, bool) {
+	if opts.Force || opts.Reassign {
+		return result, false
+	}
+	check := CheckBeadStateWithOptions(querier, beadID, opts.Target, deps, BeadCheckOptions{
+		NoConvoy: opts.NoConvoy,
+		Reassign: opts.Reassign,
+	})
+	if check.InFlightOwner == "" {
+		return result, false
+	}
+	result.Idempotent = true
+	result.InFlightOwner = check.InFlightOwner
+	result.BeadID = beadID
+	result.Target = opts.Target.QualifiedName()
+	return result, true
+}
+
 func attachFormulaToBead(opts SlingOpts, deps SlingDeps, querier BeadQuerier, beadID, formulaName, method, errLabel string, result SlingResult) (SlingResult, error) {
 	a := opts.Target
 	formulaVars := BuildSlingFormulaVars(formulaName, beadID, opts.Vars, a, deps)
@@ -430,6 +461,9 @@ func attachFormulaToBead(opts SlingOpts, deps SlingDeps, querier BeadQuerier, be
 		return withGraphV2SourceWorkflowLock(context.Background(), deps, beadID, func() (SlingResult, error) {
 			if err := CheckNoMoleculeChildrenAllowLiveWorkflow(querier, beadID, deps.Store, &result); err != nil {
 				return result, fmt.Errorf("%w", err)
+			}
+			if res, skip := inFlightSkipResult(querier, opts, deps, beadID, result); skip {
+				return res, nil
 			}
 			if err := checkLegacySourceWorkflowConflict(deps, beadID); err != nil {
 				return result, fmt.Errorf("%w", err)
@@ -468,6 +502,9 @@ func attachFormulaToBead(opts SlingOpts, deps SlingDeps, querier BeadQuerier, be
 	// with CheckNoMoleculeChildren on this path.
 	if err := CheckNoMoleculeChildren(querier, beadID, deps.Store, &result); err != nil {
 		return result, fmt.Errorf("%w", err)
+	}
+	if res, skip := inFlightSkipResult(querier, opts, deps, beadID, result); skip {
+		return res, nil
 	}
 	run := func() (SlingResult, error) {
 		mResult, err := InstantiateSlingFormula(context.Background(), formulaName, SlingFormulaSearchPaths(deps, a), molecule.Options{

@@ -4,6 +4,7 @@ import (
 	"time"
 
 	"github.com/gastownhall/gascity/internal/beads"
+	"github.com/gastownhall/gascity/internal/config"
 	"github.com/gastownhall/gascity/internal/nudgequeue"
 )
 
@@ -25,12 +26,22 @@ type nudgeReference = nudgequeue.Reference
 // strongly-typed beads.NudgesStore so the nudges class is statically visible to
 // every leaf nudge-bead helper; the wrapper carries the same underlying store
 // value (identity to the work store until the nudges class relocates).
-var openNudgeBeadStore = func(cityPath string) beads.NudgesStore {
-	store, err := openStoreAtForCity(cityPath, cityPath)
+//
+// It takes the city config so a caller that already loaded it (the drain path
+// resolves its target from the same config) does not pay the full city+pack
+// TOML load again inside the store open; nil keeps the loading behavior.
+var openNudgeBeadStoreWithConfig = func(cityPath string, cfg *config.City) beads.NudgesStore {
+	store, err := openStoreAtForCityWithConfig(cityPath, cityPath, cfg)
 	if err != nil {
 		return beads.NudgesStore{}
 	}
 	return beads.NudgesStore{Store: resolveNudgesStore(store, nil, cityPath, nil)}
+}
+
+// openNudgeBeadStore is openNudgeBeadStoreWithConfig for callers with no
+// config in hand.
+func openNudgeBeadStore(cityPath string) beads.NudgesStore {
+	return openNudgeBeadStoreWithConfig(cityPath, nil)
 }
 
 // nudgeFrontDoor wraps a strongly-typed nudges store as the nudge object's

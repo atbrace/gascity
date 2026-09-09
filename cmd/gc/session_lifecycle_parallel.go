@@ -2259,6 +2259,15 @@ func commitStartFailure(result startResult, sessFront *sessionpkg.Store, clk clo
 			if saveErr := sessFront.SaveStartupHealthEpisode(episode); saveErr != nil {
 				fmt.Fprintf(stderr, "session reconciler: saving startup-health episode for %s: %v\n", name, saveErr) //nolint:errcheck
 			}
+			// Operator signal: one line at the moment the episode crosses the
+			// quarantine threshold, not one per held tick. Without it a slot
+			// whose pre_start fails deterministically is only visible as
+			// thousands of identical op=start provider_error lines
+			// (sys-by2243.12: 3949 in 24h).
+			if prior.QuarantinedUntil.IsZero() && !episode.QuarantinedUntil.IsZero() {
+				fmt.Fprintf(stderr, "session reconciler: startup-health QUARANTINE %s (template %s): %d consecutive failed starts since %s, next start allowed after %s; last error: %s\n",
+					name, tp.TemplateName, episode.ConsecutiveCount, episode.FirstFailureAt.UTC().Format(time.RFC3339), episode.QuarantinedUntil.UTC().Format(time.RFC3339), episode.LastDetail) //nolint:errcheck
+			}
 		}
 		rollbackPendingCreate(info, sessFront, clk.Now().UTC(), stderr)
 		logLifecycleOutcome(stderr, "start", wave, name, tp.TemplateName, string(result.outcome), result.started, result.finished, result.err, result.phases)

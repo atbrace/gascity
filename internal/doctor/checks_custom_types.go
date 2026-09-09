@@ -31,6 +31,13 @@ var RequiredCustomTypes = []string{
 	"molecule", "convoy", "message", "event", "gate",
 	"merge-request", "agent", "role", "rig", "session", "spec",
 	"convergence", "step",
+	// "startup-health-episode" is the per-pool-instance bookkeeping bead the
+	// session reconciler writes after each failed start so it can quarantine a
+	// slot after N consecutive failures (internal/session/startup_health.go).
+	// Without it registered every save fails "invalid issue type" and the
+	// quarantine never fires, so a poisoned slot re-spawns unbounded with no
+	// signal — measured live: 139 then 3,949 failed starts, zero episodes.
+	"startup-health-episode",
 }
 
 // CustomTypesCheck verifies that all required Gas City custom bead

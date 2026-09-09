@@ -85,6 +85,19 @@ func TestCustomTypesCheck_RequiredTypesIncludeConvergence(t *testing.T) {
 	}
 }
 
+func TestCustomTypesCheck_RequiredTypesIncludeStartupHealthEpisode(t *testing.T) {
+	found := false
+	for _, typ := range RequiredCustomTypes {
+		if typ == "startup-health-episode" {
+			found = true
+			break
+		}
+	}
+	if !found {
+		t.Fatal("RequiredCustomTypes must include 'startup-health-episode' — the session reconciler saves one per failed start")
+	}
+}
+
 // TestMergeCustomTypes exercises the merge/dedup/preservation logic that
 // backs CustomTypesCheck.Fix(). The regression it guards against is
 // `--fix` overwriting user-defined types (which was the pre-PR behavior

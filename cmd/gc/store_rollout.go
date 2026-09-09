@@ -110,6 +110,28 @@ func openControlBdStoreThroughFactory(scopeRoot, cityPath, provider string, cfg 
 	return nativeControlStores.retain(scopeRoot, result.Store), nil
 }
 
+// openNativeControlStore opens the native store for a control-plane scope
+// the same way the controller's rig stores do (api_state.go openRigStore):
+// the scoped Dolt env for the initial open, plus a reopen hook that
+// re-resolves the CURRENT env on every reconnect. The reopen deliberately
+// reloads config (cfg is nil) because the dispatcher process can outlive a
+// managed-Dolt restart or rebind by days, and the env it opened with pins
+// the port as of open time.
+func openNativeControlStore(scopeRoot, cityPath string, cfg *config.City) (beads.Store, error) {
+	env, err := nativeDoltOpenEnvForScope(cityPath, cfg, scopeRoot)
+	if err != nil {
+		return nil, fmt.Errorf("project native control store env %s: %w", scopeRoot, err)
+	}
+	reopen := func(ctx context.Context) (beads.NativeStorage, error) {
+		freshEnv, rerr := nativeDoltOpenEnvForScopeContext(ctx, cityPath, nil, scopeRoot)
+		if rerr != nil {
+			return nil, fmt.Errorf("re-resolve native control store env %s: %w", scopeRoot, rerr)
+		}
+		return beads.OpenNativeStorage(ctx, scopeRoot, freshEnv)
+	}
+	return beads.OpenNativeDoltStoreAt(context.Background(), scopeRoot, env, beads.WithNativeReopen(reopen))
+}
+
 // newControlPreflightChecker is a seam so tests of the control path can
 // substitute a checker that never forks bd; production uses the same checker
 // as every other gc store open.

@@ -1882,10 +1882,9 @@ func TestGastownRoutedToTargetsUseBindingPrefix(t *testing.T) {
 		{"packs/gastown/formulas/mol-polecat-work.toml", `${GC_RIG:+$GC_RIG/}{{binding_prefix}}refinery`},
 		{"packs/gastown/formulas/mol-refinery-patrol.toml", `${GC_RIG:+$GC_RIG/}{{binding_prefix}}polecat`},
 		{"packs/gastown/formulas/mol-idea-to-plan.toml", "$GC_RIG/{{binding_prefix}}polecat"},
-		{"packs/gastown/agents/mayor/prompt.template.md", `${TARGET_RIG:+$TARGET_RIG/}{{ .BindingPrefix }}polecat`},
+		{"packs/gastown/agents/mayor/prompt.template.md", `<rig>/{{ .BindingPrefix }}polecat`},
 		{"packs/gastown/agents/polecat/prompt.template.md", `${GC_RIG:+$GC_RIG/}{{ .BindingPrefix }}polecat`},
-		{"packs/gastown/agents/polecat/prompt.template.md", `${GC_RIG:+$GC_RIG/}{{ .BindingPrefix }}refinery`},
-		{"packs/gastown/template-fragments/approval-fallacy.template.md", `${GC_RIG:+$GC_RIG/}{{ .BindingPrefix }}refinery`},
+		{"packs/gastown/agents/polecat/prompt.template.md", `${GC_RIG:+$GC_RIG/}{{ .BindingPrefix }}witness`},
 	}
 	for _, check := range checks {
 		data, err := os.ReadFile(gastownRel(check.rel))
@@ -2540,10 +2539,8 @@ func TestGastownPromptPeerAddressesUseBindingPrefix(t *testing.T) {
 			templateName: "boot",
 			wants: []string{
 				"gc session peek gastown.deacon --lines 1",
-				"gc bd list --assignee=gastown.deacon --status=in_progress --json --limit=5",
-				"gc mail count gastown.deacon",
+				"gc bd list --assignee=gastown.deacon --status=in_progress --include-infra --json",
 				"gc session nudge gastown.deacon",
-				`--title="Stuck: gastown.deacon"`,
 				`"target":"gastown.deacon"`,
 			},
 			bads: []string{
@@ -2561,11 +2558,9 @@ func TestGastownPromptPeerAddressesUseBindingPrefix(t *testing.T) {
 			templateName: "boot",
 			unbound:      true,
 			wants: []string{
-				"gc session peek deacon --lines 1",
-				"gc bd list --assignee=deacon --status=in_progress --json --limit=5",
-				"gc mail count deacon",
+				"gc session peek deacon --lines 30",
+				"gc bd list --assignee=deacon --status=in_progress --include-infra --json",
 				"gc session nudge deacon",
-				`--title="Stuck: deacon"`,
 				`"target":"deacon"`,
 			},
 			bads: []string{
@@ -2906,8 +2901,8 @@ func TestGastownPatrolPromptFallbackPreservesLifecycle(t *testing.T) {
 				`run ` + "`gc hook`" + ` immediately`,
 				`CURRENT_WISP=${GC_BEAD_ID:-}`,
 				`if [ -z "$CURRENT_WISP" ]; then`,
-				`CURRENT_WISP=$(gc bd list --assignee="$GC_AGENT" --status=in_progress --type=wisp --limit=1 --json | jq -r '.[0].id // empty')`,
-				`ASSIGNED_WISP=$(gc bd list --assignee="$GC_AGENT" --status=open --type=wisp --limit=1 --json | jq -r '.[0].id // empty')`,
+				`CURRENT_WISP=$(gc bd list --assignee="$GC_AGENT" --status=in_progress --type=molecule --limit=1 --json | jq -r '.[0].id // empty')`,
+				`ASSIGNED_WISP=$(gc bd list --assignee="$GC_AGENT" --status=open --type=molecule --limit=1 --json | jq -r '.[0].id // empty')`,
 				`if [ -n "$CURRENT_WISP" ] && [ -z "$ASSIGNED_WISP" ]; then`,
 				`NEXT=$(gc bd mol wisp mol-deacon-patrol --root-only --var binding_prefix=gastown. --json | jq -r '.new_epic_id // empty')`,
 				`if [ -z "$NEXT" ]; then`,
@@ -2997,7 +2992,7 @@ func TestRefineryPatrolRestartGuidanceAssignsSuccessor(t *testing.T) {
 			wantOrder: []string{
 				`CURRENT_WISP=${GC_BEAD_ID:-}`,
 				`if [ -z "$CURRENT_WISP" ]; then`,
-				`CURRENT_WISP=$(gc bd list --assignee="$GC_AGENT" --status=in_progress --type=wisp --limit=1 --json | jq -r '.[0].id // empty')`,
+				`CURRENT_WISP=$(gc bd list --assignee="$GC_AGENT" --status=in_progress --type=molecule --limit=1 --json | jq -r '.[0].id // empty')`,
 				`fi`,
 				`NEXT=$(gc bd mol wisp mol-refinery-patrol --root-only --var target_branch={{ .DefaultBranch }} --var rig_name={{ .RigName }} --var binding_prefix={{ .BindingPrefix }} --json | jq -r '.new_epic_id // empty')`,
 				`if [ -z "$NEXT" ]; then`,
@@ -4024,7 +4019,7 @@ func TestRefineryPromptUsesCanonicalAgentIdentity(t *testing.T) {
 	for _, want := range []string{
 		`gc bd list --assignee="$GC_AGENT" --status=in_progress`,
 		`gc bd update "$WISP" --assignee="$GC_AGENT"`,
-		`| Find assigned work | ` + "`" + `gc bd list ${GC_RIG:+--rig="$GC_RIG"} --assignee="$GC_AGENT" --status=open` + "`" + ` |`,
+		`| Find assigned work | ` + "`" + `gc bd list ${GC_RIG:+--rig="$GC_RIG"} --assignee="$GC_AGENT" --status=open,in_progress` + "`" + ` — both statuses`,
 	} {
 		if !strings.Contains(body, want) {
 			t.Errorf("refinery prompt missing canonical $GC_AGENT usage %q", want)
@@ -4068,7 +4063,7 @@ func TestRefineryAssignedWorkQueriesUsePortableRigScope(t *testing.T) {
 		{
 			name: "prompt quick reference",
 			body: prompt,
-			want: `| Find assigned work | ` + "`" + `gc bd list ${GC_RIG:+--rig="$GC_RIG"} --assignee="$GC_AGENT" --status=open` + "`" + ` |`,
+			want: `| Find assigned work | ` + "`" + `gc bd list ${GC_RIG:+--rig="$GC_RIG"} --assignee="$GC_AGENT" --status=open,in_progress` + "`" + ` — both statuses`,
 		},
 		{
 			name: "formula find-work step",

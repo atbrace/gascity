@@ -430,6 +430,27 @@ func resolveConvoyRecovery(q BeadQuerier, b beads.Bead, deps SlingDeps, opts Bea
 	return BeadCheckResult{Idempotent: true}
 }
 
+// inFlightResult reports the skip for a bead another actor is already holding.
+// A non-empty assignee that is not the sling target means the work is in
+// flight right now: a pool slot that claimed it, a refinery holding a
+// submitted branch, an order, or a human. The routed-to idempotency check
+// above cannot see any of those, because claiming a bead CLEARS
+// gc.routed_to — so an in-flight bead is indistinguishable from a fresh one
+// on that field alone, and every later sling pours a second molecule for work
+// already under way (sys-dpeoz; measured four times in one day on the
+// sysadmin rig, each costing a pool seat and a hand sweep).
+//
+// --reassign is the deliberate "take it away from its current owner" verb and
+// must not be blocked here; --force bypasses this check entirely upstream in
+// shouldCheckBeadState.
+func inFlightResult(b beads.Bead, beadID, target string, opts BeadCheckOptions) (BeadCheckResult, bool) {
+	assignee := strings.TrimSpace(b.Assignee)
+	if opts.Reassign || assignee == "" || assignee == target {
+		return BeadCheckResult{}, false
+	}
+	return BeadCheckResult{Idempotent: true, InFlightOwner: assignee}, true
+}
+
 // CheckBeadState checks whether a bead is already routed and returns a
 // structured result. Best-effort: nil querier or query failure → empty result.
 func CheckBeadState(q BeadQuerier, beadID string, a config.Agent, deps SlingDeps) BeadCheckResult {
@@ -456,6 +477,9 @@ func CheckBeadStateWithOptions(q BeadQuerier, beadID string, a config.Agent, dep
 		if b.Assignee == "" || b.Assignee == target {
 			return resolveConvoyRecovery(q, b, deps, opts, beadID)
 		}
+		if res, ok := inFlightResult(b, beadID, target, opts); ok {
+			return res
+		}
 		return BeadCheckResult{
 			Warnings: []string{fmt.Sprintf("warning: bead %s routed to %q but assigned to %q", beadID, target, b.Assignee)},
 		}
@@ -465,6 +489,9 @@ func CheckBeadStateWithOptions(q BeadQuerier, beadID string, a config.Agent, dep
 	if !isMulti {
 		if b.Assignee == target {
 			return resolveConvoyRecovery(q, b, deps, opts, beadID)
+		}
+		if res, ok := inFlightResult(b, beadID, target, opts); ok {
+			return res
 		}
 		return BeadCheckResult{Warnings: routedStateWarnings(b, beadID)}
 	}
@@ -476,6 +503,9 @@ func CheckBeadStateWithOptions(q BeadQuerier, beadID string, a config.Agent, dep
 				return resolveConvoyRecovery(q, b, deps, opts, beadID)
 			}
 		}
+	}
+	if res, ok := inFlightResult(b, beadID, target, opts); ok {
+		return res
 	}
 	return BeadCheckResult{Warnings: routedStateWarnings(b, beadID)}
 }

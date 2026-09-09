@@ -172,8 +172,12 @@ func preflight(opts SlingOpts, deps SlingDeps, querier BeadQuerier) (SlingResult
 func resolveIdempotentShortCircuit(opts SlingOpts, a config.Agent, deps SlingDeps, querier BeadQuerier, result *SlingResult) bool {
 	check := CheckBeadStateWithOptions(querier, opts.BeadOrFormula, a, deps, BeadCheckOptions{
 		NoConvoy: opts.NoConvoy,
+		Reassign: opts.Reassign,
 	})
-	if check.Idempotent {
+	// An in-flight skip must not fall into the --on attachment path: the bead
+	// belongs to another actor, so attaching a formula to it is the very
+	// duplicate pour this skip exists to stop.
+	if check.Idempotent && check.InFlightOwner == "" {
 		needsAttach, probeErr := onFormulaNeedsAttachment(opts, querier, deps)
 		switch {
 		case probeErr != nil:
@@ -196,6 +200,7 @@ func resolveIdempotentShortCircuit(opts SlingOpts, a config.Agent, deps SlingDep
 		return false
 	}
 	result.Idempotent = true
+	result.InFlightOwner = check.InFlightOwner
 	result.DryRun = opts.DryRun
 	result.BeadID = opts.BeadOrFormula
 	result.Method = "bead"
@@ -1481,9 +1486,11 @@ func DoSlingBatch(opts SlingOpts, deps SlingDeps, querier BeadChildQuerier) (Sli
 		if !opts.Force {
 			check := CheckBeadStateWithOptions(querier, child.ID, a, deps, BeadCheckOptions{
 				NoConvoy: opts.NoConvoy,
+				Reassign: opts.Reassign,
 			})
 			if check.Idempotent {
 				childResult.Skipped = true
+				childResult.InFlightOwner = check.InFlightOwner
 				batchResult.Children = append(batchResult.Children, childResult)
 				idempotent++
 				continue

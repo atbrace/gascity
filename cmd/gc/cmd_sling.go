@@ -802,6 +802,10 @@ func printSlingWarnings(result sling.SlingResult, stderr io.Writer) {
 func printSlingResult(result sling.SlingResult, stdout, _ io.Writer) {
 	// Skip display messages for idempotent/dry-run (handled separately).
 	if result.Idempotent {
+		if result.InFlightOwner != "" {
+			fmt.Fprintf(stdout, "Bead %s is in flight (assigned to %s) — skipping. Use --reassign to take it from them, or --force to route anyway.\n", result.BeadID, result.InFlightOwner) //nolint:errcheck
+			return
+		}
 		fmt.Fprintf(stdout, "Bead %s already routed to %s — skipping (idempotent)\n", result.BeadID, result.Target) //nolint:errcheck
 		return
 	}
@@ -876,6 +880,8 @@ func printBatchSlingResult(result sling.SlingResult, stdout, stderr io.Writer) {
 		case child.Skipped:
 			if child.Status != "" {
 				fmt.Fprintf(stdout, "  Skipped %s (status: %s)\n", child.BeadID, child.Status) //nolint:errcheck
+			} else if child.InFlightOwner != "" {
+				fmt.Fprintf(stdout, "  Skipped %s — in flight, assigned to %s\n", child.BeadID, child.InFlightOwner) //nolint:errcheck
 			} else {
 				fmt.Fprintf(stdout, "  Skipped %s — already routed to %s\n", child.BeadID, result.Target) //nolint:errcheck
 			}
@@ -1717,11 +1723,17 @@ func dryRunSingle(opts slingOpts, deps slingDeps, querier BeadQuerier, stdout, s
 
 			check := sling.CheckBeadStateWithOptions(querier, opts.BeadOrFormula, a, deps, sling.BeadCheckOptions{
 				NoConvoy: opts.NoConvoy,
+				Reassign: opts.Reassign,
 			})
 			if check.Idempotent {
 				w("Idempotency:")
-				w("  Bead " + opts.BeadOrFormula + " is already routed to " + a.QualifiedName() + ".")
-				w("  Without --force, sling would skip routing (exit 0).")
+				if check.InFlightOwner != "" {
+					w("  Bead " + opts.BeadOrFormula + " is in flight, assigned to " + check.InFlightOwner + ".")
+					w("  Without --reassign or --force, sling would skip routing (exit 0).")
+				} else {
+					w("  Bead " + opts.BeadOrFormula + " is already routed to " + a.QualifiedName() + ".")
+					w("  Without --force, sling would skip routing (exit 0).")
+				}
 				w("")
 			}
 		}
@@ -1838,9 +1850,14 @@ func dryRunBatch(opts slingOpts, deps slingDeps, stdout, _ io.Writer,
 		if c.Status == "open" {
 			check := sling.CheckBeadStateWithOptions(querier, c.ID, a, deps, sling.BeadCheckOptions{
 				NoConvoy: opts.NoConvoy,
+				Reassign: opts.Reassign,
 			})
 			if check.Idempotent {
-				w("    " + clabel + " (open) → already routed (skip)")
+				if check.InFlightOwner != "" {
+					w("    " + clabel + " (open) → in flight, assigned to " + check.InFlightOwner + " (skip)")
+				} else {
+					w("    " + clabel + " (open) → already routed (skip)")
+				}
 			} else {
 				suffix := " → would route"
 				if opts.OnFormula != "" || (!opts.NoFormula && a.EffectiveDefaultSlingFormula() != "") {

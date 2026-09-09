@@ -185,6 +185,10 @@ type SlingResult struct {
 	FormulaName string // formula used (for display)
 	Idempotent  bool   // true if bead was already routed (skipped)
 	DryRun      bool   // true if this was a dry-run (no mutations)
+	// InFlightOwner is set alongside Idempotent when the skip was because
+	// another actor already holds the bead, not because it was already
+	// routed here. Empty otherwise.
+	InFlightOwner string
 
 	// Structured warnings (callers decide how to display).
 	AgentSuspended bool     // target agent is suspended
@@ -210,15 +214,17 @@ type SlingResult struct {
 
 // SlingChildResult holds the outcome for a single child in batch sling.
 type SlingChildResult struct {
-	BeadID      string
-	Status      string // bead status (for skipped non-open children)
-	Routed      bool
-	Skipped     bool // idempotent or non-open
-	Failed      bool
-	FailReason  string
-	WorkflowID  string // if graph workflow attached
-	WispRootID  string // if formula attached
-	FormulaName string // formula used
+	BeadID  string
+	Status  string // bead status (for skipped non-open children)
+	Routed  bool
+	Skipped bool // idempotent or non-open
+	// InFlightOwner is set on a skipped child that another actor holds.
+	InFlightOwner string
+	Failed        bool
+	FailReason    string
+	WorkflowID    string // if graph workflow attached
+	WispRootID    string // if formula attached
+	FormulaName   string // formula used
 }
 
 // Sling provides intent-based work routing operations. Construct via New.
@@ -1633,10 +1639,18 @@ func PromoteWorkflowLaunchBead(store beads.Store, beadID string) error {
 // BeadCheckResult holds the result of pre-flight bead state checks.
 type BeadCheckResult struct {
 	Idempotent bool
-	Warnings   []string
+	// InFlightOwner is the assignee currently holding the bead when the skip
+	// is an in-flight skip rather than an already-routed one. Callers use it
+	// to report the real reason; empty for every other idempotent result.
+	InFlightOwner string
+	Warnings      []string
 }
 
 // BeadCheckOptions configures pre-flight bead state checks for a route.
 type BeadCheckOptions struct {
 	NoConvoy bool
+	// Reassign mirrors SlingOpts.Reassign. Taking a bead away from its
+	// current owner is exactly what --reassign asks for, so it must not be
+	// stopped by the in-flight skip.
+	Reassign bool
 }

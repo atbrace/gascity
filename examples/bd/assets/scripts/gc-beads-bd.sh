@@ -2710,7 +2710,7 @@ op_init() {
     # "convergence" is required because gc's convergence handler creates
     # beads with that type. "step" is required for non-root formula step
     # beads (#1039). Must match doctor.RequiredCustomTypes.
-    local custom_types="${GC_BEADS_CUSTOM_TYPES:-molecule,convoy,message,event,gate,merge-request,agent,role,rig,session,spec,convergence,step}"
+    local custom_types="${GC_BEADS_CUSTOM_TYPES:-molecule,convoy,message,event,gate,merge-request,agent,role,rig,session,spec,convergence,step,startup-health-episode}"
 
     # Hosted beads-gateway: when a credential command is configured, bd
     # authenticates to the gateway via that command (EIA-as-username over TLS) and

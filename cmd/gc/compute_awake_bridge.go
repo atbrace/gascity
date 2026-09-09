@@ -4,6 +4,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/gastownhall/gascity/internal/beadmeta"
 	"github.com/gastownhall/gascity/internal/beads"
 	"github.com/gastownhall/gascity/internal/config"
 	"github.com/gastownhall/gascity/internal/fsys"
@@ -89,6 +90,7 @@ func buildAwakeInputFromReconciler(
 			ready := i < len(readyAssignedFlags) && readyAssignedFlags[i]
 			input.WorkBeads = append(input.WorkBeads, AwakeWorkBead{
 				ID: wb.ID, Assignee: a, Status: wb.Status, Ready: ready,
+				WorkflowRoot: awakeWorkflowRoot(wb),
 			})
 		}
 	}
@@ -134,6 +136,7 @@ func buildAwakeInputFromReconciler(
 			ContinuationResetPending: strings.TrimSpace(info.ContinuationResetPending) == "true" &&
 				strings.TrimSpace(info.ResetCommittedAt) != "",
 			CurrentlyProcessingBeadID: strings.TrimSpace(info.CurrentlyProcessingBeadID),
+			CurrentlyProcessingWorkflowRoot: strings.TrimSpace(info.CurrentlyProcessingWorkflowRoot),
 		}
 		bead.HeldUntil = lifecycle.HeldUntil
 		bead.QuarantinedUntil = lifecycle.QuarantinedUntil
@@ -283,4 +286,17 @@ func parseSleepDuration(s string) time.Duration {
 		return 0
 	}
 	return d
+}
+
+// awakeWorkflowRoot returns the molecule a work bead belongs to: a step carries
+// gc.root_bead_id; a workflow root (the bead that carries gc.input_convoy_id)
+// is its own root. Standalone beads have no root.
+func awakeWorkflowRoot(wb beads.Bead) string {
+	if root := strings.TrimSpace(wb.Metadata[beadmeta.RootBeadIDMetadataKey]); root != "" {
+		return root
+	}
+	if strings.TrimSpace(wb.Metadata[beadmeta.InputConvoyIDMetadataKey]) != "" {
+		return wb.ID
+	}
+	return ""
 }

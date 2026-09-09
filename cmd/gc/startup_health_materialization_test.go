@@ -138,6 +138,12 @@ func assertQuarantineBlocksFurtherMaterializedStarts(t *testing.T, env *reconcil
 		for k, v := range openIndex {
 			name, beadID = k, v
 		}
+		for k, tp := range env.desiredState {
+			delete(env.desiredState, k)
+			tp.SessionName = name
+			env.desiredState[name] = tp
+			break
+		}
 	}
 
 	startsBefore := env.sp.CountCalls("Start", name)

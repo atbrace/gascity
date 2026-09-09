@@ -3458,7 +3458,7 @@ func reconcileSessionBeadsTracedWithNamedDemand(
 			if sessionStartBackoffActiveInfo(info, clk) {
 				continue // exponential start-retry backoff (sys-w2c5g2)
 			}
-			if episode, err := sessFront.LoadStartupHealthEpisode(name); err != nil {
+			if episode, err := sessFront.LoadStartupHealthEpisode(startupHealthEpisodeKey(target.tp, name)); err != nil {
 				// Fail open: proceed as if no quarantine episode exists rather
 				// than block every session start on a transient store-read
 				// error. Logged (matching the two LoadStartupHealthEpisode
@@ -4577,6 +4577,22 @@ const (
 	startupHealthActiveCountMetadataKey = "startup_health_active_count"
 	startupHealthActiveKindMetadataKey  = "startup_health_active_kind"
 )
+
+// startupHealthEpisodeKey is the identity a startup-health episode accrues
+// under. Upstream keys it by session name, which is stable for named sessions
+// but NOT for pool instances on a lineage that mints a fresh session name per
+// pending-create bead (hudson-gc-<id>): on this rig 2000 consecutive
+// provider_error starts carried 2000 distinct names, so a name-keyed episode
+// reset itself every tick exactly like the per-bead wake_attempts it was meant
+// to replace (sys-by2243.12). The qualified instance name
+// (TemplateParams.InstanceName, e.g. sysadmin/hudson-3) is the slot identity
+// that survives the re-mint; fall back to the session name when it is empty.
+func startupHealthEpisodeKey(tp TemplateParams, sessionName string) string {
+	if key := strings.TrimSpace(tp.DisplayName()); key != "" {
+		return key
+	}
+	return sessionName
+}
 
 // mirrorStartupHealthEpisodeMetadata writes episode's ConsecutiveCount and
 // Kind onto the session bead id through the typed front door. Callers decide

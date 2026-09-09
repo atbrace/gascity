@@ -3,6 +3,7 @@ package dashboardbff
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"net"
@@ -28,6 +29,8 @@ const (
 	statusSampleInterval = 60 * time.Second
 	doltAppendInterval   = 10 * time.Minute
 	rigProbeInterval     = 5 * time.Minute
+	doctorHoldInitial    = 2 * rigProbeInterval
+	doctorHoldMax        = time.Hour
 	doltRingSlots        = 144 // 24h at 10-min cadence
 	statusFetchTimeout   = 40 * time.Second
 	tcpProbeTimeout      = 2 * time.Second
@@ -100,6 +103,9 @@ type samplerManager struct {
 	deps  Deps
 	exec  *execRunner
 	httpc *http.Client
+	// doctor runs the per-rig bd doctor probe; defaults to exec.execBdDoctor.
+	// Overridable so tests can drive probeRig without a real bd on PATH.
+	doctor func(ctx context.Context, beadsPath string) (*execResult, error)
 
 	mu      sync.Mutex
 	cities  map[string]*citySampler
@@ -112,6 +118,7 @@ func newSamplerManager(deps Deps, exec *execRunner) *samplerManager {
 	return &samplerManager{
 		deps:   deps,
 		exec:   exec,
+		doctor: exec.execBdDoctor,
 		httpc:  &http.Client{Timeout: statusFetchTimeout, Transport: deps.SelfReadTransport},
 		cities: make(map[string]*citySampler),
 	}
@@ -164,6 +171,15 @@ type citySampler struct {
 	// work off the lock; production never sets it.
 	beforeProbe func()
 
+	// doctorHolds is touched only by refresh() (the single loop goroutine), so
+	// it needs no lock. A rig whose bd doctor probe timed out is held out of the
+	// next probe passes: the 15s client timeout kills bd but nothing kills the
+	// query it issued on the dolt server, so re-probing on the 5-min cadence
+	// stacks orphaned server-side queries until the host swaps. The hold doubles
+	// per consecutive timeout (10m, 20m, ... capped at doctorHoldMax) and clears
+	// on the first probe that returns.
+	doctorHolds map[string]doctorHold
+
 	mu sync.RWMutex
 	// status
 	statusRaw    json.RawMessage
@@ -181,6 +197,32 @@ type citySampler struct {
 	rigOK     bool
 	rigReason string // RigStoreHealthUnavailableReason
 	lastRig   time.Time
+}
+
+type doctorHold struct {
+	until   time.Time
+	backoff time.Duration
+}
+
+// doctorHeld reports whether the bd doctor probe for beadsPath is held at now.
+func (cs *citySampler) doctorHeld(beadsPath string, now time.Time) bool {
+	return now.Before(cs.doctorHolds[beadsPath].until)
+}
+
+// noteDoctorResult records a probe outcome: a timeout starts or doubles the
+// hold, anything else clears it.
+func (cs *citySampler) noteDoctorResult(beadsPath string, timedOut bool, now time.Time) {
+	if !timedOut {
+		delete(cs.doctorHolds, beadsPath)
+		return
+	}
+	if cs.doctorHolds == nil {
+		cs.doctorHolds = make(map[string]doctorHold)
+	}
+	h := cs.doctorHolds[beadsPath]
+	h.backoff = min(max(2*h.backoff, doctorHoldInitial), doctorHoldMax)
+	h.until = now.Add(h.backoff)
+	cs.doctorHolds[beadsPath] = h
 }
 
 func (cs *citySampler) loop(ctx context.Context) {
@@ -268,7 +310,15 @@ func (cs *citySampler) refresh(ctx context.Context) {
 		}
 		rigs := make([]rigStoreHealth, 0, len(parsed.RigDetails))
 		for _, rd := range parsed.RigDetails {
-			rigs = append(rigs, cs.mgr.probeRig(ctx, rd.Name, rd.Path))
+			beadsPath := filepath.Join(rd.Path, ".beads")
+			if cs.doctorHeld(beadsPath, now) {
+				rh, _ := cs.mgr.probeRig(ctx, rd.Name, rd.Path, false)
+				rigs = append(rigs, rh)
+				continue
+			}
+			rh, timedOut := cs.mgr.probeRig(ctx, rd.Name, rd.Path, true)
+			cs.noteDoctorResult(beadsPath, timedOut, now)
+			rigs = append(rigs, rh)
 		}
 		newRigs = rigs
 	}
@@ -391,13 +441,16 @@ var benignDoctorCategories = map[string]bool{"Git Integration": true, "Integrati
 
 const doltConnectionCheck = "Dolt Connection"
 
-func (m *samplerManager) probeRig(ctx context.Context, rigName, rigPath string) rigStoreHealth {
+// probeRig probes one rig. With runDoctor false the bd doctor subprocess is
+// skipped (the rig is in a doctorHold) and only the TCP dial runs. The second
+// result reports whether the doctor probe hit its client timeout.
+func (m *samplerManager) probeRig(ctx context.Context, rigName, rigPath string, runDoctor bool) (rigStoreHealth, bool) {
 	beadsPath := filepath.Join(rigPath, ".beads")
 	if !isDir(beadsPath) {
 		return rigStoreHealth{
 			Rig: rigName, BeadsPath: beadsPath, Rollup: "down", Reachable: false,
 			Problems: []rigStoreCheck{}, Note: sanitizeTerminalOutput(".beads store not found on disk"),
-		}
+		}, false
 	}
 
 	var doltEndpoint *string
@@ -409,8 +462,13 @@ func (m *samplerManager) probeRig(ctx context.Context, rigName, rigPath string) 
 
 	var checks []rigStoreCheck
 	var note string
-	if res, err := m.exec.execBdDoctor(ctx, beadsPath); err != nil {
+	var timedOut bool
+	if !runDoctor {
+		note = "bd doctor probe held: previous probe timed out and its server-side query may still be running"
+	} else if res, err := m.doctor(ctx, beadsPath); err != nil {
 		note = "bd doctor probe failed: " + err.Error()
+		var ee *execError
+		timedOut = errors.As(err, &ee) && ee.kind == execErrTimeout
 	} else if parsed, ok := parseDoctorChecks(res.stdout); ok {
 		checks = parsed
 	} else {
@@ -436,7 +494,7 @@ func (m *samplerManager) probeRig(ctx context.Context, rigName, rigPath string) 
 		// it before it reaches the browser, per the "all subprocess output is
 		// sanitized" contract.
 		IssueCount: issueCount, Problems: problems, Note: sanitizeTerminalOutput(note),
-	}
+	}, timedOut
 }
 
 func parseDoctorChecks(stdout string) ([]rigStoreCheck, bool) {

@@ -5,6 +5,8 @@ import (
 	"io"
 	"net/http"
 	"net/http/httptest"
+	"os"
+	"path/filepath"
 	"strings"
 	"testing"
 	"time"
@@ -199,5 +201,78 @@ func TestEnsureDoesNotStoreCityPath(t *testing.T) {
 	// Calling ensure again returns the same sampler instance.
 	if again := m.ensure("alpha"); again != cs {
 		t.Error("ensure should return the cached sampler for a known city")
+	}
+}
+
+// TestDoctorHoldAfterTimeout is the regression test for the orphaned-query
+// leak: the bd doctor client timeout kills bd but not the query it issued on
+// the dolt server, so a rig whose probe timed out must be held out of the
+// next probe passes instead of re-issuing the same query every 5 minutes.
+func TestDoctorHoldAfterTimeout(t *testing.T) {
+	rig := t.TempDir()
+	if err := os.Mkdir(filepath.Join(rig, ".beads"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	beadsPath := filepath.Join(rig, ".beads")
+	srv := statusServer(t, `{"rig_details":[{"name":"r1","path":"`+rig+`"}]}`)
+	defer srv.Close()
+
+	m := newSamplerManager(Deps{SupervisorBaseURL: srv.URL}, newExecRunner())
+	calls := 0
+	m.doctor = func(context.Context, string) (*execResult, error) {
+		calls++
+		return nil, &execError{msg: "exec timed out", kind: execErrTimeout}
+	}
+	cs := &citySampler{name: "alpha", mgr: m}
+
+	now := time.Now()
+	cs.refresh(context.Background())
+	if calls != 1 {
+		t.Fatalf("first pass ran doctor %d times, want 1", calls)
+	}
+	if !cs.doctorHeld(beadsPath, now.Add(doctorHoldInitial-time.Second)) {
+		t.Fatal("rig not held after a doctor timeout")
+	}
+	if cs.doctorHeld(beadsPath, now.Add(doctorHoldInitial+time.Second)) {
+		t.Fatal("hold did not expire after doctorHoldInitial")
+	}
+
+	// A held pass must not fork bd, and must say so in the note.
+	cs.lastRig = time.Time{} // re-open the 5-min cadence gate
+	cs.refresh(context.Background())
+	if calls != 1 {
+		t.Fatalf("held pass ran doctor (calls=%d), want 0 extra", calls)
+	}
+	rep := cs.rigStoreHealth()
+	if len(rep.Rigs) != 1 || !strings.Contains(rep.Rigs[0].Note, "held") {
+		t.Fatalf("held pass report = %+v, want a 'held' note", rep.Rigs)
+	}
+
+	// Consecutive timeouts double the hold up to the cap; a success clears it.
+	for i := 0; i < 10; i++ {
+		cs.noteDoctorResult(beadsPath, true, now)
+	}
+	if got := cs.doctorHolds[beadsPath].backoff; got != doctorHoldMax {
+		t.Fatalf("backoff after repeated timeouts = %v, want cap %v", got, doctorHoldMax)
+	}
+	cs.noteDoctorResult(beadsPath, false, now)
+	if cs.doctorHeld(beadsPath, now) {
+		t.Fatal("hold survived a successful probe")
+	}
+}
+
+// TestProbeRigTimeoutIsNotAHoldForOtherErrors: only the timeout kind arms a
+// hold; a spawn failure (bd missing) has no server-side query to protect.
+func TestDoctorHoldIgnoresSpawnErrors(t *testing.T) {
+	rig := t.TempDir()
+	if err := os.Mkdir(filepath.Join(rig, ".beads"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	m := newSamplerManager(Deps{}, newExecRunner())
+	m.doctor = func(context.Context, string) (*execResult, error) {
+		return nil, &execError{msg: "spawn failed", kind: execErrSpawn}
+	}
+	if _, timedOut := m.probeRig(context.Background(), "r1", rig, true); timedOut {
+		t.Fatal("spawn failure reported as timeout")
 	}
 }

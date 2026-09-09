@@ -72,50 +72,9 @@ func TestDesiredPendingCreateRollsBackWhenStartKeepsFailing(t *testing.T) {
 	}
 }
 
-// TestDesiredQuarantinedPendingCreateRollsBackAfterLeaseExpiry pins the
-// interaction between the two independent timers. An active quarantine
-// suppresses the wake indefinitely (crash-loop protection,
-// session_reconciler.go:3514), but that must NOT also suppress the
-// never-started pending-create rollback: the lease has its own 10-minute floor
-// (pendingCreateNeverStartedTimeout) and must still release the claim while the
-// quarantine is in force. Otherwise a quarantined never-started create holds its
-// alias and capacity slot for the whole quarantine window.
-func TestDesiredQuarantinedPendingCreateRollsBackAfterLeaseExpiry(t *testing.T) {
-	h := newSessionChaosHarness(t, 20260734)
-	h.createSessionIntent()
-	h.assertCreatingIntent()
-
-	if err := h.env.store.SetMetadataBatch(h.sessionID, map[string]string{
-		// Quarantine outlives the never-started lease timeout by a wide margin.
-		"quarantined_until": h.env.clk.Now().Add(time.Hour).UTC().Format(time.RFC3339),
-	}); err != nil {
-		t.Fatalf("seed quarantine: %v", err)
-	}
-	// Healing must come from the rollback, never from a successful start.
-	h.env.sp.StartErrors[h.sessionName] = errors.New("provider start failure")
-
-	at := runDesiredPendingCreateTicks(t, h)
-	if at < 0 {
-		got, _ := h.env.store.Get(h.sessionID)
-		t.Fatalf("quarantined never-started pending-create survived 30m (lease expired at %s): status=%q state=%q claim=%q",
-			pendingCreateNeverStartedTimeout, got.Status,
-			strings.TrimSpace(got.Metadata["state"]),
-			strings.TrimSpace(got.Metadata["pending_create_claim"]))
-	}
-	// The rollback must be driven by the lease floor, not by the quarantine
-	// lifting at 60m — catching a regression that defers it to quarantine expiry.
-	if maxTicks := int(pendingCreateNeverStartedTimeout/time.Minute) + 5; at > maxTicks {
-		t.Errorf("claim released at tick %d, want <= %d (lease floor %s, not quarantine expiry)",
-			at, maxTicks, pendingCreateNeverStartedTimeout)
-	}
-}
-
-// TestDesiredCreatingPendingCreateReleasesClaim covers the exact input the
-// claim-gated projection branch keys on (lifecycle_projection.go:761):
-// state=creating + pending_create_claim=true + last_woke_at="". That branch
-// returns start-requested and the projection places no age bound on this shape,
-// so the release must come from the reconciler; in this scenario the
-// failed-create rollback gets there first (tick 1), ahead of the 10m lease.
+// TestDesiredQuarantinedPendingCreateRollsBackAfterLeaseExpiry (upstream #4822)
+// is not carried: this lineage has no quarantined-pending-create lease-expiry
+// rollback, and the test encodes that behaviour, not #6016 (sys-by2243.12).
 func TestDesiredCreatingPendingCreateReleasesClaim(t *testing.T) {
 	h := newSessionChaosHarness(t, 20260730)
 	h.createSessionIntent()

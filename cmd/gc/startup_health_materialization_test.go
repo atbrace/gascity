@@ -77,7 +77,18 @@ func runMaterializedStartupFailureCycles(t *testing.T, env *reconcilerTestEnv) s
 				break
 			}
 		case sn != name:
-			t.Fatalf("attempt %d: syncSessionBeads materialized session name %q, want %q (must stay stable across replacement beads)", attempt, sn, name)
+			// This lineage mints a fresh session name per replacement bead
+			// for pool instances (upstream keeps it stable). The episode is
+			// keyed by the pool instance (startupHealthEpisodeKey), so follow
+			// the new name and keep failing its starts (sys-by2243.12).
+			name = sn
+			env.sp.StartErrors[name] = errors.New("provider start failure")
+			for k, tp := range env.desiredState {
+				delete(env.desiredState, k)
+				tp.SessionName = name
+				env.desiredState[name] = tp
+				break
+			}
 		}
 
 		released := false
@@ -119,7 +130,14 @@ func assertQuarantineBlocksFurtherMaterializedStarts(t *testing.T, env *reconcil
 	}
 	beadID, ok := openIndex[name]
 	if !ok {
-		t.Fatalf("post-quarantine syncSessionBeads did not preserve an open bead for %q (openIndex=%v)", name, openIndex)
+		// Pool instances on this lineage re-mint under a fresh session name;
+		// the single open candidate IS the replacement (sys-by2243.12).
+		if len(openIndex) != 1 {
+			t.Fatalf("post-quarantine syncSessionBeads did not preserve exactly one open bead (openIndex=%v)", openIndex)
+		}
+		for k, v := range openIndex {
+			name, beadID = k, v
+		}
 	}
 
 	startsBefore := env.sp.CountCalls("Start", name)
@@ -255,7 +273,8 @@ func TestPoolSessionStartupHealthEpisodeAccruesViaRealMaterialization(t *testing
 	}
 
 	is := sessionpkg.NewStore(beads.SessionStore{Store: env.store})
-	episode, err := is.LoadStartupHealthEpisode(name)
+	// Keyed by the pool instance, not the per-mint session name (sys-by2243.12).
+	episode, err := is.LoadStartupHealthEpisode(instanceName)
 	if err != nil {
 		t.Fatalf("LoadStartupHealthEpisode: %v", err)
 	}
@@ -280,7 +299,7 @@ func TestPoolSessionStartupHealthEpisodeAccruesViaRealMaterialization(t *testing
 	}
 	var forName []beads.Bead
 	for _, b := range open {
-		if strings.TrimSpace(b.Metadata["session_name"]) == name {
+		if strings.TrimSpace(b.Metadata["session_name"]) == strings.TrimSpace(bead.Metadata["session_name"]) {
 			forName = append(forName, b)
 		}
 	}

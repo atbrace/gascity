@@ -13,4 +13,8 @@ func TestStartupHealthEpisodeKey_PoolInstanceStableAcrossRemint(t *testing.T) {
 	if got := startupHealthEpisodeKey(TemplateParams{}, "sky"); got != "sky" {
 		t.Fatalf("expected fallback to session name, got %q", got)
 	}
+	named := TemplateParams{TemplateName: "captain", InstanceName: "captain"}
+	if got := startupHealthEpisodeKey(named, "gs__captain"); got != "gs__captain" {
+		t.Fatalf("expected a non-pool session to keep its session-name key, got %q", got)
+	}
 }

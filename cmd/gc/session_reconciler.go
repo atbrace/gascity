@@ -4586,10 +4586,13 @@ const (
 // reset itself every tick exactly like the per-bead wake_attempts it was meant
 // to replace (sys-by2243.12). The qualified instance name
 // (TemplateParams.InstanceName, e.g. sysadmin/hudson-3) is the slot identity
-// that survives the re-mint; fall back to the session name when it is empty.
+// that survives the re-mint. Named and non-pool sessions keep upstream's
+// session-name key (their InstanceName is the template name, not an identity).
 func startupHealthEpisodeKey(tp TemplateParams, sessionName string) string {
-	if key := strings.TrimSpace(tp.DisplayName()); key != "" {
-		return key
+	if tp.PoolSlot > 0 {
+		if key := strings.TrimSpace(tp.InstanceName); key != "" {
+			return key
+		}
 	}
 	return sessionName
 }

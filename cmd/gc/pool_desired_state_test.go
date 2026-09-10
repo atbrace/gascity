@@ -1113,35 +1113,36 @@ func TestComputePoolDesiredStates_InFlightNewSessionsConsumeScaleDemand(t *testi
 	}
 }
 
-// Regression for sys-30y0i.26.23: the graph executable step was the sole
-// routed demand unit, but two pending pool creates were reserved for the same
-// trigger. Both workers then received gc.trigger_bead_id=sys-sp19qp; the first
-// could execute the step formula and claim its source before the step ledger
-// claim, while the second claimed the step. A trigger identifies one unit of
-// execution, so duplicate requests in one desired-state pass must collapse to
-// one effective pool start (store ref distinguishes same IDs in independent
-// stores).
-func TestComputePoolDesiredStates_DeduplicatesPendingCreateTrigger(t *testing.T) {
+// Regression for sys-30y0i.26.23: pending_create_claim clears at provider
+// start, before the worker's hook CAS claim. The same routed graph step then
+// still appears as new demand and a second pool start is reserved even though
+// the first worker is already executing the formula. Recent creation_complete
+// capacity must cover that handoff window and retain the concrete trigger.
+func TestComputePoolDesiredStates_PostCreateProtectionRetainsGraphStep(t *testing.T) {
+	now := time.Date(2026, 9, 10, 21, 0, 0, 0, time.UTC)
 	max := 2
 	cfg := &config.City{Agents: []config.Agent{poolAgent("worker", "", &max, 0)}}
-	demand := map[string]scaleCheckDemand{
-		"worker": {
-			Count:       2,
-			WorkBeadIDs: []string{"sys-sp19qp", "sys-sp19qp"},
-			StoreRefs:   map[string]string{"sys-sp19qp": "city"},
-		},
-	}
-	got := ComputePoolDesiredStatesWithDemandTraced(
-		cfg, nil, nil, map[string]int{"worker": 2}, demand, nil,
+	session := pendingPoolSessionBeadAt("gc-a1hkx0", now.Add(-30*time.Second))
+	session.Metadata["pending_create_claim"] = ""
+	session.Metadata["state"] = "active"
+	session.Metadata["state_reason"] = "creation_complete"
+	session.Metadata["creation_complete_at"] = now.Add(-20 * time.Second).Format(time.RFC3339)
+	session.Metadata[beadmeta.TriggerBeadIDMetadataKey] = "sys-sp19qp"
+	session.Metadata[beadmeta.TriggerBeadStoreRefMetadataKey] = "city"
+	demand := map[string]scaleCheckDemand{"worker": {
+		Count: 1, WorkBeadIDs: []string{"sys-sp19qp"},
+		StoreRefs: map[string]string{"sys-sp19qp": "city"},
+	}}
+	got := ComputePoolDesiredStatesWithDemandTracedAt(
+		cfg, nil, sessionInfosFromBeads([]beads.Bead{session}),
+		map[string]int{"worker": 1}, demand, now, nil,
 	)
-	if len(got) != 1 {
-		t.Fatalf("desired states = %#v, want one worker pool", got)
+	if len(got) != 1 || len(got[0].Requests) != 1 {
+		t.Fatalf("desired state = %#v, want one retained worker", got)
 	}
-	if len(got[0].Requests) != 1 {
-		t.Fatalf("requests = %#v, want one request for one trigger", got[0].Requests)
-	}
-	if got[0].Requests[0].WorkBeadID != "sys-sp19qp" {
-		t.Fatalf("trigger = %q, want sys-sp19qp", got[0].Requests[0].WorkBeadID)
+	request := got[0].Requests[0]
+	if request.SessionBeadID != session.ID || request.WorkBeadID != "sys-sp19qp" {
+		t.Fatalf("request = %#v, want existing session %s bound to sys-sp19qp", request, session.ID)
 	}
 }
 

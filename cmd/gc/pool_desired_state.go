@@ -3,6 +3,7 @@ package main
 import (
 	"sort"
 	"strings"
+	"time"
 
 	"github.com/gastownhall/gascity/internal/beadmeta"
 	"github.com/gastownhall/gascity/internal/beads"
@@ -84,6 +85,13 @@ func ComputePoolDesiredStates(
 	return computePoolDesiredStates(cfg, assignedWorkBeads, sessionInfos, scaleCheckCounts, nil, nil)
 }
 
+// ComputePoolDesiredStatesAt is the deterministic form used by the
+// reconciler and tests. A single decision time keeps post-create protection
+// consistent across all pool requests in one pass.
+func ComputePoolDesiredStatesAt(cfg *config.City, assignedWorkBeads []beads.Bead, sessionInfos []sessionpkg.Info, scaleCheckCounts map[string]int, decisionTime time.Time) []PoolDesiredState {
+	return computePoolDesiredStatesAt(cfg, assignedWorkBeads, sessionInfos, scaleCheckCounts, nil, decisionTime, nil)
+}
+
 func ComputePoolDesiredStatesTraced(
 	cfg *config.City,
 	assignedWorkBeads []beads.Bead,
@@ -105,12 +113,28 @@ func ComputePoolDesiredStatesWithDemandTraced(
 	return computePoolDesiredStates(cfg, assignedWorkBeads, sessionInfos, scaleCheckCounts, scaleCheckDemand, trace)
 }
 
+func ComputePoolDesiredStatesWithDemandTracedAt(cfg *config.City, assignedWorkBeads []beads.Bead, sessionInfos []sessionpkg.Info, scaleCheckCounts map[string]int, scaleCheckDemand map[string]scaleCheckDemand, decisionTime time.Time, trace *sessionReconcilerTraceCycle) []PoolDesiredState {
+	return computePoolDesiredStatesAt(cfg, assignedWorkBeads, sessionInfos, scaleCheckCounts, scaleCheckDemand, decisionTime, trace)
+}
+
 func computePoolDesiredStates(
 	cfg *config.City,
 	assignedWorkBeads []beads.Bead,
 	sessionInfos []sessionpkg.Info,
 	scaleCheckCounts map[string]int,
 	scaleCheckDemand map[string]scaleCheckDemand,
+	trace *sessionReconcilerTraceCycle,
+) []PoolDesiredState {
+	return computePoolDesiredStatesAt(cfg, assignedWorkBeads, sessionInfos, scaleCheckCounts, scaleCheckDemand, time.Time{}, trace)
+}
+
+func computePoolDesiredStatesAt(
+	cfg *config.City,
+	assignedWorkBeads []beads.Bead,
+	sessionInfos []sessionpkg.Info,
+	scaleCheckCounts map[string]int,
+	scaleCheckDemand map[string]scaleCheckDemand,
+	decisionTime time.Time,
 	trace *sessionReconcilerTraceCycle,
 ) []PoolDesiredState {
 	// Build reverse lookup: any identifier → session bead ID.
@@ -239,96 +263,212 @@ func computePoolDesiredStates(
 		}
 	}
 
-	limits := newNestedCapLimits(cfg)
-	usage := acceptedNestedCapUsage(limits, resumeRequests)
-	allRequests := append([]SessionRequest(nil), resumeRequests...)
 	resumeSessionBeadIDs := make(map[string]struct{}, len(resumeRequests))
 	for _, req := range resumeRequests {
 		if req.SessionBeadID != "" {
 			resumeSessionBeadIDs[req.SessionBeadID] = struct{}{}
 		}
 	}
-	inFlightNewRequests := poolInFlightNewRequests(cfg, sessionInfos, resumeSessionBeadIDs)
+	protectedNewRequests, inFlightNewRequests := poolNewDemandRequests(cfg, sessionInfos, resumeSessionBeadIDs, decisionTime)
+	limits := newNestedCapLimits(cfg)
+	usage := acceptedNestedCapUsage(limits, resumeRequests)
+	allRequests := append([]SessionRequest(nil), resumeRequests...)
 
 	// Merge scale_check demand. In bead-backed reconciliation, scale_check is
 	// the authoritative signal for new unassigned demand only; resume requests
 	// are calculated independently from assigned work and must not be deducted
 	// from that count. Pool-created sessions that have not claimed work yet
 	// represent already-spent new demand, so they occupy the first new-demand
-	// slots explicitly before anonymous creates are materialized.
-	if len(scaleCheckCounts) > 0 {
-		for i := range cfg.Agents {
-			agent := &cfg.Agents[i]
-			if agent.Suspended {
-				continue
+	// slots explicitly before anonymous creates are materialized. A freshly
+	// completed runnable session remains concrete capacity for a short grace
+	// window: pending_create_claim is cleared before the worker's hook CAS, so
+	// demand can briefly look unassigned even though the worker is executing it.
+	for i := range cfg.Agents {
+		agent := &cfg.Agents[i]
+		if agent.Suspended {
+			continue
+		}
+		template := agent.QualifiedName()
+		scaleCount, hasScaleCount := scaleCheckCounts[template]
+		protected := protectedNewRequests[template]
+		if !hasScaleCount && len(protected) == 0 {
+			continue
+		}
+		if _, ok := aliasHeldTemplates[template]; ok {
+			continue
+		}
+		effectiveDemand := scaleCount
+		if len(protected) > effectiveDemand {
+			effectiveDemand = len(protected)
+		}
+		newCount := capNewDemandCount(limits, usage, agent, effectiveDemand)
+		recordNewDemandCapTrace(trace, template, agent, limits, usage, effectiveDemand, newCount)
+		inFlight := inFlightNewRequests[template]
+		protectedCount := minInt(len(protected), newCount)
+		inFlightCount := minInt(len(inFlight), newCount-protectedCount)
+		selectedConcrete := make([]SessionRequest, 0, protectedCount+inFlightCount)
+		selectedConcrete = append(selectedConcrete, protected[:protectedCount]...)
+		selectedConcrete = append(selectedConcrete, inFlight[:inFlightCount]...)
+		demand := scaleCheckDemand[template]
+		selectedConcrete, residualWorkBeadIDs := allocateScaleDemandToConcrete(demand, selectedConcrete)
+		if scaleCount > 0 && len(protected)+len(inFlight) > 0 && trace != nil {
+			trace.RecordDecision(TraceSitePoolInFlightReuse, TraceReasonInFlightReuse, TraceOutcomeAccepted, template, "", traceRecordPayload{
+				"scale_check": scaleCount, "in_flight": len(inFlight), "protected": len(protected),
+				"reused": protectedCount + inFlightCount, "anonymous_new": newCount - protectedCount - inFlightCount,
+			})
+		}
+		for _, req := range selectedConcrete {
+			allRequests = append(allRequests, req)
+			usage.accept(req, limits)
+		}
+		for j := 0; j < newCount-protectedCount-inFlightCount; j++ {
+			workBeadID := ""
+			if len(residualWorkBeadIDs) > j {
+				workBeadID = residualWorkBeadIDs[j]
 			}
-			template := agent.QualifiedName()
-			scaleCount, ok := scaleCheckCounts[template]
-			if !ok {
-				continue
+			req := SessionRequest{Template: template, Tier: "new", WorkBeadID: workBeadID}
+			if workBeadID != "" {
+				req.WorkBeadTitle = strings.TrimSpace(demand.Titles[workBeadID])
+				req.WorkPack = strings.TrimSpace(demand.Packs[workBeadID])
+				req.WorkWorkspace = strings.TrimSpace(demand.Workspaces[workBeadID])
+				req.WorkStoreRef = strings.TrimSpace(demand.StoreRefs[workBeadID])
+				req.BrainParentSID = strings.TrimSpace(demand.ParentSIDs[workBeadID])
 			}
-			if _, ok := aliasHeldTemplates[template]; ok {
-				continue
-			}
-			newCount := capNewDemandCount(limits, usage, agent, scaleCount)
-			recordNewDemandCapTrace(trace, template, agent, limits, usage, scaleCount, newCount)
-			inFlight := inFlightNewRequests[template]
-			inFlightCount := minInt(len(inFlight), newCount)
-			if scaleCount > 0 && len(inFlight) > 0 && trace != nil {
-				trace.RecordDecision(TraceSitePoolInFlightReuse, TraceReasonInFlightReuse, TraceOutcomeAccepted, template, "", traceRecordPayload{
-					"scale_check":   scaleCount,
-					"in_flight":     len(inFlight),
-					"reused":        inFlightCount,
-					"anonymous_new": newCount - inFlightCount,
-				})
-			}
-			for j := 0; j < inFlightCount; j++ {
-				req := inFlight[j]
-				allRequests = append(allRequests, req)
-				usage.accept(req, limits)
-			}
-			for j := inFlightCount; j < newCount; j++ {
-				workBeadID := ""
-				workBeadTitle := ""
-				workPack := ""
-				workWorkspace := ""
-				workStoreRef := ""
-				workParentSID := ""
-				if demand := scaleCheckDemand[template]; len(demand.WorkBeadIDs) > j {
-					workBeadID = strings.TrimSpace(demand.WorkBeadIDs[j])
-					if demand.Titles != nil {
-						workBeadTitle = strings.TrimSpace(demand.Titles[workBeadID])
-					}
-					if demand.Packs != nil {
-						workPack = strings.TrimSpace(demand.Packs[workBeadID])
-					}
-					if demand.Workspaces != nil {
-						workWorkspace = strings.TrimSpace(demand.Workspaces[workBeadID])
-					}
-					if demand.StoreRefs != nil {
-						workStoreRef = strings.TrimSpace(demand.StoreRefs[workBeadID])
-					}
-					if demand.ParentSIDs != nil {
-						workParentSID = strings.TrimSpace(demand.ParentSIDs[workBeadID])
-					}
-				}
-				req := SessionRequest{
-					Template:       template,
-					Tier:           "new",
-					WorkBeadID:     workBeadID,
-					WorkBeadTitle:  workBeadTitle,
-					WorkPack:       workPack,
-					WorkWorkspace:  workWorkspace,
-					WorkStoreRef:   workStoreRef,
-					BrainParentSID: workParentSID,
-				}
-				allRequests = append(allRequests, req)
-				usage.accept(req, limits)
-			}
+			allRequests = append(allRequests, req)
+			usage.accept(req, limits)
 		}
 	}
+	/*
+		if len(scaleCheckCounts) > 0 {
+			for i := range cfg.Agents {
+				agent := &cfg.Agents[i]
+				if agent.Suspended {
+					continue
+				}
+				template := agent.QualifiedName()
+				scaleCount, ok := scaleCheckCounts[template]
+				if !ok {
+					continue
+				}
+				if _, ok := aliasHeldTemplates[template]; ok {
+					continue
+				}
+				newCount := capNewDemandCount(limits, usage, agent, scaleCount)
+				recordNewDemandCapTrace(trace, template, agent, limits, usage, scaleCount, newCount)
+				inFlight := inFlightNewRequests[template]
+				inFlightCount := minInt(len(inFlight), newCount)
+				if scaleCount > 0 && len(inFlight) > 0 && trace != nil {
+					trace.RecordDecision(TraceSitePoolInFlightReuse, TraceReasonInFlightReuse, TraceOutcomeAccepted, template, "", traceRecordPayload{
+						"scale_check":   scaleCount,
+						"in_flight":     len(inFlight),
+						"reused":        inFlightCount,
+						"anonymous_new": newCount - inFlightCount,
+					})
+				}
+				for j := 0; j < inFlightCount; j++ {
+					req := inFlight[j]
+					allRequests = append(allRequests, req)
+					usage.accept(req, limits)
+				}
+				for j := inFlightCount; j < newCount; j++ {
+					workBeadID := ""
+					workBeadTitle := ""
+					workPack := ""
+					workWorkspace := ""
+					workStoreRef := ""
+					workParentSID := ""
+					if demand := scaleCheckDemand[template]; len(demand.WorkBeadIDs) > j {
+						workBeadID = strings.TrimSpace(demand.WorkBeadIDs[j])
+						if demand.Titles != nil {
+							workBeadTitle = strings.TrimSpace(demand.Titles[workBeadID])
+						}
+						if demand.Packs != nil {
+							workPack = strings.TrimSpace(demand.Packs[workBeadID])
+						}
+						if demand.Workspaces != nil {
+							workWorkspace = strings.TrimSpace(demand.Workspaces[workBeadID])
+						}
+						if demand.StoreRefs != nil {
+							workStoreRef = strings.TrimSpace(demand.StoreRefs[workBeadID])
+						}
+						if demand.ParentSIDs != nil {
+							workParentSID = strings.TrimSpace(demand.ParentSIDs[workBeadID])
+						}
+					}
+					req := SessionRequest{
+						Template:       template,
+						Tier:           "new",
+						WorkBeadID:     workBeadID,
+						WorkBeadTitle:  workBeadTitle,
+						WorkPack:       workPack,
+						WorkWorkspace:  workWorkspace,
+						WorkStoreRef:   workStoreRef,
+						BrainParentSID: workParentSID,
+					}
+					allRequests = append(allRequests, req)
+					usage.accept(req, limits)
+				}
+			}
+		}
+	*/
 
 	return applyNestedCaps(cfg, allRequests, aliasHeldTemplates, trace)
+}
+
+// allocateScaleDemandToConcrete preserves trigger identity when protected or
+// pending sessions are reused. It also removes duplicate demand IDs before
+// anonymous requests are planned, so one graph step cannot reserve two starts.
+func allocateScaleDemandToConcrete(demand scaleCheckDemand, concrete []SessionRequest) ([]SessionRequest, []string) {
+	allocated := append([]SessionRequest(nil), concrete...)
+	unique := make([]string, 0, len(demand.WorkBeadIDs))
+	seen := make(map[string]struct{}, len(demand.WorkBeadIDs))
+	for _, raw := range demand.WorkBeadIDs {
+		id := strings.TrimSpace(raw)
+		if id == "" {
+			continue
+		}
+		if _, ok := seen[id]; ok {
+			continue
+		}
+		seen[id] = struct{}{}
+		unique = append(unique, id)
+	}
+	matched := make(map[string]struct{}, len(allocated))
+	free := make([]int, 0, len(allocated))
+	for i, req := range allocated {
+		id := strings.TrimSpace(req.WorkBeadID)
+		if _, ok := seen[id]; ok {
+			if _, dup := matched[id]; !dup {
+				matched[id] = struct{}{}
+				allocated[i] = requestWithScaleDemandProvenance(req, demand, id)
+				continue
+			}
+		}
+		free = append(free, i)
+	}
+	remaining := make([]string, 0, len(unique)-len(matched))
+	for _, id := range unique {
+		if _, ok := matched[id]; !ok {
+			remaining = append(remaining, id)
+		}
+	}
+	for i := 0; i < len(free) && i < len(remaining); i++ {
+		allocated[free[i]] = requestWithScaleDemandProvenance(allocated[free[i]], demand, remaining[i])
+	}
+	if len(free) < len(remaining) {
+		return allocated, remaining[len(free):]
+	}
+	return allocated, nil
+}
+
+func requestWithScaleDemandProvenance(req SessionRequest, demand scaleCheckDemand, id string) SessionRequest {
+	req.WorkBeadID = id
+	req.WorkBeadTitle = strings.TrimSpace(demand.Titles[id])
+	req.WorkPack = strings.TrimSpace(demand.Packs[id])
+	req.WorkWorkspace = strings.TrimSpace(demand.Workspaces[id])
+	req.WorkStoreRef = strings.TrimSpace(demand.StoreRefs[id])
+	req.BrainParentSID = strings.TrimSpace(demand.ParentSIDs[id])
+	return req
 }
 
 func canonicalSingletonAliasHeldTemplates(cfg *config.City, sessionInfos []sessionpkg.Info) map[string]struct{} {
@@ -364,8 +504,9 @@ func canonicalSingletonAliasHeldTemplates(cfg *config.City, sessionInfos []sessi
 	return held
 }
 
-func poolInFlightNewRequests(cfg *config.City, sessionInfos []sessionpkg.Info, resumeSessionBeadIDs map[string]struct{}) map[string][]SessionRequest {
-	requests := make(map[string][]SessionRequest)
+func poolNewDemandRequests(cfg *config.City, sessionInfos []sessionpkg.Info, resumeSessionBeadIDs map[string]struct{}, decisionTime time.Time) (map[string][]SessionRequest, map[string][]SessionRequest) {
+	protected := make(map[string][]SessionRequest)
+	inFlight := make(map[string][]SessionRequest)
 	sortedSessionInfos := append([]sessionpkg.Info(nil), sessionInfos...)
 	sort.SliceStable(sortedSessionInfos, func(i, j int) bool {
 		if !sortedSessionInfos[i].CreatedAt.Equal(sortedSessionInfos[j].CreatedAt) {
@@ -395,20 +536,48 @@ func poolInFlightNewRequests(cfg *config.City, sessionInfos []sessionpkg.Info, r
 			if normalizedSessionTemplateInfo(sb, cfg) != template {
 				continue
 			}
-			if !poolSessionConsumesNewDemandInfo(sb) {
-				continue
-			}
-			requests[template] = append(requests[template], SessionRequest{
+			req := SessionRequest{
 				Template:       template,
 				Tier:           "new",
 				SessionBeadID:  sb.ID,
 				WorkBeadID:     strings.TrimSpace(sb.TriggerBeadID),
 				WorkStoreRef:   strings.TrimSpace(sb.TriggerBeadStoreRef),
 				BrainParentSID: strings.TrimSpace(sb.BrainParentSID),
-			})
+			}
+			if poolSessionEligibleForProtectedDemand(sb, decisionTime) {
+				protected[template] = append(protected[template], req)
+			} else if poolSessionConsumesNewDemandInfo(sb) {
+				inFlight[template] = append(inFlight[template], req)
+			}
 		}
 	}
-	return requests
+	return protected, inFlight
+}
+
+func poolSessionWithinPostCreateProtection(info sessionpkg.Info, decisionTime time.Time) bool {
+	if decisionTime.IsZero() || info.Closed || isDrainedSessionInfo(info) || isFailedCreateSessionInfo(info) || sessionHasProviderTerminalErrorInfo(info) {
+		return false
+	}
+	state := strings.TrimSpace(info.MetadataState)
+	if state != "active" && state != "awake" {
+		return false
+	}
+	if strings.TrimSpace(info.StateReason) != "creation_complete" {
+		return false
+	}
+	completeAt, ok := parseRFC3339Metadata(info.CreationCompleteAt)
+	if !ok {
+		return false
+	}
+	age := decisionTime.Sub(completeAt)
+	return age >= 0 && age < postCreateProtectionTimeout
+}
+
+func poolSessionEligibleForProtectedDemand(info sessionpkg.Info, decisionTime time.Time) bool {
+	return poolSessionWithinPostCreateProtection(info, decisionTime) &&
+		!info.DependencyOnly && strings.TrimSpace(info.WaitHold) == "" &&
+		!metadataTimeInFuture(info.HeldUntil, decisionTime) &&
+		!metadataTimeInFuture(info.QuarantinedUntil, decisionTime)
 }
 
 // poolSessionConsumesNewDemandInfo reports whether a pool session already

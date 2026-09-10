@@ -761,7 +761,12 @@ func buildDesiredStateWithSessionBeads(
 		bp.assignedWorkBeads = poolWorkBeads
 		bp.poolScaleCheckPartialTemplates = poolScaleCheckPartialTemplates
 		bp.providerHealthSnapshot = loadProviderHealthSnapshot(cityPath)
-		poolDesiredStates := ComputePoolDesiredStatesWithDemandTraced(cfg, poolWorkBeads, sessionBeads.OpenInfos(), scaleCheckCounts, scaleCheckDemandByTemplate, trace)
+		// Capture one decision time for the entire desired-state pass. Fresh
+		// post-create sessions retain demand only during the claim-handoff grace
+		// window; using the production clock here keeps that protection active
+		// outside deterministic tests.
+		poolDecisionTime := time.Now()
+		poolDesiredStates := ComputePoolDesiredStatesWithDemandTracedAt(cfg, poolWorkBeads, sessionBeads.OpenInfos(), scaleCheckCounts, scaleCheckDemandByTemplate, poolDecisionTime, trace)
 		bp.configurePoolSessionCreateFairShare(poolDesiredStates)
 		for _, poolState := range poolDesiredStates {
 			cfgAgent := findAgentByTemplate(cfg, poolState.Template)

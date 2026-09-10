@@ -108,6 +108,14 @@ func pendingPoolSessionBeadAt(id string, createdAt time.Time) beads.Bead {
 	return session
 }
 
+func protectedPoolSessionBeadAt(id string, createdAt time.Time) beads.Bead {
+	session := poolSessionBeadWithState(id, "awake", "")
+	session.CreatedAt = createdAt
+	session.Metadata["state_reason"] = "creation_complete"
+	session.Metadata["creation_complete_at"] = createdAt.UTC().Format(time.RFC3339)
+	return session
+}
+
 func poolSessionBeadWithState(id, state, pendingCreateClaim string) beads.Bead {
 	const template = "claude"
 	return beads.Bead{
@@ -1144,6 +1152,66 @@ func TestComputePoolDesiredStates_PostCreateProtectionRetainsGraphStep(t *testin
 	request := got[0].Requests[0]
 	if request.SessionBeadID != session.ID || request.WorkBeadID != "sys-sp19qp" {
 		t.Fatalf("request = %#v, want existing session %s bound to sys-sp19qp", request, session.ID)
+	}
+}
+
+func TestComputePoolDesiredStates_PostCreateProtectionExpires(t *testing.T) {
+	now := time.Date(2026, 9, 10, 21, 0, 0, 0, time.UTC)
+	cfg := &config.City{Agents: []config.Agent{poolAgent("claude", "", intPtr(2), 0)}}
+	fresh := protectedPoolSessionBeadAt("sess-fresh", now.Add(-30*time.Second))
+	old := protectedPoolSessionBeadAt("sess-old", now.Add(-3*time.Minute))
+	got := ComputePoolDesiredStatesAt(cfg, nil, sessionInfosFromBeads([]beads.Bead{fresh, old}), map[string]int{"claude": 1}, now)
+	if len(got) != 1 || len(got[0].Requests) != 1 || got[0].Requests[0].SessionBeadID != fresh.ID {
+		t.Fatalf("desired state = %#v, want only fresh protected session", got)
+	}
+}
+
+func TestComputePoolDesiredStates_PostCreateProtectionExcludesNonRunnable(t *testing.T) {
+	now := time.Date(2026, 9, 10, 21, 0, 0, 0, time.UTC)
+	cfg := &config.City{Agents: []config.Agent{poolAgent("claude", "", intPtr(2), 0)}}
+	cases := []struct {
+		name  string
+		patch func(*beads.Bead)
+	}{
+		{"dependency-only", func(b *beads.Bead) { b.Metadata["dependency_only"] = "true" }},
+		{"wait-held", func(b *beads.Bead) { b.Metadata["wait_hold"] = "true" }},
+		{"held", func(b *beads.Bead) { b.Metadata["held_until"] = now.Add(time.Minute).Format(time.RFC3339) }},
+		{"quarantined", func(b *beads.Bead) { b.Metadata["quarantined_until"] = now.Add(time.Minute).Format(time.RFC3339) }},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			fresh := protectedPoolSessionBeadAt("sess-"+tc.name, now.Add(-30*time.Second))
+			tc.patch(&fresh)
+			got := ComputePoolDesiredStatesAt(cfg, nil, sessionInfosFromBeads([]beads.Bead{fresh}), map[string]int{"claude": 1}, now)
+			if len(got) != 1 || len(got[0].Requests) != 1 || got[0].Requests[0].SessionBeadID != "" {
+				t.Fatalf("desired state = %#v, want one anonymous request after exclusion", got)
+			}
+		})
+	}
+}
+
+func TestComputePoolDesiredStates_PostCreateProtectionRespectsCap(t *testing.T) {
+	now := time.Date(2026, 9, 10, 21, 0, 0, 0, time.UTC)
+	cfg := &config.City{Agents: []config.Agent{poolAgent("claude", "", intPtr(1), 0)}}
+	sessions := []beads.Bead{
+		protectedPoolSessionBeadAt("sess-1", now.Add(-30*time.Second)),
+		protectedPoolSessionBeadAt("sess-2", now.Add(-20*time.Second)),
+	}
+	got := ComputePoolDesiredStatesAt(cfg, nil, sessionInfosFromBeads(sessions), map[string]int{"claude": 1}, now)
+	if len(got) != 1 || len(got[0].Requests) != 1 {
+		t.Fatalf("desired state = %#v, want one request at cap", got)
+	}
+}
+
+func TestComputePoolDesiredStates_PostCreateProtectionAllocatesConcreteDemand(t *testing.T) {
+	now := time.Date(2026, 9, 10, 21, 0, 0, 0, time.UTC)
+	cfg := &config.City{Agents: []config.Agent{poolAgent("claude", "", intPtr(2), 0)}}
+	fresh := protectedPoolSessionBeadAt("sess-fresh", now.Add(-30*time.Second))
+	fresh.Metadata[beadmeta.TriggerBeadIDMetadataKey] = "stale-step"
+	demand := map[string]scaleCheckDemand{"claude": {Count: 1, WorkBeadIDs: []string{"sys-sp19qp"}, StoreRefs: map[string]string{"sys-sp19qp": "city"}}}
+	got := ComputePoolDesiredStatesWithDemandTracedAt(cfg, nil, sessionInfosFromBeads([]beads.Bead{fresh}), map[string]int{"claude": 1}, demand, now, nil)
+	if len(got) != 1 || len(got[0].Requests) != 1 || got[0].Requests[0].SessionBeadID != fresh.ID || got[0].Requests[0].WorkBeadID != "sys-sp19qp" {
+		t.Fatalf("desired state = %#v, want protected session rebound to concrete demand", got)
 	}
 }
 

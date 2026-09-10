@@ -271,9 +271,10 @@ func computePoolDesiredStatesAt(
 	}
 	protectedNewRequests, inFlightNewRequests := poolNewDemandRequests(cfg, sessionInfos, resumeSessionBeadIDs, decisionTime)
 	// A wake-known request has assigned work but no surviving concrete session
-	// identity. Bind a protected fresh session only when its trigger is the same
-	// work item; otherwise leave it available for scale demand or its own
-	// trigger. Consuming the match prevents a second request for that capacity.
+	// identity. Prefer a protected fresh session whose trigger is the same work
+	// item, then fall back to the oldest eligible protected capacity when the
+	// trigger is blank or stale. Consuming the match prevents a second request
+	// for that capacity; this is the upstream post-create handoff contract.
 	for i := range resumeRequests {
 		req := &resumeRequests[i]
 		if req.Tier != "wake-known-identity" || req.SessionBeadID != "" {
@@ -286,6 +287,9 @@ func computePoolDesiredStatesAt(
 				match = j
 				break
 			}
+		}
+		if match < 0 && len(candidates) > 0 {
+			match = 0
 		}
 		if match < 0 {
 			continue

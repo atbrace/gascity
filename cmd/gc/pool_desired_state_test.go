@@ -1163,21 +1163,25 @@ func TestComputePoolDesiredStates_PostCreateProtectionRetainsGraphStep(t *testin
 func TestComputePoolDesiredStates_PostCreateProtectionBindsWakeKnownCapacity(t *testing.T) {
 	now := time.Date(2026, 9, 10, 21, 0, 0, 0, time.UTC)
 	cfg := &config.City{Agents: []config.Agent{poolAgent("claude", "", intPtr(2), 0)}}
-	work := []beads.Bead{workBead("work-wake", "claude", "claude", "in_progress", 5)}
-	fresh := protectedPoolSessionBeadAt("sess-fresh", now.Add(-30*time.Second))
-	fresh.Metadata[beadmeta.TriggerBeadIDMetadataKey] = "work-wake"
-	fresh.Metadata[beadmeta.PackMetadataKey] = "homeops"
-	fresh.Metadata[beadmeta.PackWorkspaceMetadataKey] = "recon"
-	got := ComputePoolDesiredStatesAt(cfg, work, sessionInfosFromBeads([]beads.Bead{fresh}), nil, now)
-	if len(got) != 1 || len(got[0].Requests) != 1 {
-		t.Fatalf("desired state = %#v, want one wake-known request", got)
-	}
-	req := got[0].Requests[0]
-	if req.Tier != "wake-known-identity" || req.SessionBeadID != fresh.ID || req.WorkBeadID != "work-wake" {
-		t.Fatalf("request = %#v, want wake-known bound to %s", req, fresh.ID)
-	}
-	if req.WorkPack != "homeops" || req.WorkWorkspace != "recon" {
-		t.Fatalf("wake-known provenance = pack %q workspace %q, want homeops/recon", req.WorkPack, req.WorkWorkspace)
+	for _, trigger := range []string{"work-wake", "", "stale-work"} {
+		t.Run("trigger-"+strings.ReplaceAll(trigger, "-", "_"), func(t *testing.T) {
+			work := []beads.Bead{workBead("work-wake", "claude", "claude", "in_progress", 5)}
+			fresh := protectedPoolSessionBeadAt("sess-fresh", now.Add(-30*time.Second))
+			fresh.Metadata[beadmeta.TriggerBeadIDMetadataKey] = trigger
+			fresh.Metadata[beadmeta.PackMetadataKey] = "homeops"
+			fresh.Metadata[beadmeta.PackWorkspaceMetadataKey] = "recon"
+			got := ComputePoolDesiredStatesAt(cfg, work, sessionInfosFromBeads([]beads.Bead{fresh}), nil, now)
+			if len(got) != 1 || len(got[0].Requests) != 1 {
+				t.Fatalf("desired state = %#v, want one wake-known request", got)
+			}
+			req := got[0].Requests[0]
+			if req.Tier != "wake-known-identity" || req.SessionBeadID != fresh.ID || req.WorkBeadID != "work-wake" {
+				t.Fatalf("request = %#v, want wake-known bound to %s", req, fresh.ID)
+			}
+			if req.WorkPack != "homeops" || req.WorkWorkspace != "recon" {
+				t.Fatalf("wake-known provenance = pack %q workspace %q, want homeops/recon", req.WorkPack, req.WorkWorkspace)
+			}
+		})
 	}
 }
 

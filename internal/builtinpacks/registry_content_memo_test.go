@@ -11,7 +11,7 @@ import (
 const corruptionTarget = "internal/bootstrap/packs/core/pack.toml"
 
 // TestValidateSyntheticRepoDetectsCorruptionAfterSuccessfulValidation pins the
-// self-heal contract that pack content validation must keep honouring: a cached
+// self-heal contract that pack content validation must keep honoring: a cached
 // file corrupted AFTER a successful validation, in the SAME process, is still
 // detected.
 //

@@ -542,15 +542,6 @@ func materializeFS(src fs.FS, dst string) error {
 	return nil
 }
 
-// validatePackFiles verifies a materialized pack against the embedded manifest:
-// every expected file present, with the expected mode and content.
-//
-// It does not walk dst looking for unexpected files. validateSyntheticRepoFileSet
-// already walks the whole cache once against the union of that repository's
-// layout manifests, and that union check strictly subsumes a per-pack one:
-// ValidateSyntheticRepo calls validatePackFiles for exactly the layouts the
-// union is built from, so a file unexpected for its own pack is absent from the
-// union too. Keeping both meant about nine traversals of the same tree per call.
 // packContentValidationMemo memoizes successful pack content validation,
 // keyed by (dst, pack name) and guarded by a stat signature over the pack's
 // files. Verifying content costs an os.ReadFile of every file in the pack, and
@@ -573,6 +564,15 @@ func materializeFS(src fs.FS, dst string) error {
 // already lstats every file to check its mode.
 var packContentValidationMemo sync.Map // dst + "\x00" + pack.Name -> signature string
 
+// validatePackFiles verifies a materialized pack against the embedded manifest:
+// every expected file present, with the expected mode and content.
+//
+// It does not walk dst looking for unexpected files. validateSyntheticRepoFileSet
+// already walks the whole cache once against the union of that repository's
+// layout manifests, and that union check strictly subsumes a per-pack one:
+// ValidateSyntheticRepo calls validatePackFiles for exactly the layouts the
+// union is built from, so a file unexpected for its own pack is absent from the
+// union too. Keeping both meant about nine traversals of the same tree per call.
 func validatePackFiles(pack Pack, dst string) error {
 	manifest, err := manifestForPack(pack)
 	if err != nil {

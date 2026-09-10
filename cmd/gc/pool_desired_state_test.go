@@ -1122,21 +1122,21 @@ func TestComputePoolDesiredStates_InFlightNewSessionsConsumeScaleDemand(t *testi
 func TestComputePoolDesiredStates_PostCreateProtectionRetainsGraphStep(t *testing.T) {
 	now := time.Date(2026, 9, 10, 21, 0, 0, 0, time.UTC)
 	max := 2
-	cfg := &config.City{Agents: []config.Agent{poolAgent("worker", "", &max, 0)}}
+	cfg := &config.City{Agents: []config.Agent{poolAgent("claude", "", &max, 0)}}
 	session := pendingPoolSessionBeadAt("gc-a1hkx0", now.Add(-30*time.Second))
 	session.Metadata["pending_create_claim"] = ""
-	session.Metadata["state"] = "active"
+	session.Metadata["state"] = "awake"
 	session.Metadata["state_reason"] = "creation_complete"
 	session.Metadata["creation_complete_at"] = now.Add(-20 * time.Second).Format(time.RFC3339)
 	session.Metadata[beadmeta.TriggerBeadIDMetadataKey] = "sys-sp19qp"
 	session.Metadata[beadmeta.TriggerBeadStoreRefMetadataKey] = "city"
-	demand := map[string]scaleCheckDemand{"worker": {
+	demand := map[string]scaleCheckDemand{"claude": {
 		Count: 1, WorkBeadIDs: []string{"sys-sp19qp"},
 		StoreRefs: map[string]string{"sys-sp19qp": "city"},
 	}}
 	got := ComputePoolDesiredStatesWithDemandTracedAt(
 		cfg, nil, sessionInfosFromBeads([]beads.Bead{session}),
-		map[string]int{"worker": 1}, demand, now, nil,
+		map[string]int{"claude": 1}, demand, now, nil,
 	)
 	if len(got) != 1 || len(got[0].Requests) != 1 {
 		t.Fatalf("desired state = %#v, want one retained worker", got)

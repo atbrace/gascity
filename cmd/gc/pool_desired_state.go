@@ -290,7 +290,24 @@ func computePoolDesiredStatesAt(
 		if match < 0 {
 			continue
 		}
-		req.SessionBeadID = candidates[match].SessionBeadID
+		candidate := candidates[match]
+		req.SessionBeadID = candidate.SessionBeadID
+		// The assigned work row may not carry pack routing metadata (the live
+		// handoff source did not), while the fresh session already does. Keep
+		// that provenance when binding the concrete identity into the wake
+		// request so realization cannot silently re-home the work.
+		if strings.TrimSpace(req.WorkPack) == "" {
+			req.WorkPack = candidate.WorkPack
+		}
+		if strings.TrimSpace(req.WorkWorkspace) == "" {
+			req.WorkWorkspace = candidate.WorkWorkspace
+		}
+		if strings.TrimSpace(req.WorkStoreRef) == "" {
+			req.WorkStoreRef = candidate.WorkStoreRef
+		}
+		if strings.TrimSpace(req.BrainParentSID) == "" {
+			req.BrainParentSID = candidate.BrainParentSID
+		}
 		protectedNewRequests[req.Template] = append(candidates[:match], candidates[match+1:]...)
 	}
 	limits := newNestedCapLimits(cfg)

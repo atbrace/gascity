@@ -1113,6 +1113,38 @@ func TestComputePoolDesiredStates_InFlightNewSessionsConsumeScaleDemand(t *testi
 	}
 }
 
+// Regression for sys-30y0i.26.23: the graph executable step was the sole
+// routed demand unit, but two pending pool creates were reserved for the same
+// trigger. Both workers then received gc.trigger_bead_id=sys-sp19qp; the first
+// could execute the step formula and claim its source before the step ledger
+// claim, while the second claimed the step. A trigger identifies one unit of
+// execution, so duplicate requests in one desired-state pass must collapse to
+// one effective pool start (store ref distinguishes same IDs in independent
+// stores).
+func TestComputePoolDesiredStates_DeduplicatesPendingCreateTrigger(t *testing.T) {
+	max := 2
+	cfg := &config.City{Agents: []config.Agent{poolAgent("worker", "", &max, 0)}}
+	demand := map[string]scaleCheckDemand{
+		"worker": {
+			Count:       2,
+			WorkBeadIDs: []string{"sys-sp19qp", "sys-sp19qp"},
+			StoreRefs:   map[string]string{"sys-sp19qp": "city"},
+		},
+	}
+	got := ComputePoolDesiredStatesWithDemandTraced(
+		cfg, nil, nil, map[string]int{"worker": 2}, demand, nil,
+	)
+	if len(got) != 1 {
+		t.Fatalf("desired states = %#v, want one worker pool", got)
+	}
+	if len(got[0].Requests) != 1 {
+		t.Fatalf("requests = %#v, want one request for one trigger", got[0].Requests)
+	}
+	if got[0].Requests[0].WorkBeadID != "sys-sp19qp" {
+		t.Fatalf("trigger = %q, want sys-sp19qp", got[0].Requests[0].WorkBeadID)
+	}
+}
+
 func TestComputePoolDesiredStates_InFlightNewSessionsDoNotCreateZeroDemand(t *testing.T) {
 	cfg := &config.City{
 		Agents: []config.Agent{poolAgent("claude", "", intPtr(10), 0)},

@@ -1138,6 +1138,8 @@ func TestComputePoolDesiredStates_PostCreateProtectionRetainsGraphStep(t *testin
 	session.Metadata["creation_complete_at"] = now.Add(-20 * time.Second).Format(time.RFC3339)
 	session.Metadata[beadmeta.TriggerBeadIDMetadataKey] = "sys-sp19qp"
 	session.Metadata[beadmeta.TriggerBeadStoreRefMetadataKey] = "city"
+	session.Metadata[beadmeta.PackMetadataKey] = "homeops"
+	session.Metadata[beadmeta.PackWorkspaceMetadataKey] = "recon"
 	demand := map[string]scaleCheckDemand{"claude": {
 		Count: 1, WorkBeadIDs: []string{"sys-sp19qp"},
 		StoreRefs: map[string]string{"sys-sp19qp": "city"},
@@ -1152,6 +1154,49 @@ func TestComputePoolDesiredStates_PostCreateProtectionRetainsGraphStep(t *testin
 	request := got[0].Requests[0]
 	if request.SessionBeadID != session.ID || request.WorkBeadID != "sys-sp19qp" {
 		t.Fatalf("request = %#v, want existing session %s bound to sys-sp19qp", request, session.ID)
+	}
+	if request.WorkPack != "homeops" || request.WorkWorkspace != "recon" {
+		t.Fatalf("request provenance = pack %q workspace %q, want homeops/recon", request.WorkPack, request.WorkWorkspace)
+	}
+}
+
+func TestComputePoolDesiredStates_PostCreateProtectionBindsWakeKnownCapacity(t *testing.T) {
+	now := time.Date(2026, 9, 10, 21, 0, 0, 0, time.UTC)
+	cfg := &config.City{Agents: []config.Agent{poolAgent("claude", "", intPtr(2), 0)}}
+	work := []beads.Bead{workBead("work-wake", "claude", "claude", "in_progress", 5)}
+	fresh := protectedPoolSessionBeadAt("sess-fresh", now.Add(-30*time.Second))
+	fresh.Metadata[beadmeta.TriggerBeadIDMetadataKey] = "work-wake"
+	fresh.Metadata[beadmeta.PackMetadataKey] = "homeops"
+	fresh.Metadata[beadmeta.PackWorkspaceMetadataKey] = "recon"
+	got := ComputePoolDesiredStatesAt(cfg, work, sessionInfosFromBeads([]beads.Bead{fresh}), nil, now)
+	if len(got) != 1 || len(got[0].Requests) != 1 {
+		t.Fatalf("desired state = %#v, want one wake-known request", got)
+	}
+	req := got[0].Requests[0]
+	if req.Tier != "wake-known-identity" || req.SessionBeadID != fresh.ID || req.WorkBeadID != "work-wake" {
+		t.Fatalf("request = %#v, want wake-known bound to %s", req, fresh.ID)
+	}
+	if req.WorkPack != "homeops" || req.WorkWorkspace != "recon" {
+		t.Fatalf("wake-known provenance = pack %q workspace %q, want homeops/recon", req.WorkPack, req.WorkWorkspace)
+	}
+}
+
+func TestComputePoolDesiredStates_InFlightPreservesTriggerProvenance(t *testing.T) {
+	now := time.Date(2026, 9, 10, 21, 0, 0, 0, time.UTC)
+	cfg := &config.City{Agents: []config.Agent{poolAgent("claude", "", intPtr(2), 0)}}
+	pending := pendingPoolSessionBeadAt("sess-pending", now.Add(-5*time.Second))
+	pending.Metadata[beadmeta.TriggerBeadIDMetadataKey] = "sys-sp19qp"
+	pending.Metadata[beadmeta.TriggerBeadStoreRefMetadataKey] = "city"
+	pending.Metadata[beadmeta.PackMetadataKey] = "homeops"
+	pending.Metadata[beadmeta.PackWorkspaceMetadataKey] = "recon"
+	demand := map[string]scaleCheckDemand{"claude": {Count: 1, WorkBeadIDs: []string{"sys-sp19qp"}, StoreRefs: map[string]string{"sys-sp19qp": "city"}}}
+	got := ComputePoolDesiredStatesWithDemandTracedAt(cfg, nil, sessionInfosFromBeads([]beads.Bead{pending}), map[string]int{"claude": 1}, demand, now, nil)
+	if len(got) != 1 || len(got[0].Requests) != 1 {
+		t.Fatalf("desired state = %#v, want one in-flight request", got)
+	}
+	req := got[0].Requests[0]
+	if req.SessionBeadID != pending.ID || req.WorkPack != "homeops" || req.WorkWorkspace != "recon" {
+		t.Fatalf("request = %#v, want session/provenance sess-pending/homeops/recon", req)
 	}
 }
 

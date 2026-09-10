@@ -270,6 +270,29 @@ func computePoolDesiredStatesAt(
 		}
 	}
 	protectedNewRequests, inFlightNewRequests := poolNewDemandRequests(cfg, sessionInfos, resumeSessionBeadIDs, decisionTime)
+	// A wake-known request has assigned work but no surviving concrete session
+	// identity. Bind a protected fresh session only when its trigger is the same
+	// work item; otherwise leave it available for scale demand or its own
+	// trigger. Consuming the match prevents a second request for that capacity.
+	for i := range resumeRequests {
+		req := &resumeRequests[i]
+		if req.Tier != "wake-known-identity" || req.SessionBeadID != "" {
+			continue
+		}
+		candidates := protectedNewRequests[req.Template]
+		match := -1
+		for j, candidate := range candidates {
+			if req.WorkBeadID != "" && strings.TrimSpace(candidate.WorkBeadID) == strings.TrimSpace(req.WorkBeadID) {
+				match = j
+				break
+			}
+		}
+		if match < 0 {
+			continue
+		}
+		req.SessionBeadID = candidates[match].SessionBeadID
+		protectedNewRequests[req.Template] = append(candidates[:match], candidates[match+1:]...)
+	}
 	limits := newNestedCapLimits(cfg)
 	usage := acceptedNestedCapUsage(limits, resumeRequests)
 	allRequests := append([]SessionRequest(nil), resumeRequests...)
@@ -388,13 +411,27 @@ func allocateScaleDemandToConcrete(demand scaleCheckDemand, concrete []SessionRe
 }
 
 func requestWithScaleDemandProvenance(req SessionRequest, demand scaleCheckDemand, id string) SessionRequest {
+	previousID := strings.TrimSpace(req.WorkBeadID)
+	preserveExisting := previousID != "" && previousID == strings.TrimSpace(id)
 	req.WorkBeadID = id
-	req.WorkBeadTitle = strings.TrimSpace(demand.Titles[id])
-	req.WorkPack = strings.TrimSpace(demand.Packs[id])
-	req.WorkWorkspace = strings.TrimSpace(demand.Workspaces[id])
-	req.WorkStoreRef = strings.TrimSpace(demand.StoreRefs[id])
-	req.BrainParentSID = strings.TrimSpace(demand.ParentSIDs[id])
+	req.WorkBeadTitle = scaleDemandProvenanceValue(demand.Titles, id, req.WorkBeadTitle, preserveExisting)
+	req.WorkPack = scaleDemandProvenanceValue(demand.Packs, id, req.WorkPack, preserveExisting)
+	req.WorkWorkspace = scaleDemandProvenanceValue(demand.Workspaces, id, req.WorkWorkspace, preserveExisting)
+	req.WorkStoreRef = scaleDemandProvenanceValue(demand.StoreRefs, id, req.WorkStoreRef, preserveExisting)
+	req.BrainParentSID = scaleDemandProvenanceValue(demand.ParentSIDs, id, req.BrainParentSID, preserveExisting)
 	return req
+}
+
+func scaleDemandProvenanceValue(values map[string]string, id, existing string, preserveExisting bool) string {
+	if values != nil {
+		if value, ok := values[id]; ok {
+			return strings.TrimSpace(value)
+		}
+	}
+	if preserveExisting {
+		return strings.TrimSpace(existing)
+	}
+	return ""
 }
 
 func canonicalSingletonAliasHeldTemplates(cfg *config.City, sessionInfos []sessionpkg.Info) map[string]struct{} {
@@ -467,6 +504,8 @@ func poolNewDemandRequests(cfg *config.City, sessionInfos []sessionpkg.Info, res
 				Tier:           "new",
 				SessionBeadID:  sb.ID,
 				WorkBeadID:     strings.TrimSpace(sb.TriggerBeadID),
+				WorkPack:       strings.TrimSpace(sb.Pack),
+				WorkWorkspace:  strings.TrimSpace(sb.PackWorkspace),
 				WorkStoreRef:   strings.TrimSpace(sb.TriggerBeadStoreRef),
 				BrainParentSID: strings.TrimSpace(sb.BrainParentSID),
 			}

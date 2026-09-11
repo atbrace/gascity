@@ -32,6 +32,9 @@ func triggerAffinityOps(claim func(string) (beads.Bead, bool, error)) hookClaimO
 		LookupTrigger: func(context.Context, string, []string, string) (beads.Bead, error) {
 			return beads.Bead{}, beads.ErrNotFound
 		},
+		ReadyContinuation: func(context.Context, string, []string, string) ([]beads.Bead, error) {
+			return nil, nil
+		},
 	}
 }
 
@@ -260,9 +263,11 @@ func TestTriggerHookClaimUsesOnlyDurablyAssignedContinuation(t *testing.T) {
 		wantWork bool
 	}{
 		{name: "same session", siblings: []beads.Bead{{ID: "continuation-b", Status: "open", Assignee: "pool/session-1"}}, wantWork: true},
+		{name: "same session in progress", siblings: []beads.Bead{{ID: "continuation-b", Status: "in_progress", Assignee: "pool/session-1"}}, wantWork: true},
 		{name: "foreign", siblings: []beads.Bead{{ID: "continuation-b", Status: "open", Assignee: "other/session"}}},
 		{name: "unassigned", siblings: []beads.Bead{{ID: "continuation-b", Status: "open"}}},
 		{name: "unrelated", siblings: []beads.Bead{{ID: "continuation-c", Status: "open", Assignee: "pool/session-1"}}},
+		{name: "blocked before ready", siblings: []beads.Bead{{ID: "continuation-b", Status: "open", Assignee: "pool/session-1"}, {ID: "continuation-d", Status: "open", Assignee: "pool/session-1"}}, wantWork: true},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
@@ -287,6 +292,16 @@ func TestTriggerHookClaimUsesOnlyDurablyAssignedContinuation(t *testing.T) {
 				}
 				return tc.siblings, nil
 			}
+			ops.ReadyContinuation = func(context.Context, string, []string, string) ([]beads.Bead, error) {
+				if tc.name == "same session in progress" { return nil, nil }
+				if tc.name == "blocked before ready" {
+					return []beads.Bead{{ID: "continuation-d", Status: "open", Assignee: opts.Assignee}}, nil
+				}
+				if tc.wantWork {
+					return []beads.Bead{{ID: "continuation-b", Status: "open", Assignee: opts.Assignee}}, nil
+				}
+				return nil, nil
+			}
 			var stdout, stderr bytes.Buffer
 			calls := 0
 			code := claimHookWorkWithRunner("bd ready --json", "fallback", nil, stores, opts, ops,
@@ -298,7 +313,9 @@ func TestTriggerHookClaimUsesOnlyDurablyAssignedContinuation(t *testing.T) {
 			var result hookClaimJSONResult
 			if err := json.Unmarshal(stdout.Bytes(), &result); err != nil { t.Fatalf("result is not JSON: %v", err) }
 			if tc.wantWork {
-				if code != 0 || result.Action != "work" || result.BeadID != "continuation-b" { t.Fatalf("result=%+v code=%d", result, code) }
+				wantID := "continuation-b"
+				if tc.name == "blocked before ready" { wantID = "continuation-d" }
+				if code != 0 || result.Action != "work" || result.BeadID != wantID { t.Fatalf("result=%+v code=%d", result, code) }
 			} else if code != 0 || result.Action != "drain" || result.Reason != hookClaimReasonNoWork { t.Fatalf("result=%+v code=%d, want no_work", result, code) }
 			if calls != 1 { t.Fatalf("query calls=%d, want 1 exact store query", calls) }
 		})

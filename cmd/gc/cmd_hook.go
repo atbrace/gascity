@@ -753,6 +753,14 @@ func hookClaimTriggerContinuation(opts hookClaimOptions, ops hookClaimOps, dir s
 	if err != nil {
 		return writeHookClaimRetry(opts, ops, stdout, stderr), true
 	}
+	ready, err := ops.ReadyContinuation(ctx, dir, opts.Env, opts.Assignee)
+	if err != nil {
+		return writeHookClaimRetry(opts, ops, stdout, stderr), true
+	}
+	readyIDs := make(map[string]struct{}, len(ready))
+	for _, bead := range ready {
+		readyIDs[bead.ID] = struct{}{}
+	}
 	eligible := make([]beads.Bead, 0, len(siblings))
 	for _, sibling := range siblings {
 		if sibling.ID == "" || sibling.ID == opts.TriggerBeadID ||
@@ -760,6 +768,7 @@ func hookClaimTriggerContinuation(opts hookClaimOptions, ops hookClaimOps, dir s
 			sibling.Metadata[beadmeta.RootBeadIDMetadataKey] != rootID ||
 			sibling.Metadata[beadmeta.ContinuationGroupMetadataKey] != group ||
 			(sibling.Status != "open" && sibling.Status != "in_progress") ||
+			(sibling.Status == "open" && !hookBeadIDSetContains(readyIDs, sibling.ID)) ||
 			hookTriggerCandidateNotReady(sibling, time.Now()) {
 			continue
 		}
@@ -784,6 +793,11 @@ func hookClaimTriggerContinuation(opts hookClaimOptions, ops hookClaimOps, dir s
 		return writeHookClaimWorkResultForBead(result, sibling, opts, ops, dir, stdout, stderr), true
 	}
 	return 0, false
+}
+
+func hookBeadIDSetContains(ids map[string]struct{}, id string) bool {
+	_, ok := ids[id]
+	return ok
 }
 
 func hookClaimPrimaryRouteTarget(a *config.Agent) string {

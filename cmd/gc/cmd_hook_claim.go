@@ -71,6 +71,7 @@ type hookClaimOps struct {
 	// LookupTrigger resolves the frozen trigger by ID in the selected store so
 	// a terminal trigger can authorize only its already-assigned continuation.
 	LookupTrigger hookLookupTriggerFunc
+	ReadyContinuation hookReadyContinuationFunc
 	// EmitClaimRejected publishes a bead.claim_rejected event when a claim is
 	// lost to a different live claimant (ADR-0009). Best-effort.
 	EmitClaimRejected hookEmitClaimRejectedFunc
@@ -99,6 +100,7 @@ type (
 	hookInputDoneFunc          func(ctx context.Context, dir string, env []string, candidate beads.Bead, identityCandidates []string) (string, bool, error)
 	hookSkipDoneWorkflowFunc   func(ctx context.Context, dir string, env []string, rootID string) error
 	hookLookupTriggerFunc      func(ctx context.Context, dir string, env []string, beadID string) (beads.Bead, error)
+	hookReadyContinuationFunc  func(ctx context.Context, dir string, env []string, assignee string) ([]beads.Bead, error)
 	hookStampWorkMetaFunc      func(ctx context.Context, dir string, env []string, beadID, assignee string, patch map[string]string) error
 	hookPublishRunMapFunc      func(runID, beadID string, sessionKeys ...string) error
 )
@@ -264,6 +266,9 @@ func (ops *hookClaimOps) applyDefaults() {
 	}
 	if ops.LookupTrigger == nil {
 		ops.LookupTrigger = hookLookupTriggerWithBdStore
+	}
+	if ops.ReadyContinuation == nil {
+		ops.ReadyContinuation = hookReadyContinuationWithBdStore
 	}
 	if ops.EmitClaimRejected == nil {
 		ops.EmitClaimRejected = hookEmitClaimRejected
@@ -1356,6 +1361,10 @@ func hookAssignContinuationWithBdStore(_ context.Context, dir string, env []stri
 
 func hookLookupTriggerWithBdStore(_ context.Context, dir string, env []string, beadID string) (beads.Bead, error) {
 	return hookClaimBdStore(dir, env, "").Get(beadID)
+}
+
+func hookReadyContinuationWithBdStore(_ context.Context, dir string, env []string, assignee string) ([]beads.Bead, error) {
+	return hookClaimBdStore(dir, env, "").Ready(beads.ReadyQuery{Assignee: assignee, TierMode: beads.TierBoth})
 }
 
 func hookRuntimeDrainAck(stderr io.Writer) error {

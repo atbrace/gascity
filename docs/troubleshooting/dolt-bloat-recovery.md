@@ -196,6 +196,11 @@ should treat these strings as the current vocabulary:
 | `post-flatten value hash changed with row-count increase` | The database hash changed after at least one stable-table row-count gain. |
 | `post-flatten value hash changed without row-count increase` | The database hash changed without a row-count gain. |
 
+The compactor announces a quarantine marker to `GC_DOLT_COMPACT_ALERT_TO`
+(default `mayor`) once: the first alert records `alerted_at=<UTC timestamp>` in
+the marker file, and later runs do not re-announce an unchanged marker.
+Clearing the marker re-arms the alert for the next quarantine.
+
 ## When to Escalate
 
 If a recovery GC reduces the store by less than ~10% and `gc doctor` still

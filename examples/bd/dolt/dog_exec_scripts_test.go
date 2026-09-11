@@ -3388,6 +3388,71 @@ func TestCompactScriptQuarantineAlertRecipientCanBeOverridden(t *testing.T) {
 	assertCompactBeadsQuarantineAlert(t, fixture, "gascity/operator", marker, "compact-quarantine", reason)
 }
 
+func assertNoCompactQuarantineAlert(t *testing.T, fixture compactScriptFixture, context string) {
+	t.Helper()
+	log := readCompactGCLog(t, fixture)
+	if lines := compactGCLogLinesWithPrefix(log, "gc mail send "); len(lines) != 0 {
+		t.Fatalf("%s: unchanged quarantine marker must not re-send operator mail, got %d\nlog:\n%s", context, len(lines), log)
+	}
+	if lines := compactGCLogLinesWithPrefix(log, "gc event emit dolt.compact.quarantine"); len(lines) != 0 {
+		t.Fatalf("%s: unchanged quarantine marker must not re-emit dolt.compact.quarantine, got %d\nlog:\n%s", context, len(lines), log)
+	}
+}
+
+// gc-4lrsb: a quarantine marker is announced once. Re-announcing an unchanged
+// marker on every scheduled run adds no information, and every re-send is a
+// mail bead plus a Dolt commit on the very database whose compaction is stuck.
+func TestCompactScriptQuarantineMarkerAlertsOncePerMarker(t *testing.T) {
+	fixture := newCompactScriptFixture(t)
+	firstOut, err := fixture.run(t, "row_count_decreases", "GC_DOLT_COMPACT_THRESHOLD_COMMITS=500")
+	if err == nil {
+		t.Fatalf("first compact succeeded despite row-count decrease:\n%s", firstOut)
+	}
+	marker := filepath.Join(fixture.cityPath, ".gc", "runtime", "packs", "dolt", "compact-quarantine", "beads")
+	const reason = "post-flatten row count decreased"
+	assertCompactBeadsQuarantineAlert(t, fixture, "mayor", marker, "compact-quarantine", reason)
+	if alertedAt := compactMarkerValue(t, marker, "alerted_at"); len(alertedAt) != len("2026-01-01T00:00:00Z") || !strings.HasSuffix(alertedAt, "Z") {
+		t.Fatalf("quarantine marker alerted_at = %q, want UTC timestamp", alertedAt)
+	}
+
+	for _, tc := range []struct {
+		name string
+		args []string
+		env  []string
+	}{
+		{name: "scheduled_rerun"},
+		{name: "bare_gc_rerun", env: []string{"GC_DOLT_COMPACT_BARE_GC=1"}},
+		{name: "gc_only_rerun", args: []string{"--gc-only"}},
+	} {
+		resetCompactGCLog(t, fixture)
+		env := append([]string{"GC_DOLT_COMPACT_THRESHOLD_COMMITS=500"}, tc.env...)
+		out, err := fixture.runWithArgs(t, "success", tc.args, env...)
+		if err == nil {
+			t.Fatalf("%s succeeded despite quarantine marker:\n%s", tc.name, out)
+		}
+		if !strings.Contains(out, "integrity quarantine marker exists") {
+			t.Fatalf("%s missing quarantine explanation:\n%s", tc.name, out)
+		}
+		assertNoCompactQuarantineAlert(t, fixture, tc.name)
+	}
+
+	// An operator clearing the marker and a later quarantine is a new event:
+	// a fresh marker carries no stamp, so it is announced again.
+	if err := os.Remove(marker); err != nil {
+		t.Fatalf("clear quarantine marker: %v", err)
+	}
+	const rearmedReason = "manual repair pending"
+	if err := os.WriteFile(marker, []byte("db=beads\nreason="+rearmedReason+"\ncreated_at=2026-09-11T00:00:00Z\n"), 0o600); err != nil {
+		t.Fatalf("write fresh quarantine marker: %v", err)
+	}
+	resetCompactGCLog(t, fixture)
+	out, err := fixture.run(t, "success", "GC_DOLT_COMPACT_THRESHOLD_COMMITS=500")
+	if err == nil {
+		t.Fatalf("compact succeeded despite fresh quarantine marker:\n%s", out)
+	}
+	assertCompactBeadsQuarantineAlert(t, fixture, "mayor", marker, "compact-quarantine", rearmedReason)
+}
+
 func TestCompactScriptDryRunSkipsMutations(t *testing.T) {
 	fixture := newCompactScriptFixture(t)
 	out, err := fixture.run(t, "success", "GC_DOLT_COMPACT_THRESHOLD_COMMITS=500", "GC_DOLT_COMPACT_DRY_RUN=1")

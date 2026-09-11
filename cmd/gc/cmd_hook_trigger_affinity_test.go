@@ -14,11 +14,11 @@ import (
 
 func triggerAffinityOpts() hookClaimOptions {
 	return hookClaimOptions{
-		Assignee:           "pool/session-1",
-		TriggerBeadID:      "trigger-1",
+		Assignee:            "pool/session-1",
+		TriggerBeadID:       "trigger-1",
 		TriggerBeadStoreRef: "rig:target",
-		JSON:               true,
-		DrainAck:           true,
+		JSON:                true,
+		DrainAck:            true,
 	}
 }
 
@@ -180,5 +180,41 @@ func TestTriggerHookClaimReturnsExistingExactAssignment(t *testing.T) {
 	}
 	if claimCalled {
 		t.Fatal("existing exact assignment must not be claimed again")
+	}
+}
+
+func TestTriggerHookClaimKeepsExistingAssignmentWhenInputIsTerminal(t *testing.T) {
+	opts := triggerAffinityOpts()
+	stores := []hookStore{{dir: "target", storeRef: "rig:target"}}
+	inputDoneCalled := false
+	skipCalled := false
+	var stdout, stderr bytes.Buffer
+	ops := triggerAffinityOps(func(string) (beads.Bead, bool, error) {
+		t.Fatal("existing exact assignment must not be claimed again")
+		return beads.Bead{}, false, nil
+	})
+	ops.InputDone = func(context.Context, string, []string, beads.Bead, []string) (string, bool, error) {
+		inputDoneCalled = true
+		return "root-1", true, nil
+	}
+	ops.SkipDoneWorkflow = func(context.Context, string, []string, string) error {
+		skipCalled = true
+		return nil
+	}
+	code := claimHookWorkWithRunner("bd ready --json", "fallback", nil, stores, opts, ops,
+		func(_ string, _ string, _ []string) (string, error) {
+			bead := triggerAffinityBead("trigger-1", "in_progress", opts.Assignee)
+			bead.Metadata = map[string]string{"gc.root_bead_id": "root-1", "gc.input_convoy_id": "convoy-1"}
+			return triggerAffinityJSON(t, bead), nil
+		}, nil, &stdout, &stderr)
+	var result hookClaimJSONResult
+	if err := json.Unmarshal(stdout.Bytes(), &result); err != nil {
+		t.Fatalf("result is not JSON: %v; stdout=%q", err, stdout.String())
+	}
+	if code != 0 || result.Action != "work" || result.Reason != "existing_assignment" || result.BeadID != opts.TriggerBeadID {
+		t.Fatalf("result=%+v code=%d, want existing exact assignment", result, code)
+	}
+	if inputDoneCalled || skipCalled {
+		t.Fatalf("trigger-bound existing assignment invoked input retirement: inputDone=%t skip=%t", inputDoneCalled, skipCalled)
 	}
 }

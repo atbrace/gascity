@@ -41,18 +41,18 @@ var hookClaimMutationTimeout = 10 * time.Second
 var hookClaimCommandRunnerWithEnvContext = beads.ExecCommandRunnerWithEnvContext
 
 type hookClaimOptions struct {
-	Assignee           string
+	Assignee string
 	// TriggerBeadID and TriggerBeadStoreRef are stamped onto ephemeral pool
 	// sessions at creation. When present, hook --claim is restricted to this
 	// exact bead in this exact store; it must never fall back to generic or
 	// federated work.
 	TriggerBeadID       string
 	TriggerBeadStoreRef string
-	IdentityCandidates []string
-	RouteTargets       []string
-	Env                []string
-	DrainAck           bool
-	JSON               bool
+	IdentityCandidates  []string
+	RouteTargets        []string
+	Env                 []string
+	DrainAck            bool
+	JSON                bool
 }
 
 type hookClaimOps struct {
@@ -410,7 +410,7 @@ func hookClaimExistingOrAssigned(candidates []beads.Bead, opts hookClaimOptions,
 		}
 		if strings.EqualFold(strings.TrimSpace(candidate.Status), "in_progress") &&
 			hookClaimHasIdentity(candidate.Assignee, opts.IdentityCandidates) {
-			if hookSkipIfInputDone(candidate, opts, ops, dir, stderr) {
+			if opts.TriggerBeadID == "" && hookSkipIfInputDone(candidate, opts, ops, dir, stderr) {
 				continue
 			}
 			result := hookClaimJSONResult{
@@ -432,7 +432,7 @@ func hookClaimExistingOrAssigned(candidates []beads.Bead, opts hookClaimOptions,
 		}
 		if strings.EqualFold(strings.TrimSpace(candidate.Status), "open") &&
 			hookClaimHasIdentity(candidate.Assignee, opts.IdentityCandidates) {
-			if hookSkipIfInputDone(candidate, opts, ops, dir, stderr) {
+			if opts.TriggerBeadID == "" && hookSkipIfInputDone(candidate, opts, ops, dir, stderr) {
 				continue
 			}
 			result := hookClaimJSONResult{

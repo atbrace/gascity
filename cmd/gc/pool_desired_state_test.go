@@ -143,8 +143,8 @@ func TestComputePoolDesiredStatesMarksSourceResumeForAssignedContinuation(t *tes
 	continuation := workBead("continuation-C", "claude", "sess-1", "in_progress", 1)
 	continuation.Metadata[beadmeta.ContinuationGroupMetadataKey] = "group-1"
 	states := ComputePoolDesiredStates(cfg, []beads.Bead{source, continuation}, sessionInfosFromBeads([]beads.Bead{session}), nil)
-	if len(states) != 1 || len(states[0].Requests) != 2 {
-		t.Fatalf("desired states = %#v, want source plus continuation resume requests", states)
+	if len(states) != 1 || len(states[0].Requests) != 1 {
+		t.Fatalf("desired states = %#v, want one source resume request", states)
 	}
 	for _, request := range states[0].Requests {
 		if request.WorkBeadID == source.ID && !request.PreserveTrigger {

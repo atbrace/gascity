@@ -14,6 +14,7 @@ import (
 
 	"github.com/spf13/cobra"
 
+	"github.com/gastownhall/gascity/internal/beadmeta"
 	"github.com/gastownhall/gascity/internal/beads"
 	"github.com/gastownhall/gascity/internal/config"
 	"github.com/gastownhall/gascity/internal/fsys"
@@ -717,7 +718,61 @@ func claimHookTriggerWorkWithRunner(workQuery, workDir string, queryEnv []string
 	if res.claimsErrored {
 		return writeHookClaimRetry(storeOpts, storeOps, stdout, stderr)
 	}
+	if continuation, handled := hookClaimTriggerContinuation(storeOpts, storeOps, selectedDir, stdout, stderr); handled {
+		return continuation
+	}
 	return writeHookClaimNoWork(storeOpts, storeOps, false, stdout, stderr)
+}
+
+// hookClaimTriggerContinuation permits a trigger-bound session to continue
+// only after its frozen trigger has become terminal. The trigger is resolved
+// by exact ID in the already-selected store; only siblings with the exact
+// root/group metadata and the exact session assignee are eligible. In
+// particular, this never claims an unassigned or merely route-matched sibling.
+func hookClaimTriggerContinuation(opts hookClaimOptions, ops hookClaimOps, dir string, stdout, stderr io.Writer) (int, bool) {
+	ctx, cancel := context.WithTimeout(context.Background(), hookClaimMutationTimeout)
+	defer cancel()
+	trigger, err := ops.LookupTrigger(ctx, dir, opts.Env, opts.TriggerBeadID)
+	if err != nil {
+		if errors.Is(err, beads.ErrNotFound) {
+			return 0, false
+		}
+		return writeHookClaimRetry(opts, ops, stdout, stderr), true
+	}
+	status := strings.ToLower(strings.TrimSpace(trigger.Status))
+	if status != "closed" && status != "failed" {
+		return 0, false
+	}
+	rootID := strings.TrimSpace(trigger.Metadata[beadmeta.RootBeadIDMetadataKey])
+	group := strings.TrimSpace(trigger.Metadata[beadmeta.ContinuationGroupMetadataKey])
+	if rootID == "" || group == "" {
+		return 0, false
+	}
+	siblings, err := ops.ListContinuation(ctx, dir, opts.Env, rootID, group)
+	if err != nil {
+		return writeHookClaimRetry(opts, ops, stdout, stderr), true
+	}
+	for _, sibling := range siblings {
+		if sibling.ID == "" || sibling.ID == opts.TriggerBeadID ||
+			strings.TrimSpace(sibling.Assignee) != opts.Assignee ||
+			sibling.Metadata[beadmeta.RootBeadIDMetadataKey] != rootID ||
+			sibling.Metadata[beadmeta.ContinuationGroupMetadataKey] != group ||
+			(sibling.Status != "open" && sibling.Status != "in_progress") ||
+			hookTriggerCandidateNotReady(sibling, time.Now()) {
+			continue
+		}
+		reason := "existing_assignment"
+		if sibling.Status == "open" {
+			reason = "ready_assignment"
+		}
+		result := hookClaimJSONResult{
+			SchemaVersion: "1", OK: true, Command: hookClaimCommandName,
+			Action: "work", Reason: reason, BeadID: sibling.ID,
+			Assignee: sibling.Assignee, Route: hookClaimRoute(sibling),
+		}
+		return writeHookClaimWorkResultForBead(result, sibling, opts, ops, dir, stdout, stderr), true
+	}
+	return 0, false
 }
 
 func hookClaimPrimaryRouteTarget(a *config.Agent) string {

@@ -68,6 +68,9 @@ type hookClaimOps struct {
 	// SkipDoneWorkflow closes a workflow root and its open steps with
 	// gc.outcome=skipped after InputDone reported the input terminal.
 	SkipDoneWorkflow hookSkipDoneWorkflowFunc
+	// LookupTrigger resolves the frozen trigger by ID in the selected store so
+	// a terminal trigger can authorize only its already-assigned continuation.
+	LookupTrigger hookLookupTriggerFunc
 	// EmitClaimRejected publishes a bead.claim_rejected event when a claim is
 	// lost to a different live claimant (ADR-0009). Best-effort.
 	EmitClaimRejected hookEmitClaimRejectedFunc
@@ -95,6 +98,7 @@ type (
 	hookResolveWorkBranchFunc  func(dir string) string
 	hookInputDoneFunc          func(ctx context.Context, dir string, env []string, candidate beads.Bead, identityCandidates []string) (string, bool, error)
 	hookSkipDoneWorkflowFunc   func(ctx context.Context, dir string, env []string, rootID string) error
+	hookLookupTriggerFunc      func(ctx context.Context, dir string, env []string, beadID string) (beads.Bead, error)
 	hookStampWorkMetaFunc      func(ctx context.Context, dir string, env []string, beadID, assignee string, patch map[string]string) error
 	hookPublishRunMapFunc      func(runID, beadID string, sessionKeys ...string) error
 )
@@ -257,6 +261,9 @@ func (ops *hookClaimOps) applyDefaults() {
 	}
 	if ops.SkipDoneWorkflow == nil {
 		ops.SkipDoneWorkflow = hookSkipDoneWorkflowWithBdStore
+	}
+	if ops.LookupTrigger == nil {
+		ops.LookupTrigger = hookLookupTriggerWithBdStore
 	}
 	if ops.EmitClaimRejected == nil {
 		ops.EmitClaimRejected = hookEmitClaimRejected
@@ -469,7 +476,7 @@ func writeHookClaimWorkResultForBead(result hookClaimJSONResult, bead beads.Bead
 	stampHookClaimIdentity(bead, opts, ops, dir, stderr)
 	publishHookClaimRunMap(bead, opts, ops, stderr)
 	var assigned []string
-	if strings.TrimSpace(opts.TriggerBeadID) == "" {
+	if strings.TrimSpace(opts.TriggerBeadID) == "" || bead.ID == strings.TrimSpace(opts.TriggerBeadID) {
 		var err error
 		assigned, err = preassignHookContinuationGroup(bead, opts, ops, dir)
 		if err != nil {
@@ -1345,6 +1352,10 @@ func hookListContinuationWithBdStore(_ context.Context, dir string, env []string
 func hookAssignContinuationWithBdStore(_ context.Context, dir string, env []string, beadID, assignee string) error {
 	store := hookClaimBdStore(dir, env, assignee)
 	return store.Update(beadID, beads.UpdateOpts{Assignee: &assignee})
+}
+
+func hookLookupTriggerWithBdStore(_ context.Context, dir string, env []string, beadID string) (beads.Bead, error) {
+	return hookClaimBdStore(dir, env, "").Get(beadID)
 }
 
 func hookRuntimeDrainAck(stderr io.Writer) error {

@@ -9,6 +9,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/gastownhall/gascity/internal/beadmeta"
 	"github.com/gastownhall/gascity/internal/beads"
 )
 
@@ -216,5 +217,84 @@ func TestTriggerHookClaimKeepsExistingAssignmentWhenInputIsTerminal(t *testing.T
 	}
 	if inputDoneCalled || skipCalled {
 		t.Fatalf("trigger-bound existing assignment invoked input retirement: inputDone=%t skip=%t", inputDoneCalled, skipCalled)
+	}
+}
+
+func TestTriggerHookClaimPreassignsOnlyFromInitialTrigger(t *testing.T) {
+	opts := triggerAffinityOpts()
+	stores := []hookStore{{dir: "target", storeRef: "rig:target"}}
+	var assigned string
+	ops := triggerAffinityOps(func(id string) (beads.Bead, bool, error) {
+		return triggerAffinityBead(id, "in_progress", opts.Assignee), true, nil
+	})
+	ops.ListContinuation = func(context.Context, string, []string, string, string) ([]beads.Bead, error) {
+		return []beads.Bead{{ID: "continuation-b", Status: "open"}}, nil
+	}
+	ops.AssignContinuation = func(_ context.Context, _ string, _ []string, id, assignee string) error {
+		assigned = id + ":" + assignee
+		return nil
+	}
+	var stdout, stderr bytes.Buffer
+	code := claimHookWorkWithRunner("bd ready --json", "fallback", nil, stores, opts, ops,
+		func(_ string, _ string, _ []string) (string, error) {
+			bead := triggerAffinityBead(opts.TriggerBeadID, "open", "")
+			bead.Metadata = map[string]string{
+				beadmeta.RootBeadIDMetadataKey: "root-1",
+				beadmeta.ContinuationGroupMetadataKey: "group-1",
+			}
+			return triggerAffinityJSON(t, bead), nil
+		}, nil, &stdout, &stderr)
+	if code != 0 || assigned != "continuation-b:"+opts.Assignee {
+		t.Fatalf("code=%d assigned=%q, want initial trigger to preassign B", code, assigned)
+	}
+}
+
+func TestTriggerHookClaimUsesOnlyDurablyAssignedContinuation(t *testing.T) {
+	cases := []struct {
+		name     string
+		siblings []beads.Bead
+		wantWork bool
+	}{
+		{name: "same session", siblings: []beads.Bead{{ID: "continuation-b", Status: "open", Assignee: "pool/session-1"}}, wantWork: true},
+		{name: "foreign", siblings: []beads.Bead{{ID: "continuation-b", Status: "open", Assignee: "other/session"}}},
+		{name: "unassigned", siblings: []beads.Bead{{ID: "continuation-b", Status: "open"}}},
+		{name: "unrelated", siblings: []beads.Bead{{ID: "continuation-c", Status: "open", Assignee: "pool/session-1"}}},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			opts := triggerAffinityOpts()
+			stores := []hookStore{{dir: "target", storeRef: "rig:target"}, {dir: "other", storeRef: "rig:other"}}
+			ops := triggerAffinityOps(func(string) (beads.Bead, bool, error) {
+				t.Fatal("continuation path must not claim")
+				return beads.Bead{}, false, nil
+			})
+			ops.LookupTrigger = func(context.Context, string, []string, string) (beads.Bead, error) {
+				return beads.Bead{ID: opts.TriggerBeadID, Status: "closed", Metadata: map[string]string{
+					beadmeta.RootBeadIDMetadataKey: "root-1", beadmeta.ContinuationGroupMetadataKey: "group-1",
+				}}, nil
+			}
+			ops.ListContinuation = func(context.Context, string, []string, string, string) ([]beads.Bead, error) {
+				for i := range tc.siblings {
+					tc.siblings[i].Metadata = map[string]string{
+						beadmeta.RootBeadIDMetadataKey: "root-1", beadmeta.ContinuationGroupMetadataKey: "group-1",
+					}
+				}
+				return tc.siblings, nil
+			}
+			var stdout, stderr bytes.Buffer
+			calls := 0
+			code := claimHookWorkWithRunner("bd ready --json", "fallback", nil, stores, opts, ops,
+				func(_ string, dir string, _ []string) (string, error) {
+					calls++
+					if dir != "target" { t.Fatalf("queried unrelated store %q", dir) }
+					return `[]`, nil
+				}, nil, &stdout, &stderr)
+			var result hookClaimJSONResult
+			if err := json.Unmarshal(stdout.Bytes(), &result); err != nil { t.Fatalf("result is not JSON: %v", err) }
+			if tc.wantWork {
+				if code != 0 || result.Action != "work" || result.BeadID != "continuation-b" { t.Fatalf("result=%+v code=%d", result, code) }
+			} else if code != 0 || result.Action != "drain" || result.Reason != hookClaimReasonNoWork { t.Fatalf("result=%+v code=%d, want no_work", result, code) }
+			if calls != 1 { t.Fatalf("query calls=%d, want 1 exact store query", calls) }
+		})
 	}
 }

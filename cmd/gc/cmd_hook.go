@@ -9,6 +9,7 @@ import (
 	"io"
 	"os"
 	"os/exec"
+	"sort"
 	"strings"
 	"time"
 
@@ -752,6 +753,7 @@ func hookClaimTriggerContinuation(opts hookClaimOptions, ops hookClaimOps, dir s
 	if err != nil {
 		return writeHookClaimRetry(opts, ops, stdout, stderr), true
 	}
+	eligible := make([]beads.Bead, 0, len(siblings))
 	for _, sibling := range siblings {
 		if sibling.ID == "" || sibling.ID == opts.TriggerBeadID ||
 			strings.TrimSpace(sibling.Assignee) != opts.Assignee ||
@@ -761,6 +763,15 @@ func hookClaimTriggerContinuation(opts hookClaimOptions, ops hookClaimOps, dir s
 			hookTriggerCandidateNotReady(sibling, time.Now()) {
 			continue
 		}
+		eligible = append(eligible, sibling)
+	}
+	sort.SliceStable(eligible, func(i, j int) bool {
+		if eligible[i].CreatedAt.Equal(eligible[j].CreatedAt) {
+			return eligible[i].ID < eligible[j].ID
+		}
+		return eligible[i].CreatedAt.Before(eligible[j].CreatedAt)
+	})
+	for _, sibling := range eligible {
 		reason := "existing_assignment"
 		if sibling.Status == "open" {
 			reason = "ready_assignment"

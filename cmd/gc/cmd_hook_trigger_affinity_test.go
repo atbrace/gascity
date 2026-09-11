@@ -29,6 +29,9 @@ func triggerAffinityOps(claim func(string) (beads.Bead, bool, error)) hookClaimO
 			return claim(beadID)
 		},
 		DrainAck: func(_ io.Writer) error { return nil },
+		LookupTrigger: func(context.Context, string, []string, string) (beads.Bead, error) {
+			return beads.Bead{}, beads.ErrNotFound
+		},
 	}
 }
 
@@ -222,13 +225,14 @@ func TestTriggerHookClaimKeepsExistingAssignmentWhenInputIsTerminal(t *testing.T
 
 func TestTriggerHookClaimPreassignsOnlyFromInitialTrigger(t *testing.T) {
 	opts := triggerAffinityOpts()
+	opts.RouteTargets = []string{"pool"}
 	stores := []hookStore{{dir: "target", storeRef: "rig:target"}}
 	var assigned string
 	ops := triggerAffinityOps(func(id string) (beads.Bead, bool, error) {
 		return triggerAffinityBead(id, "in_progress", opts.Assignee), true, nil
 	})
 	ops.ListContinuation = func(context.Context, string, []string, string, string) ([]beads.Bead, error) {
-		return []beads.Bead{{ID: "continuation-b", Status: "open"}}, nil
+		return []beads.Bead{{ID: "continuation-b", Status: "open", Metadata: map[string]string{beadmeta.RoutedToMetadataKey: "pool"}}}, nil
 	}
 	ops.AssignContinuation = func(_ context.Context, _ string, _ []string, id, assignee string) error {
 		assigned = id + ":" + assignee
@@ -275,8 +279,10 @@ func TestTriggerHookClaimUsesOnlyDurablyAssignedContinuation(t *testing.T) {
 			}
 			ops.ListContinuation = func(context.Context, string, []string, string, string) ([]beads.Bead, error) {
 				for i := range tc.siblings {
-					tc.siblings[i].Metadata = map[string]string{
-						beadmeta.RootBeadIDMetadataKey: "root-1", beadmeta.ContinuationGroupMetadataKey: "group-1",
+					if tc.siblings[i].ID == "continuation-b" {
+						tc.siblings[i].Metadata = map[string]string{
+							beadmeta.RootBeadIDMetadataKey: "root-1", beadmeta.ContinuationGroupMetadataKey: "group-1",
+						}
 					}
 				}
 				return tc.siblings, nil

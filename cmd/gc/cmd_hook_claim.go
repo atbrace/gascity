@@ -287,7 +287,12 @@ func claimFirstEligibleHookCandidate(candidates []beads.Bead, opts hookClaimOpti
 	defer cancel()
 	claimsErrored := false
 	for _, candidate := range candidates {
-		if candidate.ID != strings.TrimSpace(opts.TriggerBeadID) && !hookCandidateClaimable(candidate, opts.RouteTargets) {
+		isExactTrigger := candidate.ID == strings.TrimSpace(opts.TriggerBeadID)
+		if isExactTrigger {
+			if strings.TrimSpace(candidate.Assignee) != "" {
+				continue
+			}
+		} else if !hookCandidateClaimable(candidate, opts.RouteTargets) {
 			continue
 		}
 		if opts.TriggerBeadID == "" && hookSkipIfInputDone(candidate, opts, ops, dir, stderr) {

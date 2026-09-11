@@ -34,6 +34,12 @@ func TestComputePoolTriggerBindingPatchPreservesFrozenPairOnResumeSourceUpdate(t
 	if _, ok := patch[beadmeta.TriggerBeadStoreRefMetadataKey]; ok {
 		t.Fatalf("resume source update rewrote frozen trigger store: %#v", patch)
 	}
+	bound, err := bindPoolSessionTriggerBead(nil, nil, "", info, SessionRequest{
+		Tier: "resume", SessionBeadID: "sess-1", WorkBeadID: "source-B", PreserveTrigger: true,
+	})
+	if err != nil || bound.TriggerBeadID != info.TriggerBeadID || bound.TriggerBeadStoreRef != info.TriggerBeadStoreRef {
+		t.Fatalf("resume source bind corrupted frozen pair: bound=%+v err=%v", bound, err)
+	}
 	patch = computePoolTriggerBindingPatch(info, SessionRequest{
 		Tier: "resume", SessionBeadID: "sess-1", WorkBeadID: "retry-C", WorkStoreRef: "rig:retry",
 	}, "")

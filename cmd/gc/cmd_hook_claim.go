@@ -1345,7 +1345,6 @@ func hookEmitClaimRejected(beadID, existingClaimant, attemptedClaimant string) {
 func hookListContinuationWithBdStore(_ context.Context, dir string, env []string, rootID, group string) ([]beads.Bead, error) {
 	store := hookClaimBdStore(dir, env, "")
 	return store.List(beads.ListQuery{
-		Status: "open",
 		Metadata: map[string]string{
 			beadmeta.RootBeadIDMetadataKey:        rootID,
 			beadmeta.ContinuationGroupMetadataKey: group,

@@ -134,6 +134,25 @@ func poolSessionBeadWithState(id, state, pendingCreateClaim string) beads.Bead {
 	}
 }
 
+func TestComputePoolDesiredStatesMarksSourceResumeForAssignedContinuation(t *testing.T) {
+	cfg := &config.City{Agents: []config.Agent{poolAgent("claude", "", intPtr(2), 0)}}
+	session := poolSessionBeadWithState("sess-1", "active", "")
+	session.Metadata[beadmeta.TriggerBeadIDMetadataKey] = "trigger-A"
+	session.Metadata[beadmeta.TriggerBeadStoreRefMetadataKey] = "rig:source"
+	source := workBead("source-B", "claude", "sess-1", "in_progress", 1)
+	continuation := workBead("continuation-C", "claude", "sess-1", "in_progress", 1)
+	continuation.Metadata[beadmeta.ContinuationGroupMetadataKey] = "group-1"
+	states := ComputePoolDesiredStates(cfg, []beads.Bead{source, continuation}, sessionInfosFromBeads([]beads.Bead{session}), nil)
+	if len(states) != 1 || len(states[0].Requests) != 2 {
+		t.Fatalf("desired states = %#v, want source plus continuation resume requests", states)
+	}
+	for _, request := range states[0].Requests {
+		if request.WorkBeadID == source.ID && !request.PreserveTrigger {
+			t.Fatalf("source request = %#v, want PreserveTrigger from assigned continuation", request)
+		}
+	}
+}
+
 func poolTraceDecision(t *testing.T, trace *sessionReconcilerTraceCycle, site TraceSiteCode) SessionReconcilerTraceRecord {
 	t.Helper()
 	for _, rec := range trace.records {

@@ -169,6 +169,15 @@ func computePoolDesiredStatesAt(
 	}
 
 	aliasHeldTemplates := canonicalSingletonAliasHeldTemplates(cfg, sessionInfos)
+	continuationSession := make(map[string]bool)
+	for _, wb := range assignedWorkBeads {
+		if strings.TrimSpace(wb.Metadata[beadmeta.ContinuationGroupMetadataKey]) == "" {
+			continue
+		}
+		if sessionID := assigneeToSessionBeadID[strings.TrimSpace(wb.Assignee)]; sessionID != "" {
+			continuationSession[sessionID] = true
+		}
+	}
 
 	var resumeRequests []SessionRequest
 	wakeRequestedTemplates := make(map[string]struct{})
@@ -231,7 +240,7 @@ func computePoolDesiredStatesAt(
 					WorkPack:       strings.TrimSpace(wb.Metadata[beadmeta.PackMetadataKey]),
 					WorkWorkspace:  strings.TrimSpace(wb.Metadata[beadmeta.PackWorkspaceMetadataKey]),
 					BrainParentSID: strings.TrimSpace(wb.Metadata[beadmeta.BrainParentSIDMetadataKey]),
-					PreserveTrigger: strings.TrimSpace(wb.Metadata[beadmeta.ContinuationGroupMetadataKey]) != "",
+					PreserveTrigger: continuationSession[sessionBeadID],
 				})
 				continue
 			}

@@ -26,7 +26,7 @@ type failUpdateStore struct {
 func TestComputePoolTriggerBindingPatchPreservesFrozenPairOnResumeSourceUpdate(t *testing.T) {
 	info := sessionpkg.Info{ID: "sess-1", TriggerBeadID: "trigger-A", TriggerBeadStoreRef: "rig:source"}
 	patch := computePoolTriggerBindingPatch(info, SessionRequest{
-		Tier: "resume", SessionBeadID: "sess-1", WorkBeadID: "source-B", WorkStoreRef: "",
+		Tier: "resume", SessionBeadID: "sess-1", WorkBeadID: "source-B", WorkStoreRef: "", PreserveTrigger: true,
 	}, "")
 	if _, ok := patch[beadmeta.TriggerBeadIDMetadataKey]; ok {
 		t.Fatalf("resume source update rewrote frozen trigger id: %#v", patch)

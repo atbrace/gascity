@@ -25,6 +25,9 @@ type SessionRequest struct {
 	WorkPack      string // pack route key from the work bead, when known
 	WorkWorkspace string // explicit pack workspace route key from the work bead, when known
 	WorkStoreRef  string // city or rig:<name> store reference for WorkBeadID when known
+	// PreserveTrigger keeps a session's frozen trigger pair when this request
+	// is a graph continuation rather than a new trigger assignment.
+	PreserveTrigger bool
 	// BrainParentSID is gc.brain_parent_sid from the driving work bead, when
 	// set: the parent session to fork this launch off of (warm-arm fork-launch).
 	BrainParentSID string
@@ -228,6 +231,7 @@ func computePoolDesiredStatesAt(
 					WorkPack:       strings.TrimSpace(wb.Metadata[beadmeta.PackMetadataKey]),
 					WorkWorkspace:  strings.TrimSpace(wb.Metadata[beadmeta.PackWorkspaceMetadataKey]),
 					BrainParentSID: strings.TrimSpace(wb.Metadata[beadmeta.BrainParentSIDMetadataKey]),
+					PreserveTrigger: strings.TrimSpace(wb.Metadata[beadmeta.ContinuationGroupMetadataKey]) != "",
 				})
 				continue
 			}

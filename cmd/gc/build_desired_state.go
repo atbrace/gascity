@@ -2893,8 +2893,8 @@ func computePoolTriggerBindingPatch(info session.Info, request SessionRequest, w
 		return metadata
 	}
 	oldWorkBeadID := strings.TrimSpace(info.TriggerBeadID)
-	preserveTrigger := request.Tier == "resume" && request.SessionBeadID == info.ID &&
-		strings.TrimSpace(request.WorkStoreRef) == "" && oldWorkBeadID != "" &&
+	preserveTrigger := request.PreserveTrigger && request.Tier == "resume" && request.SessionBeadID == info.ID &&
+		oldWorkBeadID != "" &&
 		strings.TrimSpace(info.TriggerBeadStoreRef) != ""
 	if oldWorkBeadID != workBeadID && !preserveTrigger {
 		metadata[beadmeta.TriggerBeadIDMetadataKey] = workBeadID

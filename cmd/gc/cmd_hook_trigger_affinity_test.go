@@ -284,7 +284,7 @@ func TestTriggerHookClaimUsesOnlyDurablyAssignedContinuation(t *testing.T) {
 			}
 			ops.ListContinuation = func(context.Context, string, []string, string, string) ([]beads.Bead, error) {
 				for i := range tc.siblings {
-					if tc.siblings[i].ID == "continuation-b" {
+					if tc.siblings[i].ID == "continuation-b" || tc.siblings[i].ID == "continuation-d" {
 						tc.siblings[i].Metadata = map[string]string{
 							beadmeta.RootBeadIDMetadataKey: "root-1", beadmeta.ContinuationGroupMetadataKey: "group-1",
 						}

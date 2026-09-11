@@ -29,6 +29,11 @@ const (
 	hookClaimReasonNoWork        = "no_work"
 	hookClaimReasonClaimsErrored = "claims_errored"
 	hookClaimReasonStaleSession  = "stale_session"
+	// retry is reserved for a trigger-bound session whose exact store could
+	// not be read. It is intentionally distinct from no_work: the controller
+	// must retry the reservation rather than conclude that its trigger was
+	// consumed.
+	hookClaimReasonRetry = "retry"
 )
 
 var hookClaimMutationTimeout = 10 * time.Second
@@ -37,6 +42,12 @@ var hookClaimCommandRunnerWithEnvContext = beads.ExecCommandRunnerWithEnvContext
 
 type hookClaimOptions struct {
 	Assignee           string
+	// TriggerBeadID and TriggerBeadStoreRef are stamped onto ephemeral pool
+	// sessions at creation. When present, hook --claim is restricted to this
+	// exact bead in this exact store; it must never fall back to generic or
+	// federated work.
+	TriggerBeadID       string
+	TriggerBeadStoreRef string
 	IdentityCandidates []string
 	RouteTargets       []string
 	Env                []string
@@ -128,7 +139,18 @@ func doHookClaim(workQuery, dir string, opts hookClaimOptions, ops hookClaimOps,
 	if res.terminal {
 		return res.code
 	}
+	if hookClaimHasTrigger(opts) && res.claimsErrored {
+		return writeHookClaimRetry(opts, ops, stdout, stderr)
+	}
 	return writeHookClaimNoWork(opts, ops, res.claimsErrored, stdout, stderr)
+}
+
+func hookClaimHasTrigger(opts hookClaimOptions) bool {
+	return strings.TrimSpace(opts.TriggerBeadID) != "" || strings.TrimSpace(opts.TriggerBeadStoreRef) != ""
+}
+
+func writeHookClaimRetry(opts hookClaimOptions, ops hookClaimOps, stdout, stderr io.Writer) int {
+	return writeHookClaimDrain(hookClaimReasonRetry, opts.JSON, opts.DrainAck, ops.DrainAck, stdout, stderr)
 }
 
 // tryHookClaim runs the work query for one store (dir, via ops.Runner) and
@@ -140,6 +162,8 @@ func doHookClaim(workQuery, dir string, opts hookClaimOptions, ops hookClaimOps,
 // (defaults applied) for the shared drain.
 func tryHookClaim(workQuery, dir string, opts *hookClaimOptions, ops *hookClaimOps, stdout, stderr io.Writer) hookClaimResult {
 	opts.Assignee = strings.TrimSpace(opts.Assignee)
+	opts.TriggerBeadID = strings.TrimSpace(opts.TriggerBeadID)
+	opts.TriggerBeadStoreRef = strings.TrimSpace(opts.TriggerBeadStoreRef)
 	opts.IdentityCandidates = hookClaimIdentityCandidates(append([]string{opts.Assignee}, opts.IdentityCandidates...)...)
 	opts.RouteTargets = hookClaimRouteTargets(opts.RouteTargets...)
 	if opts.Assignee == "" {
@@ -151,6 +175,12 @@ func tryHookClaim(workQuery, dir string, opts *hookClaimOptions, ops *hookClaimO
 		return hookClaimResult{terminal: true, code: 1}
 	}
 	ops.applyDefaults()
+	triggerBound := hookClaimHasTrigger(*opts)
+	if triggerBound && (opts.TriggerBeadID == "" || opts.TriggerBeadStoreRef == "") {
+		// A partial trigger envelope cannot prove the (bead, store) reservation.
+		// Refuse it as retryable instead of widening to generic work.
+		return hookClaimResult{terminal: true, code: writeHookClaimRetry(*opts, *ops, stdout, stderr)}
+	}
 	now := time.Now
 	if ops.Now != nil {
 		now = ops.Now
@@ -158,6 +188,9 @@ func tryHookClaim(workQuery, dir string, opts *hookClaimOptions, ops *hookClaimO
 
 	output, err := ops.Runner(workQuery, dir)
 	if err != nil {
+		if triggerBound {
+			return hookClaimResult{terminal: true, code: writeHookClaimRetry(*opts, *ops, stdout, stderr)}
+		}
 		fmt.Fprintf(stderr, "gc hook --claim: %v\n", err) //nolint:errcheck
 		return hookClaimResult{terminal: true, code: 1}
 	}
@@ -169,11 +202,31 @@ func tryHookClaim(workQuery, dir string, opts *hookClaimOptions, ops *hookClaimO
 	}
 	candidates, err := decodeHookClaimBeads(normalized)
 	if err != nil {
+		if triggerBound {
+			return hookClaimResult{terminal: true, code: writeHookClaimRetry(*opts, *ops, stdout, stderr)}
+		}
 		fmt.Fprintf(stderr, "gc hook --claim: requires JSON work_query output to identify claim candidates: %v\n", err) //nolint:errcheck
 		return hookClaimResult{terminal: true, code: 1}
 	}
 	if len(candidates) == 0 {
 		return hookClaimResult{}
+	}
+	if triggerBound {
+		// The query ran only against the selected trigger store. It may still
+		// contain unrelated routed work, so narrow it to the frozen trigger
+		// before adoption or claim logic. An empty result is clean no_work and
+		// never reaches the federated fallback loop.
+		exact := candidates[:0]
+		for _, candidate := range candidates {
+			if candidate.ID != opts.TriggerBeadID || hookTriggerCandidateNotReady(candidate, now()) {
+				continue
+			}
+			exact = append(exact, candidate)
+		}
+		candidates = exact
+		if len(candidates) == 0 {
+			return hookClaimResult{}
+		}
 	}
 
 	if result, bead, ok := hookClaimExistingOrAssigned(candidates, *opts, *ops, dir, stderr); ok {
@@ -234,10 +287,10 @@ func claimFirstEligibleHookCandidate(candidates []beads.Bead, opts hookClaimOpti
 	defer cancel()
 	claimsErrored := false
 	for _, candidate := range candidates {
-		if !hookCandidateClaimable(candidate, opts.RouteTargets) {
+		if candidate.ID != strings.TrimSpace(opts.TriggerBeadID) && !hookCandidateClaimable(candidate, opts.RouteTargets) {
 			continue
 		}
-		if hookSkipIfInputDone(candidate, opts, ops, dir, stderr) {
+		if opts.TriggerBeadID == "" && hookSkipIfInputDone(candidate, opts, ops, dir, stderr) {
 			continue
 		}
 		if ctx.Err() != nil {
@@ -307,6 +360,31 @@ func hookCandidateClaimable(candidate beads.Bead, routeTargets []string) bool {
 	return strings.TrimSpace(candidate.ID) != "" &&
 		strings.TrimSpace(candidate.Assignee) == "" &&
 		hookClaimMatchesRoute(candidate, routeTargets)
+}
+
+// hookTriggerCandidateNotReady applies store-independent readiness rules to a
+// trigger selected from the exact store. Generic candidates already passed bd
+// ready, but a custom query must not make a held/stale trigger claimable.
+func hookTriggerCandidateNotReady(candidate beads.Bead, now time.Time) bool {
+	switch strings.ToLower(strings.TrimSpace(candidate.Status)) {
+	case "closed", "blocked", "deferred", "failed":
+		return true
+	}
+	if beads.IsDeferred(candidate, now) {
+		return true
+	}
+	if candidate.IsBlocked != nil && *candidate.IsBlocked {
+		return true
+	}
+	if beads.IsReadyExcludedBead(candidate) {
+		return true
+	}
+	for _, key := range []string{"hold", "gc.hold"} {
+		if value := strings.TrimSpace(candidate.Metadata[key]); value != "" && !strings.EqualFold(value, "false") {
+			return true
+		}
+	}
+	return false
 }
 
 // reportHookClaimRejected publishes a bead.claim_rejected event (ADR-0009) when a
@@ -385,10 +463,14 @@ func writeHookClaimWorkResultForBead(result hookClaimJSONResult, bead beads.Bead
 	result.ContinuationGroup = strings.TrimSpace(bead.Metadata[beadmeta.ContinuationGroupMetadataKey])
 	stampHookClaimIdentity(bead, opts, ops, dir, stderr)
 	publishHookClaimRunMap(bead, opts, ops, stderr)
-	assigned, err := preassignHookContinuationGroup(bead, opts, ops, dir)
-	if err != nil {
-		fmt.Fprintf(stderr, "gc hook --claim: preassigning continuation group for %s: %v\n", bead.ID, err) //nolint:errcheck
-		return 1
+	var assigned []string
+	if strings.TrimSpace(opts.TriggerBeadID) == "" {
+		var err error
+		assigned, err = preassignHookContinuationGroup(bead, opts, ops, dir)
+		if err != nil {
+			fmt.Fprintf(stderr, "gc hook --claim: preassigning continuation group for %s: %v\n", bead.ID, err) //nolint:errcheck
+			return 1
+		}
 	}
 	result.ContinuationAssigned = assigned
 	if opts.JSON {

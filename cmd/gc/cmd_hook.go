@@ -391,7 +391,8 @@ func cmdHookWithOptions(args []string, opts hookCommandOptions, stdout, stderr i
 	// via firstStoreWithWork's emit-on-timeout contract — the agent's
 	// (work-less) city-scoped env stays as a best-effort secondary. This
 	// extends the #2877 city-scoped cross-store delivery to rig-scoped agents.
-	stores := []hookStore{{dir: workDir, env: queryEnv}}
+	primaryStoreRef := workflowStoreRefForDir(strings.TrimSpace(overrides["GC_STORE_ROOT"]), cityPath, cityName, cfg)
+	stores := []hookStore{{dir: workDir, env: queryEnv, storeRef: primaryStoreRef}}
 	if agentIsCrossStoreEligible(&a) {
 		stores = appendRigHookStores(stores, cityPath, cfg, &a, overrides)
 	} else if rig := rigScopedHookRig(cfg, agentForQuery); rig != "" {
@@ -431,6 +432,12 @@ func cmdHookWithOptions(args []string, opts hookCommandOptions, stdout, stderr i
 		assignee := firstNonEmptyHookValue(sessionName, sessionID, alias, agentForQuery, resolvedAgentName)
 		claimOpts := hookClaimOptions{
 			Assignee: assignee,
+			// Pool-created ephemeral sessions carry a frozen trigger and its
+			// residency reference. The claim path treats these as a strict
+			// single-ID/single-store reservation; do not let the generic query
+			// consume an unrelated bead while the trigger is still pending.
+			TriggerBeadID:       hookClaimEnvValue(queryEnv, "GC_TRIGGER_BEAD_ID"),
+			TriggerBeadStoreRef: hookClaimEnvValue(queryEnv, "GC_TRIGGER_BEAD_STORE_REF"),
 			// IdentityCandidates governs ADOPTION of already-owned in_progress/open
 			// work (hookClaimExistingOrAssigned); it must be scoped to this
 			// session's OWN runtime identity, never the bare pool template. A
@@ -603,6 +610,9 @@ func claimHookWork(workQuery, workDir string, queryEnv []string, stores []hookSt
 // emitFailure surfaces a work-query timeout on the event bus when eligible.
 func claimHookWorkWithRunner(workQuery, workDir string, queryEnv []string, stores []hookStore, claimOpts hookClaimOptions, ops hookClaimOps, run hookStoreRunner, emitFailure func(command string, err error), stdout, stderr io.Writer) int {
 	ops.applyDefaults()
+	if hookClaimHasTrigger(claimOpts) {
+		return claimHookTriggerWorkWithRunner(workQuery, workDir, queryEnv, stores, claimOpts, ops, run, emitFailure, stdout, stderr)
+	}
 	// primary is the agent's own store (the first entry). It is captured once
 	// here, before the loop shrinks remaining: only the primary may surface a
 	// work-query error as a fatal claim failure. Once the primary loses its
@@ -663,6 +673,51 @@ func claimHookWorkWithRunner(workQuery, workDir string, queryEnv []string, store
 		remaining = removeHookStore(remaining, claimStore)
 	}
 	return writeHookClaimNoWork(claimOpts, ops, claimsErrored, stdout, stderr)
+}
+
+// claimHookTriggerWorkWithRunner services a pool-created session carrying a
+// frozen trigger envelope. The declared store is selected once, then exactly
+// one query/claim pass is allowed against the exact trigger. Missing or
+// non-ready trigger rows drain no_work; a store/query failure drains retry.
+// There is intentionally no firstStoreWithWork or claimStoreWithFallback call
+// in this path: either widening would let an unrelated source justify the
+// session and recreate the split-owner failure this fence prevents.
+func claimHookTriggerWorkWithRunner(workQuery, workDir string, queryEnv []string, stores []hookStore, claimOpts hookClaimOptions, ops hookClaimOps, run hookStoreRunner, emitFailure func(command string, err error), stdout, stderr io.Writer) int {
+	claimOpts.TriggerBeadID = strings.TrimSpace(claimOpts.TriggerBeadID)
+	claimOpts.TriggerBeadStoreRef = strings.TrimSpace(claimOpts.TriggerBeadStoreRef)
+	if claimOpts.TriggerBeadID == "" || claimOpts.TriggerBeadStoreRef == "" {
+		return writeHookClaimRetry(claimOpts, ops, stdout, stderr)
+	}
+	selected, ok := findHookStoreByRef(stores, claimOpts.TriggerBeadStoreRef)
+	if !ok {
+		return writeHookClaimRetry(claimOpts, ops, stdout, stderr)
+	}
+	selectedEnv := selected.env
+	if len(selectedEnv) == 0 {
+		selectedEnv = queryEnv
+	}
+	selectedDir := selected.dir
+	if strings.TrimSpace(selectedDir) == "" {
+		selectedDir = workDir
+	}
+	storeOps := ops
+	storeOpts := claimOpts
+	storeOpts.Env = selectedEnv
+	storeOps.Runner = func(command, _ string) (string, error) {
+		out, err := run(command, selectedDir, selectedEnv)
+		if err != nil && emitFailure != nil {
+			emitFailure(command, err)
+		}
+		return out, err
+	}
+	res := tryHookClaim(workQuery, selectedDir, &storeOpts, &storeOps, stdout, stderr)
+	if res.terminal {
+		return res.code
+	}
+	if res.claimsErrored {
+		return writeHookClaimRetry(storeOpts, storeOps, stdout, stderr)
+	}
+	return writeHookClaimNoWork(storeOpts, storeOps, false, stdout, stderr)
 }
 
 func hookClaimPrimaryRouteTarget(a *config.Agent) string {

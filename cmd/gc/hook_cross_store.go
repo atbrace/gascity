@@ -13,6 +13,11 @@ import (
 type hookStore struct {
 	dir string
 	env []string
+	// storeRef is the canonical residency reference for this entry (for
+	// example city:gas-city or rig:sysadmin). Trigger-bound sessions use it to
+	// select exactly one store; leaving it empty is deliberately not treated as
+	// a wildcard there.
+	storeRef string
 }
 
 // hookStoreRunner runs a work query against one federated store's dir and env.
@@ -83,6 +88,7 @@ func appendOneRigHookStore(stores []hookStore, cityPath string, cfg *config.City
 	return append(stores, hookStore{
 		dir: agentCommandDir(cityPath, &view, cfg.Rigs),
 		env: mergeRuntimeEnv(os.Environ(), rigEnv),
+		storeRef: "rig:" + rigName,
 	})
 }
 
@@ -117,7 +123,38 @@ func appendCityHookStore(stores []hookStore, cityPath string, cfg *config.City, 
 	return append(stores, hookStore{
 		dir: cityPath,
 		env: mergeRuntimeEnv(os.Environ(), cityEnv),
+		storeRef: "city:" + firstNonEmptyHookValue(loadedCityName(cfg, cityPath), "city"),
 	})
+}
+
+// hookStoreRefMatches compares a trigger's declared store reference with one
+// federated hook entry. The bare "city" spelling is accepted as the legacy
+// alias for the one city store, but a named city reference never matches a
+// different city. Empty entry refs do not match: a trigger-bearing session is
+// fail-closed when the controller did not give us enough information to prove
+// which store owns its trigger.
+func hookStoreRefMatches(storeRef, triggerRef string) bool {
+	storeRef = strings.TrimSpace(storeRef)
+	triggerRef = strings.TrimSpace(triggerRef)
+	if storeRef == "" || triggerRef == "" {
+		return false
+	}
+	if triggerRef == "city" {
+		return strings.HasPrefix(storeRef, "city:")
+	}
+	if storeRef == "city" {
+		return strings.HasPrefix(triggerRef, "city:")
+	}
+	return storeRef == triggerRef
+}
+
+func findHookStoreByRef(stores []hookStore, triggerRef string) (hookStore, bool) {
+	for _, store := range stores {
+		if hookStoreRefMatches(store.storeRef, triggerRef) {
+			return store, true
+		}
+	}
+	return hookStore{}, false
 }
 
 // rigScopedHookRig returns the rig whose store a rig-scoped agent must ALSO

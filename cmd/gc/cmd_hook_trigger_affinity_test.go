@@ -1,0 +1,184 @@
+package main
+
+import (
+	"bytes"
+	"context"
+	"encoding/json"
+	"errors"
+	"io"
+	"testing"
+	"time"
+
+	"github.com/gastownhall/gascity/internal/beads"
+)
+
+func triggerAffinityOpts() hookClaimOptions {
+	return hookClaimOptions{
+		Assignee:           "pool/session-1",
+		TriggerBeadID:      "trigger-1",
+		TriggerBeadStoreRef: "rig:target",
+		JSON:               true,
+		DrainAck:           true,
+	}
+}
+
+func triggerAffinityOps(claim func(string) (beads.Bead, bool, error)) hookClaimOps {
+	return hookClaimOps{
+		Claim: func(_ context.Context, _ string, _ []string, beadID, _ string) (beads.Bead, bool, error) {
+			return claim(beadID)
+		},
+		DrainAck: func(_ io.Writer) error { return nil },
+	}
+}
+
+func triggerAffinityJSON(t *testing.T, bead beads.Bead) string {
+	t.Helper()
+	data, err := json.Marshal([]beads.Bead{bead})
+	if err != nil {
+		t.Fatalf("marshal trigger fixture: %v", err)
+	}
+	return string(data)
+}
+
+func triggerAffinityBead(id, status, assignee string) beads.Bead {
+	return beads.Bead{ID: id, Status: status, Assignee: assignee}
+}
+
+func runTriggerAffinity(t *testing.T, opts hookClaimOptions, stores []hookStore, run hookStoreRunner, claim func(string) (beads.Bead, bool, error)) (hookClaimJSONResult, int, []string) {
+	t.Helper()
+	var stdout, stderr bytes.Buffer
+	var calls []string
+	wrapped := func(command, dir string, env []string) (string, error) {
+		calls = append(calls, dir)
+		return run(command, dir, env)
+	}
+	code := claimHookWorkWithRunner("bd ready --json", "fallback", nil, stores, opts, triggerAffinityOps(claim), wrapped, nil, &stdout, &stderr)
+	if stderr.Len() != 0 {
+		t.Fatalf("stderr = %q, want empty", stderr.String())
+	}
+	var result hookClaimJSONResult
+	if err := json.Unmarshal(stdout.Bytes(), &result); err != nil {
+		t.Fatalf("result is not JSON: %v; stdout=%q", err, stdout.String())
+	}
+	return result, code, calls
+}
+
+func TestTriggerHookClaimDoesNotFallBackToUnrelatedSource(t *testing.T) {
+	opts := triggerAffinityOpts()
+	stores := []hookStore{
+		{dir: "city", storeRef: "city:test"},
+		{dir: "target", storeRef: "rig:target"},
+		{dir: "other", storeRef: "rig:other"},
+	}
+	result, code, calls := runTriggerAffinity(t, opts, stores, func(_ string, dir string, _ []string) (string, error) {
+		if dir != "target" {
+			t.Fatalf("unexpected query against %q", dir)
+		}
+		return triggerAffinityJSON(t, triggerAffinityBead("unrelated", "open", "")), nil
+	}, func(string) (beads.Bead, bool, error) {
+		t.Fatal("unrelated trigger path attempted a claim")
+		return beads.Bead{}, false, nil
+	})
+	if code != 0 || result.Action != "drain" || result.Reason != hookClaimReasonNoWork {
+		t.Fatalf("result=%+v code=%d, want acknowledged no_work drain", result, code)
+	}
+	if len(calls) != 1 || calls[0] != "target" {
+		t.Fatalf("queried stores=%v, want exactly [target]", calls)
+	}
+}
+
+func TestTriggerHookClaimMissingTerminalHeldAndForeignAreNoWork(t *testing.T) {
+	cases := []struct {
+		name string
+		bead beads.Bead
+	}{
+		{name: "missing", bead: beads.Bead{}},
+		{name: "terminal", bead: triggerAffinityBead("trigger-1", "closed", "")},
+		{name: "foreign assignment", bead: triggerAffinityBead("trigger-1", "open", "other/session")},
+		{name: "hold", bead: beads.Bead{ID: "trigger-1", Status: "open", Metadata: map[string]string{"gc.hold": "true"}}},
+		{name: "future defer", bead: beads.Bead{ID: "trigger-1", Status: "open", DeferUntil: func() *time.Time { future := time.Now().Add(time.Hour); return &future }()}},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			opts := triggerAffinityOpts()
+			stores := []hookStore{{dir: "target", storeRef: "rig:target"}, {dir: "other", storeRef: "rig:other"}}
+			result, code, calls := runTriggerAffinity(t, opts, stores, func(_ string, dir string, _ []string) (string, error) {
+				if dir != "target" {
+					t.Fatalf("unexpected query against %q", dir)
+				}
+				if tc.name == "missing" {
+					return `[]`, nil
+				}
+				return triggerAffinityJSON(t, tc.bead), nil
+			}, func(string) (beads.Bead, bool, error) {
+				t.Fatal("non-claimable trigger attempted a claim")
+				return beads.Bead{}, false, nil
+			})
+			if code != 0 || result.Action != "drain" || result.Reason != hookClaimReasonNoWork {
+				t.Fatalf("result=%+v code=%d, want acknowledged no_work drain", result, code)
+			}
+			if len(calls) != 1 || calls[0] != "target" {
+				t.Fatalf("queried stores=%v, want exactly [target]", calls)
+			}
+		})
+	}
+}
+
+func TestTriggerHookClaimStoreFailureIsStructuredRetry(t *testing.T) {
+	opts := triggerAffinityOpts()
+	stores := []hookStore{{dir: "target", storeRef: "rig:target"}, {dir: "other", storeRef: "rig:other"}}
+	result, code, calls := runTriggerAffinity(t, opts, stores, func(_ string, _ string, _ []string) (string, error) {
+		return "", errors.New("store unavailable")
+	}, func(string) (beads.Bead, bool, error) {
+		t.Fatal("store failure attempted a claim")
+		return beads.Bead{}, false, nil
+	})
+	if code != 0 || result.Action != "drain" || result.Reason != hookClaimReasonRetry {
+		t.Fatalf("result=%+v code=%d, want acknowledged retry drain", result, code)
+	}
+	if len(calls) != 1 || calls[0] != "target" {
+		t.Fatalf("queried stores=%v, want exactly [target]", calls)
+	}
+}
+
+func TestTriggerHookClaimClaimsExactTrigger(t *testing.T) {
+	opts := triggerAffinityOpts()
+	stores := []hookStore{{dir: "target", storeRef: "rig:target"}, {dir: "other", storeRef: "rig:other"}}
+	var claimedID string
+	result, code, calls := runTriggerAffinity(t, opts, stores, func(_ string, dir string, _ []string) (string, error) {
+		if dir != "target" {
+			t.Fatalf("unexpected query against %q", dir)
+		}
+		return triggerAffinityJSON(t, triggerAffinityBead("trigger-1", "open", "")), nil
+	}, func(id string) (beads.Bead, bool, error) {
+		claimedID = id
+		return triggerAffinityBead(id, "in_progress", opts.Assignee), true, nil
+	})
+	if code != 0 || result.Action != "work" || result.Reason != "claimed" || result.BeadID != "trigger-1" {
+		t.Fatalf("result=%+v code=%d, want claimed exact trigger", result, code)
+	}
+	if claimedID != opts.TriggerBeadID {
+		t.Fatalf("claimed id=%q, want %q", claimedID, opts.TriggerBeadID)
+	}
+	if len(calls) != 1 || calls[0] != "target" {
+		t.Fatalf("queried stores=%v, want exactly [target]", calls)
+	}
+}
+
+func TestTriggerHookClaimReturnsExistingExactAssignment(t *testing.T) {
+	opts := triggerAffinityOpts()
+	stores := []hookStore{{dir: "target", storeRef: "rig:target"}}
+	claimCalled := false
+	result, code, _ := runTriggerAffinity(t, opts, stores, func(_ string, _ string, _ []string) (string, error) {
+		return triggerAffinityJSON(t, triggerAffinityBead("trigger-1", "in_progress", opts.Assignee)), nil
+	}, func(string) (beads.Bead, bool, error) {
+		claimCalled = true
+		return beads.Bead{}, false, nil
+	})
+	if code != 0 || result.Action != "work" || result.Reason != "existing_assignment" || result.BeadID != opts.TriggerBeadID {
+		t.Fatalf("result=%+v code=%d, want existing exact assignment", result, code)
+	}
+	if claimCalled {
+		t.Fatal("existing exact assignment must not be claimed again")
+	}
+}

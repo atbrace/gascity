@@ -187,7 +187,8 @@ func rawPoolTriggerBindingPatchRef(sb beads.Bead, request SessionRequest, workDi
 	}
 	oldWorkBeadID := strings.TrimSpace(sb.Metadata[beadmeta.TriggerBeadIDMetadataKey])
 	preserveTrigger := request.Tier == "resume" && request.SessionBeadID == sb.ID &&
-		oldWorkBeadID != "" && strings.TrimSpace(sb.Metadata[beadmeta.TriggerBeadStoreRefMetadataKey]) != ""
+		strings.TrimSpace(request.WorkStoreRef) == "" && oldWorkBeadID != "" &&
+		strings.TrimSpace(sb.Metadata[beadmeta.TriggerBeadStoreRefMetadataKey]) != ""
 	if oldWorkBeadID != workBeadID && !preserveTrigger {
 		metadata[beadmeta.TriggerBeadIDMetadataKey] = workBeadID
 		newParentSID := strings.TrimSpace(request.BrainParentSID)

@@ -34,6 +34,12 @@ func TestComputePoolTriggerBindingPatchPreservesFrozenPairOnResumeSourceUpdate(t
 	if _, ok := patch[beadmeta.TriggerBeadStoreRefMetadataKey]; ok {
 		t.Fatalf("resume source update rewrote frozen trigger store: %#v", patch)
 	}
+	patch = computePoolTriggerBindingPatch(info, SessionRequest{
+		Tier: "resume", SessionBeadID: "sess-1", WorkBeadID: "retry-C", WorkStoreRef: "rig:retry",
+	}, "")
+	if patch[beadmeta.TriggerBeadIDMetadataKey] != "retry-C" || patch[beadmeta.TriggerBeadStoreRefMetadataKey] != "rig:retry" {
+		t.Fatalf("resume request with authoritative store did not replace trigger pair atomically: %#v", patch)
+	}
 }
 
 func (s failUpdateStore) Update(string, beads.UpdateOpts) error { return s.err }

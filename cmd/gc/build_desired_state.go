@@ -2893,7 +2893,9 @@ func computePoolTriggerBindingPatch(info session.Info, request SessionRequest, w
 		return metadata
 	}
 	oldWorkBeadID := strings.TrimSpace(info.TriggerBeadID)
-	if oldWorkBeadID != workBeadID {
+	preserveTrigger := request.Tier == "resume" && request.SessionBeadID == info.ID &&
+		oldWorkBeadID != "" && strings.TrimSpace(info.TriggerBeadStoreRef) != ""
+	if oldWorkBeadID != workBeadID && !preserveTrigger {
 		metadata[beadmeta.TriggerBeadIDMetadataKey] = workBeadID
 		// On a genuine reassign to a different work bead, reconcile the fork parent
 		// to the new work's value (set when the new bead carries one, clear
@@ -2904,6 +2906,9 @@ func computePoolTriggerBindingPatch(info session.Info, request SessionRequest, w
 		}
 	}
 	workStoreRef := strings.TrimSpace(request.WorkStoreRef)
+	if preserveTrigger {
+		workStoreRef = strings.TrimSpace(info.TriggerBeadStoreRef)
+	}
 	if workStoreRef != "" && strings.TrimSpace(info.TriggerBeadStoreRef) != workStoreRef {
 		metadata[beadmeta.TriggerBeadStoreRefMetadataKey] = workStoreRef
 	} else if workStoreRef == "" && oldWorkBeadID != workBeadID && strings.TrimSpace(info.TriggerBeadStoreRef) != "" {

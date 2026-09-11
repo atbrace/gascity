@@ -186,7 +186,9 @@ func rawPoolTriggerBindingPatchRef(sb beads.Bead, request SessionRequest, workDi
 		return metadata
 	}
 	oldWorkBeadID := strings.TrimSpace(sb.Metadata[beadmeta.TriggerBeadIDMetadataKey])
-	if oldWorkBeadID != workBeadID {
+	preserveTrigger := request.Tier == "resume" && request.SessionBeadID == sb.ID &&
+		oldWorkBeadID != "" && strings.TrimSpace(sb.Metadata[beadmeta.TriggerBeadStoreRefMetadataKey]) != ""
+	if oldWorkBeadID != workBeadID && !preserveTrigger {
 		metadata[beadmeta.TriggerBeadIDMetadataKey] = workBeadID
 		newParentSID := strings.TrimSpace(request.BrainParentSID)
 		if strings.TrimSpace(sb.Metadata[beadmeta.BrainParentSIDMetadataKey]) != newParentSID {
@@ -194,6 +196,9 @@ func rawPoolTriggerBindingPatchRef(sb beads.Bead, request SessionRequest, workDi
 		}
 	}
 	workStoreRef := strings.TrimSpace(request.WorkStoreRef)
+	if preserveTrigger {
+		workStoreRef = strings.TrimSpace(sb.Metadata[beadmeta.TriggerBeadStoreRefMetadataKey])
+	}
 	if workStoreRef != "" && strings.TrimSpace(sb.Metadata[beadmeta.TriggerBeadStoreRefMetadataKey]) != workStoreRef {
 		metadata[beadmeta.TriggerBeadStoreRefMetadataKey] = workStoreRef
 	} else if workStoreRef == "" && oldWorkBeadID != workBeadID && strings.TrimSpace(sb.Metadata[beadmeta.TriggerBeadStoreRefMetadataKey]) != "" {

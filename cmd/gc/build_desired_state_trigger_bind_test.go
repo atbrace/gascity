@@ -12,6 +12,7 @@ import (
 	"github.com/gastownhall/gascity/internal/beads/beadstest"
 	"github.com/gastownhall/gascity/internal/config"
 	"github.com/gastownhall/gascity/internal/runtime"
+	sessionpkg "github.com/gastownhall/gascity/internal/session"
 )
 
 // failUpdateStore is a beads.Store whose Update always fails; every other op
@@ -20,6 +21,19 @@ import (
 type failUpdateStore struct {
 	beads.Store
 	err error
+}
+
+func TestComputePoolTriggerBindingPatchPreservesFrozenPairOnResumeSourceUpdate(t *testing.T) {
+	info := sessionpkg.Info{ID: "sess-1", TriggerBeadID: "trigger-A", TriggerBeadStoreRef: "rig:source"}
+	patch := computePoolTriggerBindingPatch(info, SessionRequest{
+		Tier: "resume", SessionBeadID: "sess-1", WorkBeadID: "source-B", WorkStoreRef: "",
+	}, "")
+	if _, ok := patch[beadmeta.TriggerBeadIDMetadataKey]; ok {
+		t.Fatalf("resume source update rewrote frozen trigger id: %#v", patch)
+	}
+	if _, ok := patch[beadmeta.TriggerBeadStoreRefMetadataKey]; ok {
+		t.Fatalf("resume source update rewrote frozen trigger store: %#v", patch)
+	}
 }
 
 func (s failUpdateStore) Update(string, beads.UpdateOpts) error { return s.err }

@@ -138,7 +138,6 @@ func TestCascadeNudgeCutsOnPersistedSeq(t *testing.T) {
 		`!= "session"`,
 		`!= "message"`,
 		"cascade-nudge-on-blocker-close-seq",
-		"FIRST_RUN_LOOKBACK",
 		"MAX_PER_RUN",
 	} {
 		if !strings.Contains(body, want) {
@@ -150,6 +149,11 @@ func TestCascadeNudgeCutsOnPersistedSeq(t *testing.T) {
 	// MAX_PER_RUN so that replay can never itself exceed the order deadline.
 	if adv, loop := strings.LastIndex(body, "\nadvance_seq\n"), strings.Index(body, "while IFS= read -r blocker"); adv < 0 || loop < 0 || adv < loop {
 		t.Error("cascade-nudge-on-blocker-close.sh must advance the seq mark after the blocker loop, not before")
+	}
+	// No short first-run lookback: a first run whose window is empty writes no
+	// mark, and every later run would then miss closes older than that window.
+	if strings.Contains(body, "FIRST_RUN_LOOKBACK") {
+		t.Error("cascade-nudge-on-blocker-close.sh must read the same WINDOW on the first run; the per-run cap bounds it")
 	}
 	if strings.Contains(body, `.payload.bead.id // empty`) {
 		t.Error("cascade-nudge-on-blocker-close.sh must not read the nested-only payload path; flat bead.closed payloads would match nothing")

@@ -50,21 +50,19 @@ fi
 
 CITY="${GC_CITY:-.}"
 # Upper bound on how far back one run reads. The real cut is the persisted
-# high-water seq; this only bounds the read.
-WINDOW="${GC_CASCADE_NUDGE_WINDOW:-1h}"
-# Lookback for the very first run, when no seq has been recorded yet. Kept
-# short on purpose: a busy city closes hundreds of beads an hour, and a first
-# run that walks a full hour of them exceeds the order's exec deadline
-# (measured: 300s deadline, 1h of closes = 268-300s) without ever recording a
-# seq, so the next run replays the same hour.
-FIRST_RUN_LOOKBACK="${GC_CASCADE_NUDGE_LOOKBACK:-5m}"
+# high-water seq; this only bounds the read (and is the lookback on the very
+# first run, when no seq has been recorded yet).
+WINDOW="${GC_CASCADE_NUDGE_WINDOW:-${GC_CASCADE_NUDGE_LOOKBACK:-1h}}"
 # Upper bound on the closes one run walks, oldest first; the rest wait for the
 # next firing. Each close costs one `gc bd dep list` (~1-1.5s measured), and
-# the order's exec deadline is 300s: an unbounded run (a first run, a burst)
-# is killed mid-loop before it can record its seq and then replays the same
-# closes on every firing. Bounding the batch keeps every run well inside the
-# deadline, so the mark can stay AFTER the loop and an interrupted run
-# (reload, cutover, transient store error) replays instead of losing nudges.
+# the order's exec deadline is 300s: an unbounded run (a first run walking a
+# full hour, a burst) is killed mid-loop before it can record its seq and then
+# replays the same closes on every firing. Bounding the batch keeps every run
+# well inside the deadline, so the mark can stay AFTER the loop and an
+# interrupted run (reload, cutover, transient store error) replays instead of
+# losing nudges. A shorter first-run lookback is deliberately NOT used: a first
+# run whose short window happens to be empty writes no mark, and every later
+# run is then a "first run" that misses closes older than that window.
 MAX_PER_RUN="${GC_CASCADE_NUDGE_MAX_PER_RUN:-100}"
 # Dedup entries older than this are pruned so the state file stays bounded.
 # Must be at least WINDOW. Accepts a simple Ns / Nm / Nh duration.
@@ -118,10 +116,8 @@ set_rig_args() {
 # crash the controller's order loop.
 LAST_SEQ="$(cat "$SEQ_FILE" 2>/dev/null || true)"
 case "$LAST_SEQ" in ''|*[!0-9]*) LAST_SEQ=0 ;; esac
-SINCE="$WINDOW"
-[ "$LAST_SEQ" -gt 0 ] || SINCE="$FIRST_RUN_LOOKBACK"
 
-EVENTS="$(gc events --type bead.closed --since "$SINCE" 2>/dev/null)" || exit 0
+EVENTS="$(gc events --type bead.closed --since "$WINDOW" 2>/dev/null)" || exit 0
 [ -n "$EVENTS" ] || exit 0
 
 # This run's batch: the closes newer than the previous run's high-water seq,

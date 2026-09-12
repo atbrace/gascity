@@ -58,6 +58,14 @@ WINDOW="${GC_CASCADE_NUDGE_WINDOW:-1h}"
 # (measured: 300s deadline, 1h of closes = 268-300s) without ever recording a
 # seq, so the next run replays the same hour.
 FIRST_RUN_LOOKBACK="${GC_CASCADE_NUDGE_LOOKBACK:-5m}"
+# Upper bound on the closes one run walks, oldest first; the rest wait for the
+# next firing. Each close costs one `gc bd dep list` (~1-1.5s measured), and
+# the order's exec deadline is 300s: an unbounded run (a first run, a burst)
+# is killed mid-loop before it can record its seq and then replays the same
+# closes on every firing. Bounding the batch keeps every run well inside the
+# deadline, so the mark can stay AFTER the loop and an interrupted run
+# (reload, cutover, transient store error) replays instead of losing nudges.
+MAX_PER_RUN="${GC_CASCADE_NUDGE_MAX_PER_RUN:-100}"
 # Dedup entries older than this are pruned so the state file stays bounded.
 # Must be at least WINDOW. Accepts a simple Ns / Nm / Nh duration.
 RETENTION="${GC_CASCADE_NUDGE_RETENTION:-1h}"
@@ -116,35 +124,44 @@ SINCE="$WINDOW"
 EVENTS="$(gc events --type bead.closed --since "$SINCE" 2>/dev/null)" || exit 0
 [ -n "$EVENTS" ] || exit 0
 
-# Closed beads newer than the previous run's high-water seq, minus the
-# lifecycle types that are never blockers. The bead payload is read as
-# (.payload.bead // .payload): `gc events` wraps bead.* payloads as
-# {"bead": …} on some builds and emits them flat on others (#5968).
-BLOCKERS="$(printf '%s\n' "$EVENTS" \
-    | jq -r --argjson last "$LAST_SEQ" '
-        select((.seq // 0) > $last)
+# This run's batch: the closes newer than the previous run's high-water seq,
+# oldest first, at most MAX_PER_RUN of them. The high-water mark advances to
+# the batch's last seq, so whatever did not fit is picked up next firing.
+BATCH="$(printf '%s\n' "$EVENTS" \
+    | jq -c -s --argjson last "$LAST_SEQ" --argjson max "$MAX_PER_RUN" '
+        [.[] | select((.seq // 0) > $last)] | sort_by(.seq) | .[0:$max]' 2>/dev/null)" || BATCH="[]"
+HEAD_SEQ="$(printf '%s' "$BATCH" | jq -r 'map(.seq // 0) | max // 0' 2>/dev/null)" || HEAD_SEQ=""
+case "$HEAD_SEQ" in ''|*[!0-9]*) HEAD_SEQ=0 ;; esac
+
+# Blockers in the batch, minus the lifecycle types that are never blockers.
+# The bead payload is read as (.payload.bead // .payload): `gc events` wraps
+# bead.* payloads as {"bead": …} on some builds and emits them flat on others
+# (#5968).
+BLOCKERS="$(printf '%s' "$BATCH" \
+    | jq -r '.[]
         | (.payload.bead // .payload) as $b
         | select(($b.issue_type // "") != "session"
                  and ($b.issue_type // "") != "message")
         | $b.id // empty' 2>/dev/null \
     | sort -u)" || BLOCKERS=""
 
-# Advance the high-water mark to the newest event seen so the next run starts
-# exactly where this one stopped. Recorded BEFORE the dep lookups, not after:
-# if this run is killed by the order deadline mid-loop, the closes it already
-# walked must not be replayed on every subsequent firing — each close is
-# looked up at most once, and a close lost to a kill is the same best-effort
-# gap a blocker whose dep lookup failed (`|| continue`) has always had.
-HEAD_SEQ="$(printf '%s\n' "$EVENTS" | jq -r '.seq // 0' 2>/dev/null | sort -n | tail -1)" || HEAD_SEQ=""
-case "$HEAD_SEQ" in ''|*[!0-9]*) HEAD_SEQ=0 ;; esac
+# Advance the high-water mark to the batch's last seq so the next run starts
+# exactly where this one stopped. Recorded AFTER the dep lookups: a run that
+# is interrupted (order deadline, supervisor reload, store error) leaves the
+# mark where it was and the next firing walks the same batch again — the
+# batch is bounded by MAX_PER_RUN, so that replay cannot itself hit the
+# deadline. A blocker whose dep lookup failed is skipped (`|| continue`), not
+# retried, exactly as before.
 advance_seq() {
     [ "$HEAD_SEQ" -gt "$LAST_SEQ" ] || return 0
     _tmp="$(mktemp "$PACK_STATE_DIR/.cascade-nudge-on-blocker-close-seq.XXXXXX")"
     printf '%s\n' "$HEAD_SEQ" > "$_tmp"
     mv -f "$_tmp" "$SEQ_FILE"
 }
-advance_seq
-[ -n "$BLOCKERS" ] || exit 0
+if [ -z "$BLOCKERS" ]; then
+    advance_seq
+    exit 0
+fi
 
 # Load dedup state (object mapping "<blocker>|<dependent>" -> ISO timestamp).
 STATE="$(cat "$STATE_FILE" 2>/dev/null || true)"
@@ -187,6 +204,7 @@ EOF
 done <<EOF
 $BLOCKERS
 EOF
+advance_seq
 
 # Prune entries older than RETENTION so the state file stays bounded.
 RETENTION_S="$(duration_to_seconds "$RETENTION")"

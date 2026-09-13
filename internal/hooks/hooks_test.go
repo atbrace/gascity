@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"errors"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"strings"
 	"testing"
@@ -1980,7 +1981,8 @@ func TestInstallPiHookUsesCurrentExtensionAPI(t *testing.T) {
 		"gc hook --inject",
 		`pi.on("agent_end"`,
 		"startIdleDrain(pi, ctx)",
-		"pi.sendUserMessage(nudges)",
+		`await pi.sendUserMessage(pendingIdleNudges, { deliverAs: "followUp" })`,
+		"pendingIdleNudges",
 		`run(["prime", "--hook"], ctx.cwd, hookEnv(ctx, "SessionStart"))`,
 		`run(["prime", "--hook"], ctx.cwd, hookEnv(ctx, "PreCompact"))`,
 		"GC_MANAGED_SESSION_HOOK",
@@ -2009,6 +2011,84 @@ func TestInstallPiHookUsesCurrentExtensionAPI(t *testing.T) {
 		if strings.Contains(data, legacy) {
 			t.Errorf("Pi hook still contains legacy API marker %q:\n%s", legacy, data)
 		}
+	}
+}
+
+func TestPiIdleDrainRetriesRejectedFollowUpWithoutRedraining(t *testing.T) {
+	nodeBin, err := exec.LookPath("node")
+	if err != nil {
+		t.Skip("node not installed; cannot execute the Pi hook")
+	}
+
+	fs := fsys.NewFake()
+	if err := Install(fs, "/city", "/work", []string{"pi"}); err != nil {
+		t.Fatalf("Install: %v", err)
+	}
+	plugin := fs.Files["/work/.pi/extensions/gc-hooks.js"]
+	stage := t.TempDir()
+	pluginPath := filepath.Join(stage, "gc-hooks.js")
+	if err := os.WriteFile(pluginPath, plugin, 0o644); err != nil {
+		t.Fatalf("write Pi hook: %v", err)
+	}
+
+	driver := `const childProcess = require("node:child_process");
+let drainCalls = 0;
+childProcess.execFileSync = (_command, args) => {
+  if (args[0] === "nudge" && args[1] === "drain") {
+    drainCalls += 1;
+    return drainCalls === 1 ? "wake once\n" : "";
+  }
+  return "";
+};
+
+let intervalCallback = null;
+global.setInterval = (callback) => {
+  intervalCallback = callback;
+  return { unref() {} };
+};
+global.clearInterval = () => {};
+
+const handlers = {};
+let sendCalls = 0;
+const pi = {
+  on(name, handler) { handlers[name] = handler; },
+  async sendUserMessage(message, options) {
+    sendCalls += 1;
+    if (!options || options.deliverAs !== "followUp") {
+      throw new Error("Agent is already processing. Specify streamingBehavior");
+    }
+    if (sendCalls === 1) {
+      throw new Error("synthetic provider rejection");
+    }
+    if (message !== "wake once") {
+      throw new Error("retry did not preserve the drained message");
+    }
+  },
+};
+
+require(process.argv[2])(pi);
+await handlers.agent_end({}, { cwd: process.cwd() });
+if (!intervalCallback) {
+  throw new Error("rejected delivery did not arm a retry");
+}
+await intervalCallback();
+if (drainCalls !== 1) {
+  throw new Error(` + "`" + `drained ${drainCalls} times; want exactly once` + "`" + `);
+}
+if (sendCalls !== 2) {
+  throw new Error(` + "`" + `sent ${sendCalls} times; want rejected attempt plus retry` + "`" + `);
+}
+`;
+	driverPath := filepath.Join(stage, "driver.mjs")
+	if err := os.WriteFile(driverPath, []byte(driver), 0o644); err != nil {
+		t.Fatalf("write Pi hook driver: %v", err)
+	}
+
+	cmd := exec.Command(nodeBin, driverPath, pluginPath)
+	cmd.Env = append(os.Environ(), "GC_SESSION_ID=test-pi-session")
+	out, err := cmd.CombinedOutput()
+	if err != nil {
+		t.Fatalf("Pi idle-drain runtime: %v\noutput:\n%s", err, out)
 	}
 }
 

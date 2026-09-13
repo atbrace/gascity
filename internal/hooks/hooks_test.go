@@ -1977,7 +1977,7 @@ func TestInstallPiHookUsesCurrentExtensionAPI(t *testing.T) {
 		`pi.on("session_start"`,
 		`pi.on("session_compact"`,
 		`pi.on("before_agent_start"`,
-		"const GC_PI_HOOK_VERSION = 10",
+		"const GC_PI_HOOK_VERSION = 11",
 		"gc hook --inject",
 		`pi.on("agent_end"`,
 		"startIdleDrain(pi, ctx)",
@@ -2031,59 +2031,7 @@ func TestPiIdleDrainRetriesRejectedFollowUpWithoutRedraining(t *testing.T) {
 		t.Fatalf("write Pi hook: %v", err)
 	}
 
-	driver := `const childProcess = require("node:child_process");
-let drainCalls = 0;
-childProcess.execFileSync = (_command, args) => {
-  if (args[0] === "nudge" && args[1] === "drain") {
-    drainCalls += 1;
-    return drainCalls === 1 ? "wake once\n" : "";
-  }
-  return "";
-};
-
-let intervalCallback = null;
-global.setInterval = (callback) => {
-  intervalCallback = callback;
-  return { unref() {} };
-};
-global.clearInterval = () => {};
-
-const handlers = {};
-let sendCalls = 0;
-const pi = {
-  on(name, handler) { handlers[name] = handler; },
-  async sendUserMessage(message, options) {
-    sendCalls += 1;
-    if (!options || options.deliverAs !== "followUp") {
-      throw new Error("Agent is already processing. Specify streamingBehavior");
-    }
-    if (sendCalls === 1) {
-      throw new Error("synthetic provider rejection");
-    }
-    if (message !== "wake once") {
-      throw new Error("retry did not preserve the drained message");
-    }
-  },
-};
-
-require(process.argv[2])(pi);
-await handlers.agent_end({}, { cwd: process.cwd() });
-if (!intervalCallback) {
-  throw new Error("rejected delivery did not arm a retry");
-}
-await intervalCallback();
-if (drainCalls !== 1) {
-  throw new Error(` + "`" + `drained ${drainCalls} times; want exactly once` + "`" + `);
-}
-if (sendCalls !== 2) {
-  throw new Error(` + "`" + `sent ${sendCalls} times; want rejected attempt plus retry` + "`" + `);
-}
-`;
-	driverPath := filepath.Join(stage, "driver.mjs")
-	if err := os.WriteFile(driverPath, []byte(driver), 0o644); err != nil {
-		t.Fatalf("write Pi hook driver: %v", err)
-	}
-
+	driverPath := filepath.Join("testdata", "pi_idle_drain_driver.mjs")
 	cmd := exec.Command(nodeBin, driverPath, pluginPath)
 	cmd.Env = append(os.Environ(), "GC_SESSION_ID=test-pi-session")
 	out, err := cmd.CombinedOutput()
@@ -2125,7 +2073,7 @@ func TestPiHookNeedsUpgradeComparesParsedVersion(t *testing.T) {
 // gc prime --hook
 // gc hook --inject
 // gc handoff --auto
-const GC_PI_HOOK_VERSION = 10;
+const GC_PI_HOOK_VERSION = 11;
 pendingPrimeContext = run(["prime", "--hook"], ctx.cwd, hookEnv(ctx, "SessionStart"));
 run(["hook", "--inject"], ctx.cwd);
 run(["handoff", "--auto", "context cycle"], ctx.cwd);
@@ -2137,8 +2085,8 @@ GC_HOOK_EVENT_NAME;
 stdio: ["ignore", "pipe", "inherit"];
 function providerSessionEnv(ctx) {}
 `)
-	stale := bytes.Replace(current, []byte("GC_PI_HOOK_VERSION = 10"), []byte("GC_PI_HOOK_VERSION = 9"), 1)
-	future := bytes.Replace(current, []byte("GC_PI_HOOK_VERSION = 10"), []byte("GC_PI_HOOK_VERSION = 11"), 1)
+	stale := bytes.Replace(current, []byte("GC_PI_HOOK_VERSION = 11"), []byte("GC_PI_HOOK_VERSION = 10"), 1)
+	future := bytes.Replace(current, []byte("GC_PI_HOOK_VERSION = 11"), []byte("GC_PI_HOOK_VERSION = 12"), 1)
 	missingStderrForward := bytes.Replace(current, []byte(`stdio: ["ignore", "pipe", "inherit"];
 `), nil, 1)
 	missingManagedHookMarkers := bytes.Replace(current, []byte(`GC_MANAGED_SESSION_HOOK;

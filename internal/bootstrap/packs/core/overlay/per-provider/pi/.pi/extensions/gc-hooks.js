@@ -17,7 +17,7 @@ const { execFileSync } = require("node:child_process");
 const fs = require("node:fs");
 const path = require("node:path");
 
-const GC_PI_HOOK_VERSION = 10;
+const GC_PI_HOOK_VERSION = 11;
 const PATH_PREFIX =
   `/opt/homebrew/bin:/usr/local/bin:${process.env.HOME}/go/bin:${process.env.HOME}/.local/bin:`;
 let mirrorTempCounter = 0;
@@ -172,12 +172,15 @@ function mirrorTranscript(ctx) {
 // at agent_end and then every IDLE_DRAIN_INTERVAL_MS until the next
 // agent_start. Drained nudges arrive as a user message, which starts a turn.
 //
-// Bounded by construction: `gc nudge drain` claims what it prints, so a
-// delivered reminder cannot be re-delivered, and an empty queue prints
-// nothing. Only armed when gc exported a session identity, so a human running
-// pi in a managed worktree does not get an idle gc subprocess loop.
+// A drained reminder stays in memory until Pi accepts it. This matters because
+// sendUserMessage rejects while the agent is streaming unless a delivery mode
+// is explicit; consuming the queue first used to lose that reminder. Only
+// armed when gc exported a session identity, so a human running pi in a
+// managed worktree does not get an idle gc subprocess loop.
 const IDLE_DRAIN_INTERVAL_MS = 15000;
 let idleDrainTimer = null;
+let idleDrainInFlight = false;
+let pendingIdleNudges = "";
 
 function managedSessionIdentity() {
   return process.env.GC_ALIAS || process.env.GC_SESSION_ID || "";
@@ -209,26 +212,46 @@ function stopIdleDrain() {
   }
 }
 
-function drainIdleNudges(pi, ctx) {
-  const nudges = runQuiet(["nudge", "drain"], ctx.cwd);
-  if (!nudges) {
+async function drainIdleNudges(pi, ctx) {
+  if (idleDrainInFlight) {
     return false;
   }
-  stopIdleDrain();
-  pi.sendUserMessage(nudges);
-  return true;
+  idleDrainInFlight = true;
+  try {
+    if (!pendingIdleNudges) {
+      pendingIdleNudges = runQuiet(["nudge", "drain"], ctx.cwd);
+    }
+    if (!pendingIdleNudges) {
+      return false;
+    }
+    await pi.sendUserMessage(pendingIdleNudges, { deliverAs: "followUp" });
+    pendingIdleNudges = "";
+    stopIdleDrain();
+    return true;
+  } catch (err) {
+    try {
+      const detail =
+        (err && (err.code || err.message)) || "unknown delivery error";
+      console.error("gc-hooks idle nudge delivery failed:", detail);
+    } catch {
+      // Keep Pi hooks non-fatal even if stderr is unavailable.
+    }
+    return false;
+  } finally {
+    idleDrainInFlight = false;
+  }
 }
 
-function startIdleDrain(pi, ctx) {
+async function startIdleDrain(pi, ctx) {
   stopIdleDrain();
   if (!managedSessionIdentity()) {
     return;
   }
-  if (drainIdleNudges(pi, ctx)) {
+  if (await drainIdleNudges(pi, ctx)) {
     return;
   }
   idleDrainTimer = setInterval(() => {
-    drainIdleNudges(pi, ctx);
+    void drainIdleNudges(pi, ctx);
   }, IDLE_DRAIN_INTERVAL_MS);
   if (typeof idleDrainTimer.unref === "function") {
     idleDrainTimer.unref();
@@ -275,9 +298,9 @@ module.exports = function gascityPiExtension(pi) {
     stopIdleDrain();
   });
 
-  pi.on("agent_end", (_event, ctx) => {
+  pi.on("agent_end", async (_event, ctx) => {
     mirrorTranscript(ctx);
-    startIdleDrain(pi, ctx);
+    await startIdleDrain(pi, ctx);
   });
 
   pi.on("session_shutdown", (_event, ctx) => {

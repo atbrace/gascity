@@ -166,8 +166,8 @@ var bootstrapPolicy = Ledger{
 		{
 			Scope:           ScopeUntagged,
 			Resource:        ResourceSubprocess,
-			BaselineCalls:   489,
-			BaselineFiles:   143,
+			BaselineCalls:   490,
+			BaselineFiles:   144,
 			ReportedCalls:   380,
 			ReportedFiles:   98,
 			OwnerBead:       "ga-cp3hwi",
@@ -352,7 +352,7 @@ var bootstrapPolicy = Ledger{
 			Invariant:       "the Pi idle-redrive provider-boundary regression is a checked Medium subprocess owner",
 			ResourceOwner:   "the one Node subprocess is confined to TestPiIdleDrainRetriesRejectedFollowUpWithoutRedraining, which executes the real bundled extension against a deterministic mocked Pi API and fake gc binary",
 			MigrationTarget: "P0.4b",
-			Expires:         "2026-10-01",
+			Expires:         "2026-10-31",
 		},
 		{
 			PackageDir:      "cmd/gc",

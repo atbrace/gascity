@@ -125,8 +125,8 @@ var bootstrapPolicy = Ledger{
 		{
 			Scope:           ScopeAll,
 			Resource:        ResourceSubprocess,
-			BaselineCalls:   726,
-			BaselineFiles:   212,
+			BaselineCalls:   727,
+			BaselineFiles:   213,
 			ReportedCalls:   495,
 			ReportedFiles:   135,
 			OwnerBead:       "ga-cp3hwi",
@@ -342,6 +342,17 @@ var bootstrapPolicy = Ledger{
 			ResourceOwner:   "the git processes are confined to TestCommitReachableOnBranch, which exists to ask a real repository whether a commit is an ancestor of a branch: CommitReachableOnBranch is that git invocation, so a fake oracle would only prove itself",
 			MigrationTarget: "P0.4b",
 			Expires:         "2026-10-31",
+		},
+		{
+			PackageDir:      "internal/hooks",
+			PackageName:     "hooks",
+			Owner:           "TestPiIdleDrainRetriesRejectedFollowUpWithoutRedraining",
+			Resources:       []Resource{ResourceSubprocess},
+			OwnerBead:       "sys-xtzg5w",
+			Invariant:       "the Pi idle-redrive provider-boundary regression is a checked Medium subprocess owner",
+			ResourceOwner:   "the one Node subprocess is confined to TestPiIdleDrainRetriesRejectedFollowUpWithoutRedraining, which executes the real bundled extension against a deterministic mocked Pi API and fake gc binary",
+			MigrationTarget: "P0.4b",
+			Expires:         "2026-10-01",
 		},
 		{
 			PackageDir:      "cmd/gc",

@@ -334,7 +334,7 @@ func TestBundledPiHookUsesCurrentExtensionAPI(t *testing.T) {
 		"gc hook --inject",
 		`pi.on("agent_end"`,
 		"startIdleDrain(pi, ctx)",
-		"pi.sendUserMessage(nudges)",
+		`await pi.sendUserMessage(pendingIdleNudges, { deliverAs: "followUp" })`,
 		`run(["prime", "--hook"], ctx.cwd, providerSessionEnv(ctx))`,
 		"GC_PROVIDER_SESSION_ID",
 		"GC_PROVIDER_SESSION_ID_REQUIRED",

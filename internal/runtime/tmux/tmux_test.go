@@ -2091,6 +2091,45 @@ func TestSendKeysLiteralWithRetryUsesPasteBufferForLargeText(t *testing.T) {
 	assertTmuxCommand(t, fe.calls[1], "paste-buffer")
 }
 
+func TestSendKeysLiteralWithRetryUsesPasteBufferForShortMultilineText(t *testing.T) {
+	fe := &fakeExecutor{}
+	tm := NewTmuxWithConfig(DefaultConfig())
+	tm.exec = fe
+
+	// Well under maxSendKeysLiteralLen, but multi-line: send-keys -l would
+	// deliver the embedded newline as Enter, submitting each line as its own
+	// premature prompt. Must take the paste-buffer path instead.
+	err := tm.sendKeysLiteralWithRetry("%1", "line one\nline two", time.Second)
+	if err != nil {
+		t.Fatalf("sendKeysLiteralWithRetry() = %v, want nil", err)
+	}
+
+	if len(fe.calls) != 2 {
+		t.Fatalf("tmux calls = %d, want 2: %#v", len(fe.calls), fe.calls)
+	}
+	assertTmuxCommand(t, fe.calls[0], "load-buffer")
+	assertTmuxCommand(t, fe.calls[1], "paste-buffer")
+}
+
+func TestSendKeysLiteralWithRetryUsesSendKeysForShortSingleLineText(t *testing.T) {
+	fe := &fakeExecutor{}
+	tm := NewTmuxWithConfig(DefaultConfig())
+	tm.exec = fe
+
+	err := tm.sendKeysLiteralWithRetry("%1", "single line prompt", time.Second)
+	if err != nil {
+		t.Fatalf("sendKeysLiteralWithRetry() = %v, want nil", err)
+	}
+
+	if len(fe.calls) != 1 {
+		t.Fatalf("tmux calls = %d, want 1: %#v", len(fe.calls), fe.calls)
+	}
+	joined := strings.Join(fe.calls[0], " ")
+	if !strings.Contains(joined, "send-keys") || !strings.Contains(joined, "-l") {
+		t.Fatalf("first call = %v, want literal send-keys", fe.calls[0])
+	}
+}
+
 func assertTmuxCommand(t *testing.T, args []string, want string) {
 	t.Helper()
 

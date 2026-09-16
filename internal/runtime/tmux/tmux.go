@@ -1620,7 +1620,11 @@ func nextPasteBufferName() string {
 }
 
 func (t *Tmux) sendLiteralText(target, text string) error {
-	if len(text) > maxSendKeysLiteralLen {
+	// tmux send-keys -l delivers an embedded '\n' as Enter, so any multi-line
+	// text — even well under the length threshold — gets submitted line by
+	// line instead of arriving as one literal string. Route it through the
+	// bracketed-paste path regardless of length whenever it contains a newline.
+	if len(text) > maxSendKeysLiteralLen || strings.Contains(text, "\n") {
 		return t.pasteLiteralText(target, text)
 	}
 	_, err := t.run("send-keys", "-t", target, "-l", text)

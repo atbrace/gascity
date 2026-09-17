@@ -75,14 +75,24 @@ duration_to_seconds() {
 # but do not fan out: the controller binds routed pool demand to one eligible
 # slot, and the native idle-claim backstop delivers a bounded nudge if that
 # slot does not claim normally. Nudging every active member also wakes busy
-# siblings that cannot claim the new work. A target with no members (a
-# single-session agent or explicit slot name) is still nudged directly.
+# siblings that cannot claim the new work. A template with exactly one active
+# member is safe to nudge once; a target with no members (a named session or
+# explicit slot) is nudged directly.
 nudge_routed_target() {
     _target="$1"
-    _members="$(gc session list --json --state active --template "$_target" 2>/dev/null \
-        | jq -r '(.sessions // [])[] | .name // .id' 2>/dev/null)" || _members=""
-    if [ -n "$_members" ]; then
+    _sessions="$(gc session list --json --state active --template "$_target" 2>/dev/null)" \
+        || _sessions='{"sessions":[]}'
+    _member_count="$(printf '%s\n' "$_sessions" \
+        | jq -r '(.sessions // []) | length' 2>/dev/null)" || _member_count=0
+    if [ "$_member_count" -gt 1 ]; then
         return 0
+    fi
+    if [ "$_member_count" -eq 1 ]; then
+        _members="$(printf '%s\n' "$_sessions" \
+            | jq -r '(.sessions // [])[0] | .name // .id' 2>/dev/null)" || _members=""
+        [ -n "$_members" ] || return 0
+        gc session nudge "$_members" "$NUDGE_MESSAGE" >/dev/null 2>&1
+        return $?
     fi
     gc session nudge "$_target" "$NUDGE_MESSAGE" >/dev/null 2>&1
 }

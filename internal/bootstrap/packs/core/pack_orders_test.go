@@ -175,6 +175,8 @@ func TestNudgeOnRouteDefersPoolMembersToIdleClaimBackstop(t *testing.T) {
 		"gc session list",
 		"--template",
 		"native idle-claim backstop",
+		`if [ "$_member_count" -gt 1 ]`,
+		`gc session nudge "$_members"`,
 		`gc session nudge "$_target"`,
 		"Run gc hook --claim --drain-ack --json now",
 	} {

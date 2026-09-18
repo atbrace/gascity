@@ -48,6 +48,20 @@ func TestComputePoolTriggerBindingPatchPreservesFrozenPairOnResumeSourceUpdate(t
 	}
 }
 
+// TestComputePoolTriggerBindingPatchNeverHalvesFrozenPairOnRefLessResume pins
+// sys-v7fwbx: between graph-v2 steps only the source bead is assigned, so the
+// resume request carries no PreserveTrigger and no store ref. Re-pointing the
+// id there cleared the ref, and the restarted session's half envelope made
+// every hook --claim drain retry.
+func TestComputePoolTriggerBindingPatchNeverHalvesFrozenPairOnRefLessResume(t *testing.T) {
+	info := sessionpkg.Info{ID: "sess-1", TriggerBeadID: "step-A", TriggerBeadStoreRef: "rig:source"}
+	request := SessionRequest{Tier: "resume", SessionBeadID: "sess-1", WorkBeadID: "source-B"}
+	bound := info.ApplyPatch(computePoolTriggerBindingPatch(info, request, ""))
+	if bound.TriggerBeadID != "step-A" || bound.TriggerBeadStoreRef != "rig:source" {
+		t.Fatalf("ref-less resume rewrote frozen pair to (%q, %q), want (step-A, rig:source)", bound.TriggerBeadID, bound.TriggerBeadStoreRef)
+	}
+}
+
 func (s failUpdateStore) Update(string, beads.UpdateOpts) error { return s.err }
 
 // triggerClusterSessionBead builds a pool session bead carrying a full

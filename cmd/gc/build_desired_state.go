@@ -2893,7 +2893,13 @@ func computePoolTriggerBindingPatch(info session.Info, request SessionRequest, w
 		return metadata
 	}
 	oldWorkBeadID := strings.TrimSpace(info.TriggerBeadID)
-	preserveTrigger := request.PreserveTrigger && request.Tier == "resume" && request.SessionBeadID == info.ID &&
+	// A resume request without an authoritative store ref must not replace a
+	// full frozen pair: it would persist the new id with an empty ref, a half
+	// envelope hook --claim refuses forever once the session restarts
+	// (sys-v7fwbx: the graph-v2 gap between steps, when only the source bead
+	// is assigned and PreserveTrigger is false).
+	preserveTrigger := request.Tier == "resume" && request.SessionBeadID == info.ID &&
+		(request.PreserveTrigger || strings.TrimSpace(request.WorkStoreRef) == "") &&
 		oldWorkBeadID != "" &&
 		strings.TrimSpace(info.TriggerBeadStoreRef) != ""
 	if oldWorkBeadID != workBeadID && !preserveTrigger {

@@ -841,6 +841,80 @@ func TestCmdMailSendFromRejectsUnresolvableCallerIdentity(t *testing.T) {
 	}
 }
 
+// TestCmdMailSendFromHumanRejectedForLiveAgentSession closes the reserved
+// "human" bucket as a --from bypass: "human" is the operator's identity, so a
+// live agent session claiming it forges operator-authority mail just as
+// --from mayor forges coordinator mail (#4070).
+func TestCmdMailSendFromHumanRejectedForLiveAgentSession(t *testing.T) {
+	t.Setenv("GC_BEADS", "file")
+	t.Setenv("GC_MAIL", "")
+	t.Setenv("GC_ALIAS", "worker")
+	t.Setenv("GC_SESSION_ID", "")
+	t.Setenv("GC_AGENT", "")
+
+	cityPath := t.TempDir()
+	if err := os.WriteFile(filepath.Join(cityPath, "city.toml"), []byte("[workspace]\nname = \"test-city\"\n"), 0o644); err != nil {
+		t.Fatalf("WriteFile(city.toml): %v", err)
+	}
+	t.Setenv("GC_CITY", cityPath)
+
+	store, err := openCityStoreAt(cityPath)
+	if err != nil {
+		t.Fatalf("openCityStoreAt: %v", err)
+	}
+	createMailIdentitySession(t, store, "test-city/mayor", "mayor", "mayor-session")
+	createMailIdentitySession(t, store, "test-city/worker", "worker", "worker-session")
+
+	var stdout, stderr bytes.Buffer
+	code := cmdMailSend([]string{"mayor"}, false, false, "human", "", "forged directive", "not really from the operator", &stdout, &stderr)
+	if code == 0 {
+		t.Fatalf("cmdMailSend(--from human, caller=worker) = 0, want non-zero (operator impersonation must be rejected); stdout=%s", stdout.String())
+	}
+
+	storeAfter, err := openCityStoreAt(cityPath)
+	if err != nil {
+		t.Fatalf("openCityStoreAt after send: %v", err)
+	}
+	all, err := storeAfter.List(beads.ListQuery{Type: "message", Status: "open", TierMode: beads.TierBoth})
+	if err != nil {
+		t.Fatalf("List messages: %v", err)
+	}
+	for _, b := range all {
+		if b.From == "human" {
+			t.Fatalf("a message with forged From=human was created: %#v", b)
+		}
+	}
+}
+
+// TestCmdMailSendFromHumanAllowedForInteractiveHuman guards the other side:
+// a caller with no session identity of its own is the operator at a
+// terminal, and --from human stays its own identity.
+func TestCmdMailSendFromHumanAllowedForInteractiveHuman(t *testing.T) {
+	t.Setenv("GC_BEADS", "file")
+	t.Setenv("GC_MAIL", "")
+	t.Setenv("GC_ALIAS", "")
+	t.Setenv("GC_SESSION_ID", "")
+	t.Setenv("GC_AGENT", "")
+
+	cityPath := t.TempDir()
+	if err := os.WriteFile(filepath.Join(cityPath, "city.toml"), []byte("[workspace]\nname = \"test-city\"\n"), 0o644); err != nil {
+		t.Fatalf("WriteFile(city.toml): %v", err)
+	}
+	t.Setenv("GC_CITY", cityPath)
+
+	store, err := openCityStoreAt(cityPath)
+	if err != nil {
+		t.Fatalf("openCityStoreAt: %v", err)
+	}
+	createMailIdentitySession(t, store, "test-city/mayor", "mayor", "mayor-session")
+
+	var stdout, stderr bytes.Buffer
+	code := cmdMailSend([]string{"mayor"}, false, false, "human", "", "directive", "from the operator", &stdout, &stderr)
+	if code != 0 {
+		t.Fatalf("cmdMailSend(--from human, caller=human) = %d, want 0; stdout=%s stderr=%s", code, stdout.String(), stderr.String())
+	}
+}
+
 func TestCmdMailSendToControllerRecipientIsRejected(t *testing.T) {
 	t.Setenv("GC_BEADS", "file")
 	t.Setenv("GC_MAIL", "")

@@ -70,7 +70,7 @@ type hookClaimOps struct {
 	SkipDoneWorkflow hookSkipDoneWorkflowFunc
 	// LookupTrigger resolves the frozen trigger by ID in the selected store so
 	// a terminal trigger can authorize only its already-assigned continuation.
-	LookupTrigger hookLookupTriggerFunc
+	LookupTrigger     hookLookupTriggerFunc
 	ReadyContinuation hookReadyContinuationFunc
 	// EmitClaimRejected publishes a bead.claim_rejected event when a claim is
 	// lost to a different live claimant (ADR-0009). Best-effort.
@@ -482,11 +482,19 @@ func writeHookClaimWorkResultForBead(result hookClaimJSONResult, bead beads.Bead
 	publishHookClaimRunMap(bead, opts, ops, stderr)
 	var assigned []string
 	if strings.TrimSpace(opts.TriggerBeadID) == "" || bead.ID == strings.TrimSpace(opts.TriggerBeadID) {
-		var err error
-		assigned, err = preassignHookContinuationGroup(bead, opts, ops, dir)
+		// Continuation pre-assignment is BEST-EFFORT, like the sibling
+		// stampHookClaimIdentity and publishHookClaimRunMap calls above: it only
+		// optimizes which session is offered the next step. It must never veto the
+		// claim itself. A store hiccup, Dolt latency past the mutation budget, or a
+		// sibling that refuses an assignment would otherwise turn a successful claim
+		// (the held existing_assignment step, or a fresh claim) into a non-zero exit
+		// with no JSON on stdout — the exact hard-fail that stranded the Luna recon
+		// steps (sys-pxryan.20). We keep whatever did land and log the rest; the
+		// preassignment is retried on the next tick (NDI).
+		a, err := preassignHookContinuationGroup(bead, opts, ops, dir)
+		assigned = a
 		if err != nil {
-			fmt.Fprintf(stderr, "gc hook --claim: preassigning continuation group for %s: %v\n", bead.ID, err) //nolint:errcheck
-			return 1
+			fmt.Fprintf(stderr, "gc hook --claim: preassigning continuation group for %s: %v (non-fatal; returning held step, continuation retried next tick)\n", bead.ID, err) //nolint:errcheck
 		}
 	}
 	result.ContinuationAssigned = assigned

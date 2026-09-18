@@ -373,6 +373,56 @@ func TestDoHookClaimReturnsExistingAssignment(t *testing.T) {
 	}
 }
 
+// TestDoHookClaimExistingAssignmentSurvivesPreassignError pins sys-pxryan.20:
+// a session that already HOLDS an in-flight step (existing_assignment) must get
+// that step returned as usable JSON even when the best-effort continuation
+// pre-assignment errors. Before the fix, a ListContinuation/AssignContinuation
+// error in writeHookClaimWorkResultForBead returned exit 1 with NO JSON on
+// stdout — the exact "hard-fails, no usable output" symptom that stranded the
+// Luna recon steps. The preassignment is optimization only (it is retried next
+// tick, NDI), so it must never veto the claim itself.
+func TestDoHookClaimExistingAssignmentSurvivesPreassignError(t *testing.T) {
+	runner := func(string, string) (string, error) {
+		return `[{"id":"hw-held","status":"in_progress","assignee":"worker-1","metadata":{"gc.routed_to":"worker","gc.root_bead_id":"root-1","gc.continuation_group":"body"}}]`, nil
+	}
+	ops := hookClaimOps{
+		Runner: runner,
+		Claim: func(context.Context, string, []string, string, string) (beads.Bead, bool, error) {
+			t.Fatal("claim must not run for existing assigned in-progress work")
+			return beads.Bead{}, false, nil
+		},
+		ListContinuation: func(context.Context, string, []string, string, string) ([]beads.Bead, error) {
+			// Simulate the store hiccup / Dolt-latency deadline that used to hard-fail the claim.
+			return nil, errors.New("dolt: context deadline exceeded (forwarder timeout)")
+		},
+	}
+	opts := hookClaimOptions{
+		Assignee:           "worker-1",
+		IdentityCandidates: []string{"worker-1"},
+		RouteTargets:       []string{"worker"},
+		JSON:               true,
+	}
+
+	var stdout, stderr bytes.Buffer
+	code := doHookClaim("bd ready --json", "/tmp/work", opts, ops, &stdout, &stderr)
+	if code != 0 {
+		t.Fatalf("doHookClaim(existing + preassign error) = %d, want 0; stderr=%s", code, stderr.String())
+	}
+	if !strings.Contains(stderr.String(), "non-fatal") {
+		t.Errorf("stderr = %q, want a non-fatal preassign note", stderr.String())
+	}
+	var result hookClaimJSONResult
+	if err := json.Unmarshal(stdout.Bytes(), &result); err != nil {
+		t.Fatalf("stdout is not JSON: %v\nraw: %s", err, stdout.String())
+	}
+	if result.Action != "work" || result.Reason != "existing_assignment" || result.BeadID != "hw-held" || result.Assignee != "worker-1" {
+		t.Fatalf("unexpected claim result: %+v", result)
+	}
+	if result.RootBeadID != "root-1" || result.ContinuationGroup != "body" {
+		t.Fatalf("claim context = {%q %q}, want {root-1 body}", result.RootBeadID, result.ContinuationGroup)
+	}
+}
+
 func TestDoHookClaimClaimsRoutedUnassignedWork(t *testing.T) {
 	var claimedID string
 	runner := func(string, string) (string, error) {

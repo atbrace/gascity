@@ -223,6 +223,23 @@ func doSubmit(store beads.Store, opts submitOptions, ops submitOps, stderr io.Wr
 	if err != nil {
 		return submitResult{}, fmt.Errorf("reading work bead %s: %w", beadID, err)
 	}
+	// Review gate (sys-pxryan.50): applies ONLY to review_required work. Read
+	// HEAD once, then refuse before any push or store write unless the owning
+	// session's claimed verified-submit step has a settled approved review for
+	// exactly this HEAD; head is carried into the LocalSHA assignment below.
+	// Legacy work (no review_required) keeps the pre-gate flow byte-identical:
+	// no HEAD read here. It is read later, exactly where the original code read
+	// it (after the ahead==0 check), so HEAD reads and error order are unchanged.
+	var head string
+	if strings.EqualFold(strings.TrimSpace(bead.Metadata["review_required"]), "true") {
+		head, err = ops.Head(opts.Dir)
+		if err != nil {
+			return submitResult{}, fmt.Errorf("reading HEAD for review gate: %w", err)
+		}
+		if err := reviewSubmitGuard(store, bead, head); err != nil {
+			return submitResult{}, err
+		}
+	}
 
 	if !ops.RefineryConfigured(opts.Refinery) {
 		return submitResult{}, fmt.Errorf("refinery target %q does not name a configured agent; refusing to hand off (the bead would be stranded)", opts.Refinery)
@@ -286,9 +303,12 @@ func doSubmit(store beads.Store, opts submitOptions, ops submitOps, stderr io.Wr
 	if ahead == 0 {
 		return submitResult{}, fmt.Errorf("%s has no commits beyond origin/%s; nothing to hand off", expected, base)
 	}
-	head, err := ops.Head(opts.Dir)
-	if err != nil {
-		return submitResult{}, fmt.Errorf("reading HEAD: %w", err)
+	if head == "" {
+		// Legacy path: the review gate did not read HEAD early, so read it here
+		// exactly as the pre-gate code did (same position, same error text).
+		if head, err = ops.Head(opts.Dir); err != nil {
+			return submitResult{}, fmt.Errorf("reading HEAD: %w", err)
+		}
 	}
 	res.LocalSHA = head
 
@@ -333,6 +353,240 @@ func doSubmit(store beads.Store, opts submitOptions, ops submitOps, stderr io.Wr
 		fmt.Fprintf(stderr, "gc submit: warning: nudge %s: %v (refinery finds the work on its next poll)\n", opts.Refinery, err) //nolint:errcheck
 	}
 	return res, nil
+}
+
+// reviewSubmitGuard enforces the review handoff gate at the submit seam
+// (sys-pxryan.27, sys-pxryan.50): a work bead stamped review_required=true may
+// only be handed to the refinery by the session whose persisted claim IS the
+// live verified-submit step, and only while that workflow's terminal review
+// loop has a settled approved review for the exact candidate SHA about to be
+// pushed.
+//
+// The submitted --bead/--convoy target is the WORK bead, NOT the current
+// execution step. GC_BEAD_ID is a non-authoritative hint only: the formula
+// itself exports it as the workflow root when it invokes the checker, so it
+// can name the step or the root depending on the caller and must never be
+// trusted alone. Authority is the authenticated hook/claim stamp: gc.session_id
+// / gc.session_name on the step (written by stampHookClaimIdentity at claim
+// time), cross-checked against the step's own gc.root_bead_id and gc.step_ref.
+// resolveActiveWispStep is deliberately NOT used to pick the step: its
+// entry-step fallback returns the oldest OPEN child with no ownership check, so
+// it cannot authenticate an OPEN non-entry verified-submit step.
+//
+// Every refusal returns before any push or store write. Targets without
+// review_required=true keep the legacy manual/polecat path unchanged; the
+// Refinery's own review gate remains defense in depth.
+func reviewSubmitGuard(store beads.Store, work beads.Bead, candidateSHA string) error {
+	if !strings.EqualFold(strings.TrimSpace(work.Metadata["review_required"]), "true") {
+		return nil // legacy/manual path: unchanged
+	}
+	sid := strings.TrimSpace(os.Getenv("GC_SESSION_ID"))
+	sname := strings.TrimSpace(os.Getenv("GC_SESSION_NAME"))
+	if sid == "" && sname == "" {
+		return fmt.Errorf("gc submit: %s is review_required=true but this invocation carries no session identity (GC_SESSION_ID/GC_SESSION_NAME both empty); only the owning verified-submit session may hand it to the refinery (sys-pxryan.50)", work.ID)
+	}
+	// Bind the work bead to its workflow root.
+	root := strings.TrimSpace(work.Metadata["gc.dispatch_workflow"])
+	if root == "" {
+		root = strings.TrimSpace(work.Metadata["gc.root_bead_id"])
+	}
+	if root == "" {
+		return fmt.Errorf("gc submit: %s is review_required=true but has no workflow root (gc.dispatch_workflow/gc.root_bead_id empty); refusing before push or handoff write (sys-pxryan.50)", work.ID)
+	}
+	// Step provenance: the caller's claimed current step must be exactly the
+	// verified-submit step under this root.
+	if err := requireClaimedVerifiedSubmitStep(store, sid, sname, root, work.ID); err != nil {
+		return err
+	}
+	// Review binding: the terminal closed/pass ralph control's settled attempt
+	// must carry a native review approval of exactly the candidate SHA.
+	return assertSettledReview(store, root, candidateSHA)
+}
+
+// requireClaimedVerifiedSubmitStep authenticates the caller's current execution
+// step from persisted claim state. Among non-closed native steps (gc.step_ref
+// set - work beads and cards are not steps), the ones stamped to THIS exact
+// session (gc.session_id / gc.session_name, written by the authenticated
+// hook/claim path; the stamp is the only authority - assignee alone never
+// authorizes) must be EXACTLY ONE, and it must be the verified-submit step
+// under root. A preassigned-but-unstamped step is not claim proof. An earlier
+// OPEN step owned by ANOTHER session is simply not in the set; multiple
+// claimed steps (e.g. an apply step plus verified-submit) are ambiguous and
+// fail closed. sid/sname are the exact claim identity - no fuzzy alias
+// expansion.
+func requireClaimedVerifiedSubmitStep(store beads.Store, sid, sname, root, workID string) error {
+	steps, err := store.List(beads.ListQuery{
+		TierMode:      beads.TierBoth,
+		IncludeClosed: false, // non-closed only: open + in_progress
+		AllowScan:     true,  // unfiltered: ownership decided in memory
+	})
+	if err != nil {
+		return fmt.Errorf("gc submit: %s: listing open steps for session claim check: %w (sys-pxryan.50)", workID, err)
+	}
+	claimed := 0
+	claimedVerifiedSubmit := false
+	for _, b := range steps {
+		if strings.TrimSpace(b.Metadata["gc.step_ref"]) == "" {
+			continue
+		}
+		if !stepClaimedBySession(b, sid, sname) {
+			continue
+		}
+		claimed++
+		if strings.TrimSpace(b.Metadata["gc.root_bead_id"]) == root && isVerifiedSubmitRef(b.Metadata["gc.step_ref"]) {
+			claimedVerifiedSubmit = true
+		}
+	}
+	switch {
+	case claimed == 0:
+		return fmt.Errorf("gc submit: %s is review_required=true but no open step is claimed by this session; the verified-submit step must be claimed by its owning session before handoff (sys-pxryan.50)", workID)
+	case claimed > 1:
+		return fmt.Errorf("gc submit: %s: this session claims %d open steps, so the current step is ambiguous; refusing (sys-pxryan.50)", workID, claimed)
+	case !claimedVerifiedSubmit:
+		return fmt.Errorf("gc submit: %s: this session's current step is not the verified-submit step of workflow %s; only verified-submit may hand off review_required work (sys-pxryan.50)", workID, root)
+	}
+	return nil
+}
+
+// stepClaimedBySession reports whether a step carries THIS session's exact
+// hook-claim stamp (gc.session_id / gc.session_name, written by
+// stampHookClaimIdentity at claim time). Assignee is deliberately NOT
+// consulted: a preassigned-but-unstamped step is not a claim, and any stamp
+// field naming a different session is a conflict - both are rejected even if
+// the assignee matches. At least one stamp field must positively identify this
+// session.
+func stepClaimedBySession(b beads.Bead, sid, sname string) bool {
+	stepSID := strings.TrimSpace(b.Metadata["gc.session_id"])
+	stepSname := strings.TrimSpace(b.Metadata["gc.session_name"])
+	if stepSID == "" && stepSname == "" {
+		return false // never claimed by a session; assignee is not authority here
+	}
+	// Any stamp field present must name this session; a field naming a
+	// different session is a conflict -> fail closed.
+	if stepSID != "" && stepSID != sid {
+		return false
+	}
+	if stepSname != "" && stepSname != sname {
+		return false
+	}
+	return (sid != "" && stepSID == sid) || (sname != "" && stepSname == sname)
+}
+
+// assertSettledReview binds the approval to the loop's SETTLED attempt instead
+// of max-scanning attempt numbers over arbitrary descendants:
+//
+//  1. The terminal ralph control under root (gc.kind=ralph, closed,
+//     gc.outcome=pass) must exist and be unique.
+//  2. Its gc.attempt_log (the JSON array appendAttemptLogValue writes)
+//     settles the attempt - the last entry's attempt.
+//  3. That iteration's NATIVE review member must exist and be unique:
+//     gc.ralph_step_id == the control's step id, gc.step_ref ending
+//     ".<loop>.review" (scope-check beads end "-scope-check" and never match),
+//     gc.attempt == the settled attempt, closed with gc.outcome=pass.
+//  4. That member must carry review.verdict=approve and
+//     review.reviewed_sha == candidateSHA.
+//
+// apply / scope / control descendants copy approve and SHA fields (observed in
+// production roots), so they are never accepted as review proof: only the
+// native member at the settled attempt can approve. A stale-attempt approval of
+// the SAME SHA (an earlier iteration) is refused by the attempt binding.
+func assertSettledReview(store beads.Store, root, candidateSHA string) error {
+	if strings.TrimSpace(candidateSHA) == "" {
+		return fmt.Errorf("gc submit: review gate cannot verify approval with an empty candidate HEAD; refusing (sys-pxryan.50)")
+	}
+	all, err := store.List(beads.ListQuery{
+		Metadata:      map[string]string{"gc.root_bead_id": root},
+		IncludeClosed: true, // the loop is terminal (closed) by submit time
+		TierMode:      beads.TierBoth,
+	})
+	if err != nil {
+		return fmt.Errorf("gc submit: listing review beads under workflow %s: %w (sys-pxryan.50)", root, err)
+	}
+	var under []beads.Bead
+	var control *beads.Bead
+	for i := range all {
+		b := &all[i]
+		// Belt: verify the root in memory (backend-agnostic filter check).
+		if strings.TrimSpace(b.Metadata["gc.root_bead_id"]) != root {
+			continue
+		}
+		under = append(under, *b)
+		if strings.TrimSpace(b.Metadata["gc.kind"]) == "ralph" && b.Status == "closed" &&
+			strings.TrimSpace(b.Metadata["gc.outcome"]) == "pass" {
+			if control != nil {
+				return fmt.Errorf("gc submit: workflow %s has multiple terminal ralph controls; refusing (sys-pxryan.50)", root)
+			}
+			control = b
+		}
+	}
+	if control == nil {
+		return fmt.Errorf("gc submit: workflow %s has no terminal closed/pass ralph control; the review loop never settled, refusing to hand off review_required work (sys-pxryan.50)", root)
+	}
+	// Settled attempt = last entry of the control's gc.attempt_log (the same
+	// JSON shape appendAttemptLogValue writes).
+	var log []map[string]string
+	if raw := strings.TrimSpace(control.Metadata["gc.attempt_log"]); raw != "" {
+		if uerr := json.Unmarshal([]byte(raw), &log); uerr != nil {
+			return fmt.Errorf("gc submit: ralph control %s has a malformed gc.attempt_log: %v; refusing (sys-pxryan.50)", control.ID, uerr)
+		}
+	}
+	settled := ""
+	if len(log) > 0 {
+		settled = strings.TrimSpace(log[len(log)-1]["attempt"])
+	}
+	if settled == "" {
+		return fmt.Errorf("gc submit: ralph control %s has no settled attempt in gc.attempt_log; refusing (sys-pxryan.50)", control.ID)
+	}
+	loopID := strings.TrimSpace(control.Metadata["gc.step_id"])
+	if loopID == "" {
+		return fmt.Errorf("gc submit: ralph control %s has no gc.step_id; cannot identify its review member (sys-pxryan.50)", control.ID)
+	}
+	suffix := "." + loopID + ".review"
+	member := 0
+	var verdict, reviewedSHA string
+	for _, b := range under {
+		if strings.TrimSpace(b.Metadata["gc.ralph_step_id"]) != loopID {
+			continue
+		}
+		if strings.TrimSpace(b.Metadata["gc.kind"]) == "scope-check" {
+			continue // checker beads copy approve/SHA fields; not review proof
+		}
+		if !strings.HasSuffix(strings.TrimSpace(b.Metadata["gc.step_ref"]), suffix) {
+			continue // apply ("-apply") and scope-check ("-scope-check") never match
+		}
+		if strings.TrimSpace(b.Metadata["gc.attempt"]) != settled {
+			continue // stale-attempt approval (same or different SHA) must not bind
+		}
+		if b.Status != "closed" || strings.TrimSpace(b.Metadata["gc.outcome"]) != "pass" {
+			continue
+		}
+		member++
+		verdict = strings.TrimSpace(b.Metadata["review.verdict"])
+		reviewedSHA = strings.TrimSpace(b.Metadata["review.reviewed_sha"])
+	}
+	switch {
+	case member == 0:
+		return fmt.Errorf("gc submit: workflow %s has no native review member for settled attempt %s (loop %s); no independent approval exists, refusing (sys-pxryan.50)", root, settled, loopID)
+	case member > 1:
+		return fmt.Errorf("gc submit: workflow %s has %d native review members for settled attempt %s; refusing (sys-pxryan.50)", root, member, settled)
+	case verdict != "approve":
+		return fmt.Errorf("gc submit: workflow %s attempt %s has no review.verdict=approve (got %q); refusing to hand off review_required work to the refinery before an approval exists (sys-pxryan.50)", root, settled, verdict)
+	case reviewedSHA != candidateSHA:
+		return fmt.Errorf("gc submit: workflow %s attempt %s reviewed_sha=%q does not match the candidate SHA %s being pushed (stale or missing approval); refusing (sys-pxryan.50)", root, settled, reviewedSHA, candidateSHA)
+	}
+	return nil
+}
+
+// isVerifiedSubmitRef reports whether a gc.step_ref identifies the native
+// verified-submit step, in any formula and at any iteration depth
+// (e.g. "homeops-work-reviewed.verified-submit").
+func isVerifiedSubmitRef(ref string) bool {
+	ref = strings.TrimSpace(ref)
+	if ref == "" {
+		return false
+	}
+	parts := strings.Split(ref, ".")
+	return parts[len(parts)-1] == "verified-submit"
 }
 
 func submitResolveBeadID(store beads.Store, opts submitOptions, ops submitOps) (string, error) {

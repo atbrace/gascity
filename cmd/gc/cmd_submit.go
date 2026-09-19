@@ -448,14 +448,30 @@ func requireClaimedVerifiedSubmitStep(store beads.Store, sid, sname, root, workI
 	return nil
 }
 
-// stepClaimedBySession reports whether a step carries THIS session's exact
-// hook-claim stamp (gc.session_id / gc.session_name, written by
-// stampHookClaimIdentity at claim time). Assignee is deliberately NOT
-// consulted: a preassigned-but-unstamped step is not a claim, and any stamp
-// field naming a different session is a conflict - both are rejected even if
-// the assignee matches. At least one stamp field must positively identify this
-// session.
+// stepClaimedBySession reports whether a step is CURRENTLY owned by AND
+// claimed by THIS session. Both must hold together;
+// neither alone authorizes:
+//
+//	1. assignee ownership - the bead's Assignee is non-empty and equals this
+//	   session's id or name (the claim path assigns the session to the step).
+//	   Assignee alone is NOT enough: it is cleared on release and never set by
+//	   a raw preassignment.
+//	2. hook-claim stamp - gc.session_id / gc.session_name (written by
+//	   stampHookClaimIdentity at claim time) are present, name this session,
+//	   and are not conflicted. The stamp alone is NOT enough: ReleaseWorkBead
+//	   clears Assignee but leaves this metadata behind, so a released (or
+//	   foreign-reassigned) step keeps a stale matching stamp while its
+//	   ownership has moved on.
+//
+// A field that positively names a DIFFERENT session is a conflict -> fail
+// closed. At least one stamp field must positively identify this session.
 func stepClaimedBySession(b beads.Bead, sid, sname string) bool {
+	// (1) current exact assignee ownership.
+	assignee := strings.TrimSpace(b.Assignee)
+	if assignee == "" || (assignee != sid && assignee != sname) {
+		return false
+	}
+	// (2) matching, non-conflicting hook-claim stamp.
 	stepSID := strings.TrimSpace(b.Metadata["gc.session_id"])
 	stepSname := strings.TrimSpace(b.Metadata["gc.session_name"])
 	if stepSID == "" && stepSname == "" {

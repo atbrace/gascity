@@ -300,14 +300,19 @@ func guardWork() beads.Bead {
 }
 
 // guardStep is a native formula step; sid "" means stamped to no session
-// (preassigned but never claimed).
+// (preassigned but never claimed). A non-empty sid also sets Assignee to the
+// session name, mirroring the claim path (assignee = GC_SESSION_NAME).
 func guardStep(id, ref, status, sid string) beads.Bead {
-	return beads.Bead{ID: id, Title: id, Status: status,
+	b := beads.Bead{ID: id, Title: id, Status: status,
 		Metadata: map[string]string{
 			"gc.step_ref":     ref,
 			"gc.root_bead_id": "sys-root",
 			"gc.session_id":   sid,
 		}}
+	if sid != "" {
+		b.Assignee = "homeops__" + sid // claim path assigns the session name
+	}
+	return b
 }
 
 // guardControl is the terminal closed/pass ralph control for review-loop
@@ -512,6 +517,46 @@ func TestReviewSubmitRefusesForeignRootStep(t *testing.T) {
 	assertGuardRefusal(t, h, err)
 	if !strings.Contains(err.Error(), "not the verified-submit step") {
 		t.Fatalf("error should name the current-step mismatch, got: %v", err)
+	}
+}
+
+// Stale stamp, no owner: ReleaseWorkBead clears Assignee but leaves the
+// gc.session_id / gc.session_name claim metadata behind. The step still carries
+// THIS session's hook stamp ("gc-testsub") yet has no current owner, so the
+// lingering stamp alone must not authorize submit -> refuse before push or
+// store mutation.
+func TestReviewSubmitRefusesUnassignedStampedStep(t *testing.T) {
+	released := guardStep("sys-vs", "homeops-work-reviewed.verified-submit", "open", "gc-testsub")
+	released.Assignee = "" // release clears ownership; the old stamp persists
+	h := newGuardHarness(t, []beads.Bead{
+		guardWork(),
+		released,
+		guardControl("1"),
+		guardReviewMember("1", "approve", "abc123"),
+	})
+	_, err, _ := runGuardSubmit(t, h)
+	assertGuardRefusal(t, h, err)
+	if !strings.Contains(err.Error(), "no open step is claimed") {
+		t.Fatalf("error should say no open step is claimed (released, stale stamp), got: %v", err)
+	}
+}
+
+// Stale stamp, foreign owner: the hook stamp still names THIS session but the
+// current assignee is a DIFFERENT session (the step was reassigned). A stale
+// matching stamp plus foreign ownership must not authorize submit -> refuse.
+func TestReviewSubmitRefusesForeignAssigneeStaleStamp(t *testing.T) {
+	reassigned := guardStep("sys-vs", "homeops-work-reviewed.verified-submit", "open", "gc-testsub")
+	reassigned.Assignee = "homeops__gc-other" // ownership moved on; stamp is stale
+	h := newGuardHarness(t, []beads.Bead{
+		guardWork(),
+		reassigned,
+		guardControl("1"),
+		guardReviewMember("1", "approve", "abc123"),
+	})
+	_, err, _ := runGuardSubmit(t, h)
+	assertGuardRefusal(t, h, err)
+	if !strings.Contains(err.Error(), "no open step is claimed") {
+		t.Fatalf("error should say no open step is claimed (foreign assignee, stale stamp), got: %v", err)
 	}
 }
 

@@ -661,16 +661,48 @@ func workflowInputDone(store beads.Store, candidate beads.Bead, identityCandidat
 	if len(members) == 0 {
 		return root.ID, false, nil
 	}
+	var workflowSeats []string
 	for _, m := range members {
 		if convoy.IsTerminalStatus(m.Status) {
 			continue
 		}
 		if strings.TrimSpace(m.Assignee) != "" && !hookClaimHasIdentity(m.Assignee, identityCandidates) {
-			continue
+			// A seat that ran a step of this workflow is its own pool worker
+			// (typically dead, its steps reopened), not another lane: the
+			// member was never handed off (sys-pxryan.44).
+			if workflowSeats == nil {
+				workflowSeats, err = workflowStepAssignees(store, root.ID)
+				if err != nil {
+					return root.ID, false, err
+				}
+			}
+			if !hookClaimHasIdentity(m.Assignee, workflowSeats) {
+				continue
+			}
 		}
 		return root.ID, false, nil
 	}
 	return root.ID, true, nil
+}
+
+// workflowStepAssignees lists every assignee recorded on any step (open or
+// closed) of the workflow rooted at rootID.
+func workflowStepAssignees(store beads.Store, rootID string) ([]string, error) {
+	steps, err := store.List(beads.ListQuery{
+		Metadata:      map[string]string{beadmeta.RootBeadIDMetadataKey: rootID},
+		IncludeClosed: true,
+		TierMode:      beads.TierBoth,
+	})
+	if err != nil {
+		return nil, fmt.Errorf("listing steps of %s: %w", rootID, err)
+	}
+	seats := []string{}
+	for _, step := range steps {
+		if a := strings.TrimSpace(step.Assignee); a != "" {
+			seats = append(seats, a)
+		}
+	}
+	return seats, nil
 }
 
 // skipDoneWorkflow closes rootID and every open/in_progress step under it

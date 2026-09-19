@@ -19,6 +19,7 @@ import (
 	"github.com/gastownhall/gascity/internal/beads"
 	"github.com/gastownhall/gascity/internal/clock"
 	"github.com/gastownhall/gascity/internal/config"
+	"github.com/gastownhall/gascity/internal/convoy"
 	"github.com/gastownhall/gascity/internal/events"
 	"github.com/gastownhall/gascity/internal/fsys"
 	"github.com/gastownhall/gascity/internal/runtime"
@@ -11697,4 +11698,564 @@ func TestReconcileSessionBeads_NoWorkIdleClockFailsClosed(t *testing.T) {
 			t.Fatal("assigned-work probe error must fail closed (treated as has-work)")
 		}
 	})
+}
+
+// --- Agent drain-ack finalize fixtures (sys-30y0i.36.1, design sys-9h2gdx G1) ---
+//
+// These helpers model a pool seat that holds graph.v2 workflow steps when it
+// drain-acks. They are shared by the G1 release tests below and meant to be
+// extended by later drain-ack finalize tests, so each piece (workflow, step,
+// session, finalize, assertions) is its own helper rather than an inline seat.
+
+const drainAckTestRoute = "worker"
+
+// drainAckWorkflow is a graph.v2 workflow in one store: an input convoy that
+// tracks one input work bead, and a root that names that convoy.
+type drainAckWorkflow struct {
+	store  beads.Store
+	input  beads.Bead
+	convoy beads.Bead
+	root   beads.Bead
+}
+
+// seedDrainAckWorkflow pours a workflow into store. inputStatus is the input
+// work bead's status ("open", "in_progress", or "closed"); inputAssignee holds
+// it when non-empty.
+func seedDrainAckWorkflow(t *testing.T, store beads.Store, inputStatus, inputAssignee string) drainAckWorkflow {
+	t.Helper()
+	input, err := store.Create(beads.Bead{Title: "input work", Type: "task", Assignee: inputAssignee})
+	if err != nil {
+		t.Fatalf("Create(input): %v", err)
+	}
+	switch inputStatus {
+	case "closed":
+		if err := store.Close(input.ID); err != nil {
+			t.Fatalf("Close(input): %v", err)
+		}
+	case "in_progress":
+		status := "in_progress"
+		if err := store.Update(input.ID, beads.UpdateOpts{Status: &status}); err != nil {
+			t.Fatalf("Update(input in_progress): %v", err)
+		}
+	}
+	conv, err := store.Create(beads.Bead{Title: "input convoy", Type: "convoy"})
+	if err != nil {
+		t.Fatalf("Create(convoy): %v", err)
+	}
+	if err := convoy.TrackItem(store, conv.ID, input.ID); err != nil {
+		t.Fatalf("TrackItem: %v", err)
+	}
+	root, err := store.Create(beads.Bead{Title: "workflow root", Type: "task", Metadata: map[string]string{
+		beadmeta.KindMetadataKey:          beadmeta.KindWorkflow,
+		beadmeta.InputConvoyIDMetadataKey: conv.ID,
+		beadmeta.RoutedToMetadataKey:      drainAckTestRoute,
+	}})
+	if err != nil {
+		t.Fatalf("Create(root): %v", err)
+	}
+	return drainAckWorkflow{store: store, input: input, convoy: conv, root: root}
+}
+
+// addStep creates a routed step of the workflow with the given status and
+// assignee. An assigned step carries session affinity, as a claimed step does.
+func (w drainAckWorkflow) addStep(t *testing.T, ref, status, assignee string) beads.Bead {
+	t.Helper()
+	meta := map[string]string{
+		beadmeta.RootBeadIDMetadataKey:        w.root.ID,
+		beadmeta.StepRefMetadataKey:           "wf." + ref,
+		beadmeta.RoutedToMetadataKey:          drainAckTestRoute,
+		beadmeta.ContinuationGroupMetadataKey: "pool-workflow",
+	}
+	if assignee != "" {
+		meta[beadmeta.SessionAffinityMetadataKey] = "require"
+	}
+	step, err := w.store.Create(beads.Bead{Title: ref, Type: "task", Assignee: assignee, Metadata: meta})
+	if err != nil {
+		t.Fatalf("Create(step %s): %v", ref, err)
+	}
+	switch status {
+	case "closed":
+		if err := w.store.Close(step.ID); err != nil {
+			t.Fatalf("Close(step %s): %v", ref, err)
+		}
+	case "in_progress":
+		st := "in_progress"
+		if err := w.store.Update(step.ID, beads.UpdateOpts{Status: &st}); err != nil {
+			t.Fatalf("Update(step %s in_progress): %v", ref, err)
+		}
+	}
+	return step
+}
+
+// createDrainAckStoppedSession creates a session bead in env.store that has
+// drain-acked and whose runtime is confirmed stopped (stop-pending), the state
+// finalizeDrainAckStoppedSession runs from.
+func (e *reconcilerTestEnv) createDrainAckStoppedSession(t *testing.T, name, template string) beads.Bead {
+	t.Helper()
+	session := e.createSessionBead(name, template)
+	patch := sessionpkg.DrainAckStopPendingPatch(e.clk.Now().UTC())
+	patch[poolManagedMetadataKey] = boolMetadata(true)
+	if err := e.store.SetMetadataBatch(session.ID, patch); err != nil {
+		t.Fatalf("SetMetadataBatch(stop-pending): %v", err)
+	}
+	session.Metadata = patch.Apply(session.Metadata)
+	return session
+}
+
+// finalizeAgentDrainAck runs the agent-sourced drain-ack finalize for a pool
+// seat (closeIfUnassigned=true) and returns the persisted session bead.
+func (e *reconcilerTestEnv) finalizeAgentDrainAck(t *testing.T, cityPath string, rigStores map[string]beads.Store, session beads.Bead) beads.Bead {
+	t.Helper()
+	finalizeDrainAckStoppedSession(
+		cityPath, e.cfg, e.store, rigStores, e.sessionInfo(session.ID), session.Metadata["template"], true,
+		newFakeDrainOps(), e.dt, e.clk, e.rec, &e.stderr,
+	)
+	got, err := e.store.Get(session.ID)
+	if err != nil {
+		t.Fatalf("Get(session %s): %v", session.ID, err)
+	}
+	return got
+}
+
+func assertDrainAckSeatParked(t *testing.T, session beads.Bead) {
+	t.Helper()
+	if session.Status == "closed" {
+		t.Fatalf("session bead closed, want it parked: metadata=%v", session.Metadata)
+	}
+	if session.Metadata["state"] != "asleep" || session.Metadata["sleep_reason"] != "idle" {
+		t.Fatalf("state=%q sleep_reason=%q, want asleep/idle", session.Metadata["state"], session.Metadata["sleep_reason"])
+	}
+}
+
+// assertStepReleased checks a step was handed back to the pool: open, no
+// assignee, no session affinity, route kept, no outcome.
+func assertStepReleased(t *testing.T, store beads.Store, id string) {
+	t.Helper()
+	got, err := store.Get(id)
+	if err != nil {
+		t.Fatalf("Get(%s): %v", id, err)
+	}
+	if got.Status != "open" || got.Assignee != "" {
+		t.Fatalf("step %s status=%q assignee=%q, want open and unassigned", id, got.Status, got.Assignee)
+	}
+	for _, key := range beadmeta.SessionAffinityMetadataKeys {
+		if got.Metadata[key] != "" {
+			t.Fatalf("step %s %s=%q, want cleared", id, key, got.Metadata[key])
+		}
+	}
+	if got.Metadata[beadmeta.RoutedToMetadataKey] != drainAckTestRoute {
+		t.Fatalf("step %s route=%q, want %q kept", id, got.Metadata[beadmeta.RoutedToMetadataKey], drainAckTestRoute)
+	}
+	if got.Metadata[beadmeta.OutcomeMetadataKey] != "" {
+		t.Fatalf("step %s gc.outcome=%q, want none", id, got.Metadata[beadmeta.OutcomeMetadataKey])
+	}
+}
+
+// assertBeadUnchanged checks a bead still has the status and assignee it was
+// created with, and no outcome.
+func assertBeadUnchanged(t *testing.T, store beads.Store, want beads.Bead) {
+	t.Helper()
+	got, err := store.Get(want.ID)
+	if err != nil {
+		t.Fatalf("Get(%s): %v", want.ID, err)
+	}
+	if got.Status != want.Status || got.Assignee != want.Assignee {
+		t.Fatalf("bead %s status=%q assignee=%q, want status=%q assignee=%q", want.ID, got.Status, got.Assignee, want.Status, want.Assignee)
+	}
+	if got.Metadata[beadmeta.OutcomeMetadataKey] != "" {
+		t.Fatalf("bead %s gc.outcome=%q, want none", want.ID, got.Metadata[beadmeta.OutcomeMetadataKey])
+	}
+}
+
+func getDrainAckBead(t *testing.T, store beads.Store, id string) beads.Bead {
+	t.Helper()
+	got, err := store.Get(id)
+	if err != nil {
+		t.Fatalf("Get(%s): %v", id, err)
+	}
+	return got
+}
+
+func drainAckedWithAssignedWorkEvents(rec *events.Fake) int {
+	n := 0
+	for _, ev := range rec.Events {
+		if ev.Type == events.SessionDrainAckedWithAssignedWork {
+			n++
+		}
+	}
+	return n
+}
+
+func newDrainAckFinalizeEnv() (*reconcilerTestEnv, *events.Fake) {
+	env := newReconcilerTestEnv()
+	env.cfg = &config.City{Agents: []config.Agent{{Name: drainAckTestRoute}}}
+	fake := events.NewFake()
+	env.rec = fake
+	return env, fake
+}
+
+// Acceptance 1: the gc-os20j4 shape. The seat holds an in_progress admission
+// step and two pre-assigned downstream steps of one root whose input convoy is
+// closed. The agent drain-ack closes the seat and hands all three steps back
+// to the pool.
+func TestFinalizeDrainAckReleasesStepsOfClosedInputWorkflow(t *testing.T) {
+	env, fake := newDrainAckFinalizeEnv()
+	session := env.createDrainAckStoppedSession(t, "worker", drainAckTestRoute)
+	wf := seedDrainAckWorkflow(t, env.store, "closed", "")
+	admission := wf.addStep(t, "admission", "in_progress", session.ID)
+	fix := wf.addStep(t, "fix", "open", session.ID)
+	review := wf.addStep(t, "review", "open", session.ID)
+	if err := env.store.DepAdd(fix.ID, admission.ID, "blocks"); err != nil {
+		t.Fatalf("DepAdd: %v", err)
+	}
+	if err := env.store.DepAdd(review.ID, fix.ID, "blocks"); err != nil {
+		t.Fatalf("DepAdd: %v", err)
+	}
+	rootBefore := getDrainAckBead(t, env.store, wf.root.ID)
+
+	got := env.finalizeAgentDrainAck(t, "", nil, session)
+
+	if got.Status != "closed" {
+		t.Fatalf("session bead status=%q, want closed: metadata=%v stderr=%s", got.Status, got.Metadata, env.stderr.String())
+	}
+	for _, id := range []string{admission.ID, fix.ID, review.ID} {
+		assertStepReleased(t, env.store, id)
+	}
+	assertBeadUnchanged(t, env.store, rootBefore)
+	if n := drainAckedWithAssignedWorkEvents(fake); n != 0 {
+		t.Fatalf("%s events = %d, want 0 once the seat closes", events.SessionDrainAckedWithAssignedWork, n)
+	}
+
+	// The closed seat is not woken again: nothing is assigned to it any more.
+	has, err := sessionHasOpenAssignedWorkForReachableStore("", env.cfg, env.store, nil, env.sessionInfo(got.ID))
+	if err != nil || has {
+		t.Fatalf("closed seat still has assigned work: has=%v err=%v", has, err)
+	}
+	// The released admission step is Ready and counts as pool demand for its route.
+	demand, _, _ := collectOpenUnassignedRoutedWork(env.cfg, env.store, nil, nil, io.Discard)
+	var admissionDemand bool
+	for _, b := range demand {
+		if b.ID == admission.ID {
+			admissionDemand = true
+		}
+	}
+	if !admissionDemand {
+		t.Fatalf("released admission step %s is not pool demand for %q: demand=%v", admission.ID, drainAckTestRoute, demand)
+	}
+	ready, err := env.store.Ready()
+	if err != nil {
+		t.Fatalf("Ready: %v", err)
+	}
+	var admissionReady bool
+	for _, b := range ready {
+		if b.ID == admission.ID {
+			admissionReady = true
+		}
+	}
+	if !admissionReady {
+		t.Fatalf("released admission step %s is not Ready", admission.ID)
+	}
+}
+
+// Acceptance 2: the self-closing workflow. A completed step closed the
+// workflow's own input (record-terminal), and the same seat holds the
+// downstream steps (split-and-link, finalize). None of them is closed or
+// skipped: each goes back to the pool open and routed, and a fresh seat of
+// the route can claim the Ready one.
+func TestFinalizeDrainAckSelfClosingWorkflowKeepsDownstreamStepsOpen(t *testing.T) {
+	env, _ := newDrainAckFinalizeEnv()
+	session := env.createDrainAckStoppedSession(t, "worker", drainAckTestRoute)
+	wf := seedDrainAckWorkflow(t, env.store, "open", "")
+	recordTerminal := wf.addStep(t, "record-terminal", "open", session.ID)
+	splitAndLink := wf.addStep(t, "split-and-link", "open", session.ID)
+	finalize := wf.addStep(t, "finalize", "open", session.ID)
+	if err := env.store.DepAdd(finalize.ID, splitAndLink.ID, "blocks"); err != nil {
+		t.Fatalf("DepAdd: %v", err)
+	}
+	// record-terminal closes the workflow's own input, then its step.
+	if err := env.store.Close(wf.input.ID); err != nil {
+		t.Fatalf("Close(input): %v", err)
+	}
+	if err := env.store.Close(recordTerminal.ID); err != nil {
+		t.Fatalf("Close(record-terminal): %v", err)
+	}
+
+	got := env.finalizeAgentDrainAck(t, "", nil, session)
+
+	if got.Status != "closed" {
+		t.Fatalf("session bead status=%q, want closed: metadata=%v", got.Status, got.Metadata)
+	}
+	assertStepReleased(t, env.store, splitAndLink.ID)
+	assertStepReleased(t, env.store, finalize.ID)
+
+	ready, err := env.store.Ready()
+	if err != nil {
+		t.Fatalf("Ready: %v", err)
+	}
+	var splitReady, finalizeReady bool
+	for _, b := range ready {
+		switch b.ID {
+		case splitAndLink.ID:
+			splitReady = true
+		case finalize.ID:
+			finalizeReady = true
+		}
+	}
+	if !splitReady || finalizeReady {
+		t.Fatalf("Ready split-and-link=%v finalize=%v, want split-and-link claimable and finalize still blocked", splitReady, finalizeReady)
+	}
+	fresh := env.createSessionBead("worker-2", drainAckTestRoute)
+	claimed := getDrainAckBead(t, env.store, splitAndLink.ID)
+	claimed.Assignee = fresh.ID
+	if err := env.store.Update(splitAndLink.ID, beads.UpdateOpts{Assignee: &claimed.Assignee}); err != nil {
+		t.Fatalf("fresh seat claim of %s: %v", splitAndLink.ID, err)
+	}
+}
+
+// Acceptance 3: an input member is still open. Today's behavior: the seat
+// parks and keeps its steps.
+func TestFinalizeDrainAckOpenInputParksSeat(t *testing.T) {
+	env, fake := newDrainAckFinalizeEnv()
+	session := env.createDrainAckStoppedSession(t, "worker", drainAckTestRoute)
+	wf := seedDrainAckWorkflow(t, env.store, "open", "")
+	step := wf.addStep(t, "admission", "in_progress", session.ID)
+	stepBefore := getDrainAckBead(t, env.store, step.ID)
+
+	got := env.finalizeAgentDrainAck(t, "", nil, session)
+
+	assertDrainAckSeatParked(t, got)
+	assertBeadUnchanged(t, env.store, stepBefore)
+	if n := drainAckedWithAssignedWorkEvents(fake); n != 1 {
+		t.Fatalf("%s events = %d, want 1", events.SessionDrainAckedWithAssignedWork, n)
+	}
+}
+
+// Acceptance 4: an input member is in_progress and held by another live seat
+// (the handed-off shape). The input is not terminal, so nothing moves.
+func TestFinalizeDrainAckHandedOffInputParksSeat(t *testing.T) {
+	env, _ := newDrainAckFinalizeEnv()
+	session := env.createDrainAckStoppedSession(t, "worker", drainAckTestRoute)
+	other := env.createSessionBead("refinery", "refinery")
+	wf := seedDrainAckWorkflow(t, env.store, "in_progress", other.ID)
+	step := wf.addStep(t, "review", "open", session.ID)
+	stepBefore := getDrainAckBead(t, env.store, step.ID)
+	inputBefore := getDrainAckBead(t, env.store, wf.input.ID)
+
+	got := env.finalizeAgentDrainAck(t, "", nil, session)
+
+	assertDrainAckSeatParked(t, got)
+	assertBeadUnchanged(t, env.store, stepBefore)
+	assertBeadUnchanged(t, env.store, inputBefore)
+}
+
+// Acceptance 5: the seat also holds a bead that is not releasable (its
+// in_progress work bead of a workflow whose input is open). Nothing is
+// released and the seat parks.
+func TestFinalizeDrainAckMixedHoldingsReleasesNothing(t *testing.T) {
+	env, _ := newDrainAckFinalizeEnv()
+	session := env.createDrainAckStoppedSession(t, "worker", drainAckTestRoute)
+	done := seedDrainAckWorkflow(t, env.store, "closed", "")
+	releasable := done.addStep(t, "admission", "in_progress", session.ID)
+	live := seedDrainAckWorkflow(t, env.store, "open", "")
+	held := live.addStep(t, "fix", "in_progress", session.ID)
+	releasableBefore := getDrainAckBead(t, env.store, releasable.ID)
+	heldBefore := getDrainAckBead(t, env.store, held.ID)
+
+	got := env.finalizeAgentDrainAck(t, "", nil, session)
+
+	assertDrainAckSeatParked(t, got)
+	assertBeadUnchanged(t, env.store, releasableBefore)
+	assertBeadUnchanged(t, env.store, heldBefore)
+}
+
+// Acceptance 6: a step of the same root held by another session is untouched
+// when the acking seat closes and releases its own steps.
+func TestFinalizeDrainAckLeavesSiblingSeatStepAlone(t *testing.T) {
+	env, _ := newDrainAckFinalizeEnv()
+	session := env.createDrainAckStoppedSession(t, "worker", drainAckTestRoute)
+	sibling := env.createSessionBead("worker-2", drainAckTestRoute)
+	wf := seedDrainAckWorkflow(t, env.store, "closed", "")
+	mine := wf.addStep(t, "review", "open", session.ID)
+	theirs := wf.addStep(t, "apply", "in_progress", sibling.ID)
+	theirsBefore := getDrainAckBead(t, env.store, theirs.ID)
+
+	got := env.finalizeAgentDrainAck(t, "", nil, session)
+
+	if got.Status != "closed" {
+		t.Fatalf("session bead status=%q, want closed", got.Status)
+	}
+	assertStepReleased(t, env.store, mine.ID)
+	assertBeadUnchanged(t, env.store, theirsBefore)
+	if affinity := getDrainAckBead(t, env.store, theirs.ID).Metadata[beadmeta.SessionAffinityMetadataKey]; affinity != "require" {
+		t.Fatalf("sibling step affinity=%q, want kept", affinity)
+	}
+}
+
+// Acceptance 7: an open, unassigned human-gate step and the root itself are
+// untouched when the seat releases its steps.
+func TestFinalizeDrainAckLeavesHumanGateAndRootAlone(t *testing.T) {
+	env, _ := newDrainAckFinalizeEnv()
+	session := env.createDrainAckStoppedSession(t, "worker", drainAckTestRoute)
+	wf := seedDrainAckWorkflow(t, env.store, "closed", "")
+	mine := wf.addStep(t, "fix", "open", session.ID)
+	gate, err := env.store.Create(beads.Bead{Title: "human gate", Type: "task", Labels: []string{"human"}, Metadata: map[string]string{
+		beadmeta.RootBeadIDMetadataKey: wf.root.ID,
+		beadmeta.StepRefMetadataKey:    "wf.gate",
+	}})
+	if err != nil {
+		t.Fatalf("Create(gate): %v", err)
+	}
+	gate = getDrainAckBead(t, env.store, gate.ID)
+	rootBefore := getDrainAckBead(t, env.store, wf.root.ID)
+
+	got := env.finalizeAgentDrainAck(t, "", nil, session)
+
+	if got.Status != "closed" {
+		t.Fatalf("session bead status=%q, want closed", got.Status)
+	}
+	assertStepReleased(t, env.store, mine.ID)
+	assertBeadUnchanged(t, env.store, gate)
+	assertBeadUnchanged(t, env.store, rootBefore)
+}
+
+// Acceptance 8: a reconciler-owned drain keeps its existing logic. A live seat
+// the reconciler drains while it holds steps of a closed-input workflow has
+// the drain canceled for assigned work, and keeps its steps.
+func TestReconcilerOwnedDrainOfClosedInputSeatStillCanceled(t *testing.T) {
+	env := newReconcilerTestEnv()
+	env.cfg = &config.City{Agents: []config.Agent{{Name: "worker"}}}
+	env.addDesired("worker", "worker", true)
+	session := env.createSessionBead("worker", "worker")
+	env.markSessionActive(&session)
+	wf := seedDrainAckWorkflow(t, env.store, "closed", "")
+	step := wf.addStep(t, "admission", "in_progress", session.ID)
+	stepBefore := getDrainAckBead(t, env.store, step.ID)
+	if err := setReconcilerDrainAckMetadata(env.sp, "worker", &drainState{
+		reason:     "no-wake-reason",
+		generation: 1,
+		ackSet:     true,
+	}); err != nil {
+		t.Fatalf("setReconcilerDrainAckMetadata: %v", err)
+	}
+	env.dt.set(session.ID, &drainState{
+		startedAt:  env.clk.Now().Add(-defaultDrainTimeout),
+		deadline:   env.clk.Now().Add(-time.Second),
+		reason:     "no-wake-reason",
+		generation: 1,
+		ackSet:     true,
+	})
+
+	reconcileSessionBeadsAtPath(
+		context.Background(),
+		"",
+		[]beads.Bead{session},
+		env.desiredState,
+		nil,
+		env.cfg,
+		env.sp,
+		env.store,
+		newDrainOps(env.sp),
+		[]beads.Bead{stepBefore},
+		nil,
+		nil,
+		env.dt,
+		map[string]int{"worker": 1},
+		false,
+		nil,
+		"",
+		nil,
+		env.clk,
+		env.rec,
+		0,
+		0,
+		&env.stdout,
+		&env.stderr,
+	)
+
+	if !env.sp.IsRunning("worker") {
+		t.Fatal("reconciler-owned drain of a seat with assigned work should be canceled, not stopped")
+	}
+	if ds := env.dt.get(session.ID); ds != nil {
+		t.Fatalf("drain = %+v, want canceled", ds)
+	}
+	if got := getDrainAckBead(t, env.store, session.ID); got.Status == "closed" {
+		t.Fatalf("session bead closed by a reconciler-owned drain: metadata=%v", got.Metadata)
+	}
+	assertBeadUnchanged(t, env.store, stepBefore)
+}
+
+// Acceptance 9: store tiers. The steps, root, and input convoy live in the rig
+// store while the session bead lives in the city store. The input resolves in
+// the rig store, the seat closes, and the next tick's orphan release hands the
+// rig-store steps back to the pool.
+func TestFinalizeDrainAckReleasesRigStoreStepsOnNextTick(t *testing.T) {
+	cityPath := t.TempDir()
+	rigPath := filepath.Join(cityPath, "riga")
+	env, _ := newDrainAckFinalizeEnv()
+	env.cfg = &config.City{
+		Rigs:   []config.Rig{{Name: "riga", Path: rigPath}},
+		Agents: []config.Agent{{Name: drainAckTestRoute, Dir: "riga"}},
+	}
+	rigStore := beads.NewMemStore()
+	rigStores := map[string]beads.Store{"riga": rigStore}
+	session := env.createDrainAckStoppedSession(t, "worker", "riga/"+drainAckTestRoute)
+	wf := seedDrainAckWorkflow(t, rigStore, "closed", "")
+	admission := wf.addStep(t, "admission", "in_progress", session.ID)
+	fix := wf.addStep(t, "fix", "open", session.ID)
+	for _, id := range []string{admission.ID, fix.ID} {
+		route := "riga/" + drainAckTestRoute
+		if err := rigStore.SetMetadata(id, beadmeta.RoutedToMetadataKey, route); err != nil {
+			t.Fatalf("SetMetadata(route %s): %v", id, err)
+		}
+	}
+
+	got := env.finalizeAgentDrainAck(t, cityPath, rigStores, session)
+
+	if got.Status != "closed" {
+		t.Fatalf("session bead status=%q, want closed: metadata=%v stderr=%s", got.Status, got.Metadata, env.stderr.String())
+	}
+	// closeBead releases only the session's own (city) store; the rig-store
+	// steps are still assigned until the next tick.
+	if a := getDrainAckBead(t, rigStore, admission.ID).Assignee; a != session.ID {
+		t.Fatalf("rig step assignee before next tick = %q, want %q", a, session.ID)
+	}
+
+	assigned := []beads.Bead{getDrainAckBead(t, rigStore, admission.ID), getDrainAckBead(t, rigStore, fix.ID)}
+	released := releaseOrphanedPoolAssignments(env.store, env.cfg, cityPath, nil, assigned, []beads.Store{rigStore, rigStore}, nil, rigStores)
+	if len(released) != 2 {
+		t.Fatalf("next-tick orphan release released %v, want both rig-store steps", released)
+	}
+	for _, id := range []string{admission.ID, fix.ID} {
+		step := getDrainAckBead(t, rigStore, id)
+		if step.Status != "open" || step.Assignee != "" {
+			t.Fatalf("rig step %s status=%q assignee=%q, want open and unassigned", id, step.Status, step.Assignee)
+		}
+		if step.Metadata[beadmeta.RoutedToMetadataKey] != "riga/"+drainAckTestRoute {
+			t.Fatalf("rig step %s route=%q, want kept", id, step.Metadata[beadmeta.RoutedToMetadataKey])
+		}
+		if step.Metadata[beadmeta.OutcomeMetadataKey] != "" {
+			t.Fatalf("rig step %s gc.outcome=%q, want none", id, step.Metadata[beadmeta.OutcomeMetadataKey])
+		}
+	}
+}
+
+// A seat that is not closed on drain-ack (a desired, non-pool session) keeps
+// judging closed-input steps as assigned work and parks exactly as before.
+func TestFinalizeDrainAckWithoutCloseStillParksOnClosedInputSteps(t *testing.T) {
+	env, fake := newDrainAckFinalizeEnv()
+	session := env.createDrainAckStoppedSession(t, "worker", drainAckTestRoute)
+	wf := seedDrainAckWorkflow(t, env.store, "closed", "")
+	step := wf.addStep(t, "admission", "in_progress", session.ID)
+	stepBefore := getDrainAckBead(t, env.store, step.ID)
+
+	finalizeDrainAckStoppedSession(
+		"", env.cfg, env.store, nil, env.sessionInfo(session.ID), drainAckTestRoute, false,
+		newFakeDrainOps(), env.dt, env.clk, env.rec, &env.stderr,
+	)
+
+	assertDrainAckSeatParked(t, getDrainAckBead(t, env.store, session.ID))
+	assertBeadUnchanged(t, env.store, stepBefore)
+	if n := drainAckedWithAssignedWorkEvents(fake); n != 1 {
+		t.Fatalf("%s events = %d, want 1", events.SessionDrainAckedWithAssignedWork, n)
+	}
 }

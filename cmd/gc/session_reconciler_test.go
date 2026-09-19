@@ -12259,3 +12259,46 @@ func TestFinalizeDrainAckWithoutCloseStillParksOnClosedInputSteps(t *testing.T) 
 		t.Fatalf("%s events = %d, want 1", events.SessionDrainAckedWithAssignedWork, n)
 	}
 }
+
+func TestWorkflowStepInputTerminal(t *testing.T) {
+	store := beads.NewMemStore()
+	closed := seedDrainAckWorkflow(t, store, "closed", "")
+	open := seedDrainAckWorkflow(t, store, "open", "")
+	handedOff := seedDrainAckWorkflow(t, store, "in_progress", "someone-else")
+	noConvoy, err := store.Create(beads.Bead{Title: "root without input", Type: "task"})
+	if err != nil {
+		t.Fatalf("Create: %v", err)
+	}
+	emptyConvoy, err := store.Create(beads.Bead{Title: "empty convoy", Type: "convoy"})
+	if err != nil {
+		t.Fatalf("Create: %v", err)
+	}
+	emptyRoot, err := store.Create(beads.Bead{Title: "root with empty convoy", Type: "task", Metadata: map[string]string{
+		beadmeta.InputConvoyIDMetadataKey: emptyConvoy.ID,
+	}})
+	if err != nil {
+		t.Fatalf("Create: %v", err)
+	}
+	step := func(rootID string) beads.Bead {
+		return beads.Bead{ID: "step-" + rootID, Metadata: map[string]string{beadmeta.RootBeadIDMetadataKey: rootID}}
+	}
+	cases := []struct {
+		name string
+		item beads.Bead
+		want bool
+	}{
+		{"closed input", step(closed.root.ID), true},
+		{"open input", step(open.root.ID), false},
+		{"input held by another seat", step(handedOff.root.ID), false},
+		{"root without input convoy", step(noConvoy.ID), false},
+		{"input convoy without members", step(emptyRoot.ID), false},
+		{"missing root", step("no-such-root"), false},
+		{"not a workflow step", beads.Bead{ID: "plain"}, false},
+		{"the root itself", closed.root, false},
+	}
+	for _, tc := range cases {
+		if got := workflowStepInputTerminal(store, tc.item); got != tc.want {
+			t.Errorf("%s: workflowStepInputTerminal = %v, want %v", tc.name, got, tc.want)
+		}
+	}
+}

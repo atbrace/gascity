@@ -94,7 +94,9 @@ func closeSessionInfoIfUnassigned(
 // excludeOwnDrainStep selects the drain-ack close-gate form of the
 // assigned-work probe (sessionHasOpenAssignedWorkForReachableStoreForCloseGate),
 // which excludes the session's own mol-do-work "drain" step so a session that
-// has already signaled completion is not judged to still have work.
+// has already signaled completion is not judged to still have work, and
+// graph.v2 steps whose workflow input is terminal, which the close hands back
+// to the pool.
 // Pass true ONLY from the drain-ack finalize path; every
 // other caller (failed-create close, generic idle/config-drift close) passes
 // false to keep its existing behavior unchanged.
@@ -112,11 +114,13 @@ func closeSessionBeadIfReachableStoreUnassigned(
 	if stderr == nil {
 		stderr = io.Discard
 	}
-	assignedWorkProbe := sessionHasOpenAssignedWorkForReachableStore
+	var hasAssignedWork bool
+	var err error
 	if excludeOwnDrainStep {
-		assignedWorkProbe = sessionHasOpenAssignedWorkForReachableStoreForCloseGate
+		hasAssignedWork, err = sessionHasOpenAssignedWorkForReachableStoreForCloseGate(cityPath, cfg, store, rigStores, info, true)
+	} else {
+		hasAssignedWork, err = sessionHasOpenAssignedWorkForReachableStore(cityPath, cfg, store, rigStores, info)
 	}
-	hasAssignedWork, err := assignedWorkProbe(cityPath, cfg, store, rigStores, info)
 	if err != nil {
 		fmt.Fprintf(stderr, "session work guard: checking reachable assigned work for %s: %v\n", info.ID, err) //nolint:errcheck
 		return false

@@ -27,6 +27,7 @@ import (
 	"github.com/gastownhall/gascity/internal/beads"
 	"github.com/gastownhall/gascity/internal/clock"
 	"github.com/gastownhall/gascity/internal/config"
+	"github.com/gastownhall/gascity/internal/convoy"
 	"github.com/gastownhall/gascity/internal/events"
 	"github.com/gastownhall/gascity/internal/runtime"
 	sessionpkg "github.com/gastownhall/gascity/internal/session"
@@ -539,7 +540,10 @@ func finalizeDrainAckStoppedSession(
 			Payload:   api.SessionLifecyclePayloadJSON(info.ID, template, "drain acknowledged"),
 		})
 	}
-	hasAssignedWork, assignedErr := sessionHasOpenAssignedWorkForReachableStoreForCloseGate(cityPath, cfg, store, rigStores, info)
+	// Only a drain-ack that may close the seat looks past steps whose workflow
+	// input is terminal: the close hands them back to the pool. A seat that
+	// stays open keeps judging them as assigned work, exactly as before.
+	hasAssignedWork, assignedErr := sessionHasOpenAssignedWorkForReachableStoreForCloseGate(cityPath, cfg, store, rigStores, info, closeIfUnassigned)
 	if assignedErr != nil {
 		fmt.Fprintf(stderr, "session reconciler: checking assigned work for drain-acked %s: %v\n", name, assignedErr) //nolint:errcheck
 		hasAssignedWork = true
@@ -585,7 +589,7 @@ func finalizeDrainAckStoppedSession(
 			recordStopped(false)
 			return drainAckFinalizeResult{witnessInfo: &witnessInfo}
 		}
-		assignedAfterCloseGate, closeGateAssignedErr := sessionHasOpenAssignedWorkForReachableStoreForCloseGate(cityPath, cfg, store, rigStores, info)
+		assignedAfterCloseGate, closeGateAssignedErr := sessionHasOpenAssignedWorkForReachableStoreForCloseGate(cityPath, cfg, store, rigStores, info, true)
 		if closeGateAssignedErr != nil {
 			fmt.Fprintf(stderr, "session reconciler: checking assigned work after failed drain-ack close gate for %s: %v\n", name, closeGateAssignedErr) //nolint:errcheck
 			assignedAfterCloseGate = true
@@ -4006,12 +4010,23 @@ func poolSessionNoAssignedWorkIdle(
 // own drain step — only the drain-ack close decision should. Use this function
 // (and closeSessionBeadIfReachableStoreUnassigned's excludeOwnDrainStep=true form)
 // ONLY from the drain-ack finalize path.
+//
+// releaseClosedInputSteps additionally ignores graph.v2 steps whose workflow
+// input is terminal (workflowStepInputTerminal). Closing the seat then hands
+// those steps back to the pool through the existing release paths
+// (releaseWorkFromClosedSessionBead for the session's own store,
+// releaseOrphanedPoolAssignments on the next tick for rig stores), which clear
+// the assignee and session affinity, reset in_progress to open, and keep the
+// route. Nothing is closed, skipped, or given an outcome. Without it, a seat
+// holding such a step parks on every drain-ack and is woken straight back
+// onto it, because nothing else ever releases the step.
 func sessionHasOpenAssignedWorkForReachableStoreForCloseGate(
 	cityPath string,
 	cfg *config.City,
 	store beads.Store,
 	rigStores map[string]beads.Store,
 	info sessionpkg.Info,
+	releaseClosedInputSteps bool,
 ) (bool, error) {
 	identifiers := sessionAssignmentIdentifiersForConfigInfo(info, cfg)
 	stores, err := reachableStoresForSessionInfo(cityPath, cfg, store, rigStores, info)
@@ -4019,18 +4034,18 @@ func sessionHasOpenAssignedWorkForReachableStoreForCloseGate(
 		return false, err
 	}
 	for _, s := range stores {
-		if has, err := sessionHasOpenAssignedWorkInStoreByIdentifiersForCloseGate(s, identifiers); err != nil || has {
+		if has, err := sessionHasOpenAssignedWorkInStoreByIdentifiersForCloseGate(s, identifiers, releaseClosedInputSteps); err != nil || has {
 			return has, err
 		}
 	}
 	return false, nil
 }
 
-func sessionHasOpenAssignedWorkInStoreByIdentifiersForCloseGate(store beads.Store, identifiers []string) (bool, error) {
-	return sessionHasAssignedWorkInStoreByIdentifiersForStatusesForCloseGate(store, identifiers, []string{"open", "in_progress"})
+func sessionHasOpenAssignedWorkInStoreByIdentifiersForCloseGate(store beads.Store, identifiers []string, releaseClosedInputSteps bool) (bool, error) {
+	return sessionHasAssignedWorkInStoreByIdentifiersForStatusesForCloseGate(store, identifiers, []string{"open", "in_progress"}, releaseClosedInputSteps)
 }
 
-func sessionHasAssignedWorkInStoreByIdentifiersForStatusesForCloseGate(store beads.Store, identifiers []string, statuses []string) (bool, error) {
+func sessionHasAssignedWorkInStoreByIdentifiersForStatusesForCloseGate(store beads.Store, identifiers []string, statuses []string, releaseClosedInputSteps bool) (bool, error) {
 	if store == nil {
 		return false, nil
 	}
@@ -4045,10 +4060,10 @@ func sessionHasAssignedWorkInStoreByIdentifiersForStatusesForCloseGate(store bea
 				continue
 			}
 			seen[key] = struct{}{}
-			if has, err := sessionHasOpenAssignedWorkForTierForCloseGate(store, assignee, status, beads.TierIssues, true); err != nil || has {
+			if has, err := sessionHasOpenAssignedWorkForTierForCloseGate(store, assignee, status, beads.TierIssues, true, releaseClosedInputSteps); err != nil || has {
 				return has, err
 			}
-			if has, err := sessionHasOpenAssignedWispWorkForCloseGate(store, assignee, status); err != nil || has {
+			if has, err := sessionHasOpenAssignedWispWorkForCloseGate(store, assignee, status, releaseClosedInputSteps); err != nil || has {
 				return has, err
 			}
 		}
@@ -4060,13 +4075,13 @@ func sessionHasAssignedWorkInStoreByIdentifiersForStatusesForCloseGate(store bea
 // but filters through hasNonSessionNonOwnDrainStepWork instead of the shared
 // wa.HasNonSessionWork, so the drain-step exclusion cannot leak into
 // sessionHasOpenAssignedWorkForTier's other caller (the awake-work chain).
-func sessionHasOpenAssignedWorkForTierForCloseGate(store beads.Store, assignee, status string, tierMode beads.TierMode, live bool) (bool, error) {
+func sessionHasOpenAssignedWorkForTierForCloseGate(store beads.Store, assignee, status string, tierMode beads.TierMode, live bool, releaseClosedInputSteps bool) (bool, error) {
 	wa := workAssignmentForStore(beads.WorkStore{Store: store})
 	items, err := wa.OpenAssignedTo(assignee, status, tierMode, live)
 	if err != nil {
 		return false, err
 	}
-	return hasNonSessionNonOwnDrainStepWork(store, items), nil
+	return hasNonSessionNonOwnDrainStepWork(store, items, releaseClosedInputSteps), nil
 }
 
 // sessionHasOpenAssignedWispWorkForCloseGate mirrors sessionHasOpenAssignedWispWork
@@ -4074,14 +4089,15 @@ func sessionHasOpenAssignedWorkForTierForCloseGate(store beads.Store, assignee, 
 // path: that cache is a positive-only accelerator built on the shared
 // wa.HasNonSessionWork filter, and drain-ack is not a hot loop, so the extra
 // live read here is cheap and keeps the exclusion correct rather than stale.
-func sessionHasOpenAssignedWispWorkForCloseGate(store beads.Store, assignee, status string) (bool, error) {
-	return sessionHasOpenAssignedWorkForTierForCloseGate(store, assignee, status, beads.TierWisps, true)
+func sessionHasOpenAssignedWispWorkForCloseGate(store beads.Store, assignee, status string, releaseClosedInputSteps bool) (bool, error) {
+	return sessionHasOpenAssignedWorkForTierForCloseGate(store, assignee, status, beads.TierWisps, true, releaseClosedInputSteps)
 }
 
 // hasNonSessionNonOwnDrainStepWork is wa.HasNonSessionWork plus the own-drain-step
 // exclusion: skips session beads/repairable session beads (as HasNonSessionWork
-// already does) AND the session's own mol-do-work drain step.
-func hasNonSessionNonOwnDrainStepWork(store beads.Store, items []beads.Bead) bool {
+// already does) AND the session's own mol-do-work drain step. With
+// releaseClosedInputSteps it also skips steps whose workflow input is terminal.
+func hasNonSessionNonOwnDrainStepWork(store beads.Store, items []beads.Bead, releaseClosedInputSteps bool) bool {
 	for _, item := range items {
 		if sessionpkg.IsSessionBeadOrRepairable(item) {
 			continue
@@ -4089,9 +4105,49 @@ func hasNonSessionNonOwnDrainStepWork(store beads.Store, items []beads.Bead) boo
 		if isSessionOwnDrainStepBead(store, item) {
 			continue
 		}
+		if releaseClosedInputSteps && workflowStepInputTerminal(store, item) {
+			continue
+		}
 		return true
 	}
 	return false
+}
+
+// workflowStepInputTerminal reports whether item is a graph.v2 step (it carries
+// gc.root_bead_id) whose root's input convoy (gc.input_convoy_id) tracks at
+// least one member, every one of them terminal. The root and the convoy are
+// resolved in store, the store the step was found in: a workflow's steps are
+// poured into their root's own store (gc.root_store_ref), and its input convoy
+// lives beside the root.
+//
+// Only terminal members count. A member that is still open or in_progress
+// keeps the step, whoever holds it: a member held by another live seat is a
+// shared workflow still in flight, not a finished one. A lookup failure, a root
+// without an input convoy, or a convoy with no members reports false, so a
+// store hiccup can never release work.
+func workflowStepInputTerminal(store beads.Store, item beads.Bead) bool {
+	rootID := strings.TrimSpace(item.Metadata[beadmeta.RootBeadIDMetadataKey])
+	if rootID == "" || rootID == item.ID || store == nil {
+		return false
+	}
+	root, err := store.Get(rootID)
+	if err != nil {
+		return false
+	}
+	convoyID := strings.TrimSpace(root.Metadata[beadmeta.InputConvoyIDMetadataKey])
+	if convoyID == "" {
+		return false
+	}
+	members, err := convoy.Members(store, convoyID, true)
+	if err != nil || len(members) == 0 {
+		return false
+	}
+	for _, member := range members {
+		if !convoy.IsTerminalStatus(member.Status) {
+			return false
+		}
+	}
+	return true
 }
 
 // isSessionOwnDrainStepBead reports whether item is a mol-do-work "drain" step

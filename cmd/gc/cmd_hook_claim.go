@@ -685,8 +685,10 @@ func workflowInputDone(store beads.Store, candidate beads.Bead, identityCandidat
 	return root.ID, true, nil
 }
 
-// workflowStepAssignees lists every assignee recorded on any step (open or
-// closed) of the workflow rooted at rootID.
+// workflowStepAssignees lists every seat recorded on any step (open or closed)
+// of the workflow rooted at rootID: its assignee plus its gc.session_name and
+// gc.session_id claim provenance, which survive a reopen that clears the
+// assignee of a seat that died mid-step.
 func workflowStepAssignees(store beads.Store, rootID string) ([]string, error) {
 	steps, err := store.List(beads.ListQuery{
 		Metadata:      map[string]string{beadmeta.RootBeadIDMetadataKey: rootID},
@@ -698,8 +700,14 @@ func workflowStepAssignees(store beads.Store, rootID string) ([]string, error) {
 	}
 	seats := []string{}
 	for _, step := range steps {
-		if a := strings.TrimSpace(step.Assignee); a != "" {
-			seats = append(seats, a)
+		for _, a := range []string{
+			step.Assignee,
+			step.Metadata[beadmeta.SessionNameMetadataKey],
+			step.Metadata[beadmeta.SessionIDMetadataKey],
+		} {
+			if a = strings.TrimSpace(a); a != "" {
+				seats = append(seats, a)
+			}
 		}
 	}
 	return seats, nil

@@ -153,6 +153,38 @@ func TestWorkflowInputDoneFalseWhenMemberHeldBySiblingSeatOfSameWorkflow(t *test
 	}
 }
 
+// A seat that died before closing its step leaves that step reopened with the
+// assignee cleared; only the step's gc.session_name/gc.session_id claim
+// provenance still names it. That seat is still this workflow's own worker.
+func TestWorkflowInputDoneFalseWhenMemberHeldBySiblingSeatWhoseStepWasReopened(t *testing.T) {
+	store, root, step := seedDoneWorkflow(t, "open")
+	const deadSeat = "homeops__homeops-luna-gc-5g2aze"
+	if _, err := store.Create(beads.Bead{Title: "claim input", Status: "open", Metadata: map[string]string{
+		beadmeta.RootBeadIDMetadataKey:        root.ID,
+		beadmeta.ContinuationGroupMetadataKey: "pool-workflow",
+		beadmeta.RoutedToMetadataKey:          "rig/worker",
+		beadmeta.SessionNameMetadataKey:       deadSeat,
+		beadmeta.SessionIDMetadataKey:         "gc-5g2aze",
+	}}); err != nil {
+		t.Fatalf("create reopened claim step: %v", err)
+	}
+	members, err := convoy.Members(store, root.Metadata[beadmeta.InputConvoyIDMetadataKey], true)
+	if err != nil || len(members) != 1 {
+		t.Fatalf("convoy.Members = %d, %v; want 1 member", len(members), err)
+	}
+	if err := store.Update(members[0].ID, beads.UpdateOpts{Status: strPtr("in_progress"), Assignee: strPtr(deadSeat)}); err != nil {
+		t.Fatalf("update work: %v", err)
+	}
+
+	_, done, err := workflowInputDone(store, step, []string{"homeops__homeops-luna-gc-9b2b0a"})
+	if err != nil {
+		t.Fatalf("workflowInputDone: %v", err)
+	}
+	if done {
+		t.Fatal("done = true for a member held by a sibling seat whose step was reopened, want false")
+	}
+}
+
 func TestWorkflowInputDoneFalseWhenMemberAssignedToIdentityCandidate(t *testing.T) {
 	store, root, _ := seedDoneWorkflow(t, "handed_off")
 	convoyID := root.Metadata[beadmeta.InputConvoyIDMetadataKey]

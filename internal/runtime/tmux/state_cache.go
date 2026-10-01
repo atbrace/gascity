@@ -592,8 +592,14 @@ func (f *tmuxFetcher) FetchState(ctx context.Context) (runtimeStateSnapshot, err
 		// older than tmux says it is. Every window has at least one pane and all
 		// panes of a window carry their window's activity, so the max over pane
 		// rows is exactly the max over windows.
-		if len(parts) > 4 && parts[4] == "1" {
-			session.Attached = true
+		// #{session_attached} is the NUMBER of attached clients, not a 0/1
+		// flag: a session with two clients reads "2". Anything but "0" (or a
+		// missing/blank field) is attached — matching parseAttachedClients,
+		// which the direct per-session probe uses.
+		if len(parts) > 4 {
+			if attached := strings.TrimSpace(parts[4]); attached != "" && attached != "0" {
+				session.Attached = true
+			}
 		}
 		if len(parts) > 5 {
 			if activity, convErr := strconv.ParseInt(strings.TrimSpace(parts[5]), 10, 64); convErr == nil && activity > session.Activity {

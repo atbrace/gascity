@@ -1013,12 +1013,13 @@ func TestFetchStateCarriesAttachmentAndMaxWindowActivity(t *testing.T) {
 	fe := &fakeExecutor{
 		// Two sessions. "multi" has three windows with differing activity and
 		// a fourth remain-on-exit corpse window holding the NEWEST timestamp;
-		// "solo" is attached.
+		// it has TWO attached clients — #{session_attached} is a client count,
+		// not a boolean, and must read as attached. "solo" is attached.
 		out: strings.Join([]string{
-			"multi\t0\tclaude\t101\t0\t1000",
-			"multi\t0\tclaude\t102\t0\t3000",
-			"multi\t0\tclaude\t103\t0\t2000",
-			"multi\t1\tbash\t104\t0\t4000",
+			"multi\t0\tclaude\t101\t2\t1000",
+			"multi\t0\tclaude\t102\t2\t3000",
+			"multi\t0\tclaude\t103\t2\t2000",
+			"multi\t1\tbash\t104\t2\t4000",
 			"solo\t0\tcodex\t201\t1\t500",
 		}, "\n"),
 	}
@@ -1033,8 +1034,10 @@ func TestFetchStateCarriesAttachmentAndMaxWindowActivity(t *testing.T) {
 	if !multi.Running {
 		t.Error("multi.Running = false, want true (it has live panes)")
 	}
-	if multi.Attached {
-		t.Error("multi.Attached = true, want false")
+	// "multi" reads session_attached="2" (two clients): a count, not a
+	// boolean — it must be reported attached, not detached.
+	if !multi.Attached {
+		t.Error("multi.Attached = false, want true (2 attached clients)")
 	}
 	// 4000 comes from the dead pane's row: a remain-on-exit corpse window is
 	// still a window, and the per-session list-windows read reports it, so

@@ -171,8 +171,8 @@ func buildAwakeInputFromReconcilerWithObservationErrors(
 			RestartRequested:       strings.TrimSpace(info.RestartRequested) == "true",
 			ContinuationResetPending: strings.TrimSpace(info.ContinuationResetPending) == "true" &&
 				strings.TrimSpace(info.ResetCommittedAt) != "",
-			CurrentlyProcessingBeadID: strings.TrimSpace(info.CurrentlyProcessingBeadID),
-			PostCreateProtected:       poolSessionWithinPostCreateProtection(info, clk),
+			CurrentlyProcessingBeadID:       strings.TrimSpace(info.CurrentlyProcessingBeadID),
+			PostCreateProtected:             poolSessionWithinPostCreateProtection(info, clk),
 			CurrentlyProcessingWorkflowRoot: strings.TrimSpace(info.CurrentlyProcessingWorkflowRoot),
 		}
 		bead.HeldUntil = lifecycle.HeldUntil
@@ -330,4 +330,3 @@ func parseSleepDuration(s string) time.Duration {
 	}
 	return d
 }
-

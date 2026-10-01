@@ -19,6 +19,10 @@ const (
 	// pruneDeadQueuedNudgesWithClock, gastownhall/gascity#5278), so there is no
 	// second FindIncludingTerminal call to account for here.
 	advancingNudgeStoreDeadItemOps = 3
+	// advancingNudgeStoreTerminalizeOps is the store-op cost of terminalizing
+	// one queued nudge during enqueue-time supersession: Terminalize does
+	// SetMetadataBatch + Close (see nudgequeue.Store.Terminalize).
+	advancingNudgeStoreTerminalizeOps = 2
 )
 
 type advancingNudgeStore struct {
@@ -200,7 +204,16 @@ func TestSlingNudgeEnqueueBudgetPreservesQueuedItems(t *testing.T) {
 		t.Fatalf("advancing store ops = %d, want at most %d to prove the maintenance budget cut in", ops, maxOps)
 	}
 
-	processed := deadBacklogProcessed(deadBacklog, latency)
+	// Supersession runs before the housekeeping sweep, so the dead-prune pass
+	// does not get a fresh budget: the 4 matched pending/in-flight items each
+	// cost one Terminalize (SetMetadataBatch + Close) first. The prune loop
+	// checks the deadline before each item, so the processed count is the
+	// number of 3-op items that fit in what supersession left.
+	supersededCost := 4 * (advancingNudgeStoreTerminalizeOps * latency)
+	processed := int((nudgeEnqueueMaintenanceBudget-supersededCost)/(advancingNudgeStoreDeadItemOps*latency)) + 1
+	if processed > deadBacklog {
+		processed = deadBacklog
+	}
 	survivors := deadBacklog - processed
 	buckets := nudgeQueueBucketsByID(t, cityPath)
 	if got, want := len(buckets), survivors+4+1; got != want {

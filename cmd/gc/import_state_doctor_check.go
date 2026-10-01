@@ -422,6 +422,7 @@ func legacyPublicPackSubpath(subpath string) (string, bool) {
 	return "", false
 }
 
+//nolint:unparam // fs seam is intentional for command tests and symmetry with the other import helpers.
 func rewriteLegacyPublicPackImportsFS(fs fsys.FS, cityPath string, targets map[string]wave1PublicPackImportTarget) (bool, error) {
 	for packName, target := range targets {
 		if strings.TrimSpace(packName) == "" || strings.TrimSpace(target.Binding) == "" {

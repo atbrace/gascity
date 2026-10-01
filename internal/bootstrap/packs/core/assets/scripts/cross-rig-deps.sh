@@ -61,9 +61,10 @@ run_bd_for_scope() {
     fi
 }
 
-# Cross-prefix targets are stored verbatim in depends_on_external. bd dep
-# list returns hydrated issue records and cannot surface a target that is
-# absent from the local store, so query the owning column directly.
+# Cross-prefix targets are stored verbatim in depends_on_external. The
+# gc bd dep list command returns hydrated issue records and cannot surface
+# a target that is absent from the local store, so query the owning column
+# directly.
 EXTERNAL_BLOCKS_SQL="SELECT issue_id, depends_on_external
 FROM dependencies
 WHERE type = 'blocks' AND depends_on_external IS NOT NULL
@@ -81,7 +82,7 @@ while IFS="$(printf '\t')" read -r scope_kind scope_name; do
     [ -n "$scope_kind" ] || continue
     if ! ROWS=$(run_bd_for_scope "$scope_kind" "$scope_name" \
             sql --json "$EXTERNAL_BLOCKS_SQL" 2>"$ERR_FILE"); then
-        echo "cross-rig-deps: skipping $scope_name — bd sql failed: $(tail -n 1 "$ERR_FILE")" >&2
+        echo "cross-rig-deps: skipping $scope_name — gc bd sql failed: $(tail -n 1 "$ERR_FILE")" >&2
         continue
     fi
     if [ -z "$ROWS" ] || [ "$ROWS" = "[]" ]; then

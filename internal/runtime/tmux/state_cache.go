@@ -216,6 +216,12 @@ func (c *StateCache) SessionActivity(name string) (time.Time, bool) {
 }
 
 func (c *StateCache) currentState() runtimeStateSnapshot {
+	// A nil cache knows nothing: report an empty snapshot so every reader
+	// treats the session as absent and falls back to its direct probe. Tests
+	// (and any future zero-value Provider) build a Tmux without a cache.
+	if c == nil {
+		return runtimeStateSnapshot{}
+	}
 	obs, hit := c.observeRefreshing()
 	if hit {
 		return obs.state

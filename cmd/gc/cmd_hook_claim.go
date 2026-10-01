@@ -1573,8 +1573,9 @@ func retireDoneWorkflowCandidates(candidates []beads.Bead, opts hookClaimOptions
 			kept = append(kept, candidate)
 			continue
 		}
+		now := ops.nowOrWallClock()
 		served := hookClaimHasIdentity(candidate.Assignee, opts.IdentityCandidates) ||
-			hookCandidateClaimable(candidate, opts.RouteTargets)
+			hookCandidateClaimable(candidate, opts.RouteTargets, now)
 		if served && hookSkipIfInputDone(candidate, opts, ops, dir, stderr) {
 			continue
 		}

@@ -169,6 +169,12 @@ func findPiSessionCandidates(searchPaths []string, workDir string) []piSessionCa
 
 	roots := mergePiSearchPaths(searchPaths)
 	dirName := piSessionDirName(workDir)
+	// The encoded name is a single path component by construction (every
+	// separator is replaced); the IsLocal guard keeps the join provably
+	// containment-safe for CodeQL's path-injection query.
+	if !filepath.IsLocal(dirName) {
+		return nil
+	}
 	var candidates []piSessionCandidate
 	encodedDirFound := false
 	for _, root := range roots {

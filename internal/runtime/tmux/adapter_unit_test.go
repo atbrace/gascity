@@ -221,15 +221,18 @@ func TestProviderAttachmentAndActivityFallBackWhenSnapshotMissesSession(t *testi
 	fe := &fakeExecutor{
 		outs: []string{
 			"agent-1\t0\tclaude\t101\t0\t1000", // list-panes: no agent-2
-			"0",                                // display-message for agent-2
+			"agent-2|1",                        // display-message for agent-2 (name|client-count)
 			"5000",                             // list-windows for agent-2
 		},
 	}
 	p := NewProviderWithConfig(Config{SocketName: "x"})
 	p.tm.exec = fe
 
-	if p.IsAttached("agent-2") {
-		t.Error("IsAttached(agent-2) = true, want false from the direct read")
+	if !p.IsAttached("agent-2") {
+		t.Error("IsAttached(agent-2) = false, want true from the direct read")
+	}
+	if len(fe.calls) < 2 || !strings.Contains(strings.Join(fe.calls[1], " "), "display-message") {
+		t.Fatalf("tmux calls = %v, want the per-session display-message attachment fallback after list-panes", fe.calls)
 	}
 	got, err := p.GetLastActivity("agent-2")
 	if err != nil {

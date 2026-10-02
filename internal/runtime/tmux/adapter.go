@@ -344,6 +344,11 @@ func (p *Provider) IsDeadRuntimeSession(name string) (bool, error) {
 // pass probes attachment for every session it tracks, so the per-session form
 // cost one tmux process per session per pass. A session missing from the
 // snapshot falls back to the direct read.
+//
+// Only this boolean read is served from the snapshot. [Provider.IsAttachedWithError],
+// the error-aware probe that destructive-action gates use, deliberately keeps
+// its direct per-session `display-message` so those gates never act on a
+// cached answer.
 func (p *Provider) IsAttached(name string) bool {
 	if attached, ok := p.cache.SessionAttached(name); ok {
 		return attached

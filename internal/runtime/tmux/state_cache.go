@@ -54,7 +54,9 @@ const (
 // StateFetcher abstracts tmux subprocess calls for testability.
 type StateFetcher interface {
 	// FetchState returns a runtime-state snapshot for live sessions.
-	// Sessions with remain-on-exit corpses (pane_dead=1) are excluded.
+	// Corpse-only sessions (every pane pane_dead=1 under remain-on-exit) are
+	// kept with Running: false so their window activity is recorded; they
+	// still contribute no liveness.
 	// The returned snapshot is handed to StateCache, which publishes it to
 	// lock-free readers, so the fetcher must not retain or mutate its maps.
 	FetchState(ctx context.Context) (runtimeStateSnapshot, error)
@@ -538,8 +540,10 @@ func (g *processSnapshotGate) succeeded() bool {
 }
 
 // FetchState runs one tmux pane snapshot and one process-table snapshot.
-// Sessions where remain-on-exit has kept a dead pane (pane_dead=1) are
-// excluded — they represent exited processes, not running ones.
+// Corpse-only sessions (remain-on-exit has kept only dead panes, pane_dead=1)
+// are kept with Running: false so their window activity is recorded; they
+// still contribute no liveness — they represent exited processes, not
+// running ones.
 func (f *tmuxFetcher) FetchState(ctx context.Context) (runtimeStateSnapshot, error) {
 	out, err := f.tm.runCtx(ctx, "list-panes", "-a", "-F", "#{session_name}\t#{pane_dead}\t#{pane_current_command}\t#{pane_pid}\t#{session_attached}\t#{window_activity}")
 	if err != nil {

@@ -459,14 +459,17 @@ concurrent builds.
 
 Before considering any task complete:
 
-- Fast unit baseline passes — use `make test-fast-parallel`, which reads
+- Fast unit baseline passes — prefer `make test-fast-parallel`, which reads
   `LOCAL_TEST_JOBS`/`LOCAL_TEST_GO_PROCS` and clamps their product to available
-  memory. Plain `make test` is a single unbounded `go test -p ./...` sweep over
-  the whole module including `cmd/gc`; on a memory-constrained host it is the
-  dangerous choice, not the simple one (gcy-bme). This list previously named
-  `make test` first and unqualified, and agents kept picking it.
-  **On a shared or memory-constrained machine, run neither locally — push the
-  sweep to the cluster.**
+  memory (gcy-bme). `make test` is a single `go test -p ./...` sweep over the
+  whole module including `cmd/gc`, now bounded via `TEST_PKG_PARALLEL` (default
+  4): a package's memory cost is its test binary's link rather than its compile,
+  and 58 of 149 test binaries link ~1.6 GiB with `internal/api` reaching
+  2.44 GiB (gcy-z78). `-p` bounds concurrency only — it cannot bound a single
+  link, so on a host with under ~3 GiB free no value of `-p` makes the sweep
+  fit. **On a shared or memory-constrained machine, run neither locally — push
+  the sweep to the cluster.** For broad local sweeps prefer the sharded targets
+  per `TESTING.md` and the guidance above.
 - Broader process/integration coverage uses the sharded targets documented in
   `TESTING.md` instead of one monolithic `go test ./...` sweep
 - `go vet ./...` clean

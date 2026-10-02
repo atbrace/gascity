@@ -324,7 +324,7 @@ func TestDoHookClaimStillClaimsWhenInputNotDone(t *testing.T) {
 			return nil, nil
 		},
 		AssignContinuation: func(_ context.Context, _ string, _ []string, _, _ string) error { return nil },
-		ResolveWorkBranch: func(hookClaimWorkTree) string { return "" },
+		ResolveWorkBranch:  func(_ hookClaimWorkTree) string { return "" },
 		StampWorkMeta: func(_ context.Context, _ string, _ []string, _, _ string, _ map[string]string) error {
 			return nil
 		},

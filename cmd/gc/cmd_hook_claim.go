@@ -1243,18 +1243,20 @@ func writeHookClaimWorkResultForBead(result hookClaimJSONResult, bead beads.Bead
 	}
 	stampHookSessionCurrentClaim(bead, opts, ops, stderr)
 	publishHookClaimRunMap(bead, opts, ops, stderr)
-	// Continuation pre-assignment is BEST-EFFORT, like the sibling
-	// stampHookClaimIdentity and publishHookClaimRunMap calls above: it only
-	// optimizes which session is offered the next step. It must never veto the
-	// claim itself. A store hiccup, Dolt latency past the mutation budget, or a
-	// sibling that refuses an assignment would otherwise turn a successful claim
-	// (the held existing_assignment step, or a fresh claim) into a non-zero exit
-	// with no JSON on stdout — the exact hard-fail that stranded graph.v2 recon
-	// workflows (sys-pxryan.20). We keep whatever did land and log the rest; the
-	// preassignment is retried on the next tick (NDI).
+	// Continuation pre-assignment pins the remaining steps of the continuation
+	// group to this session. For gc.session_affinity=require pools it is how
+	// later steps stay on the same session and worktree; nothing else enforces
+	// that for unassigned siblings at claim time. A failure here (a store hiccup,
+	// Dolt latency past the mutation budget, a sibling refusing assignment) can
+	// therefore let another session claim the next sibling. We accept losing
+	// affinity over vetoing the claim: a non-zero exit with no JSON would strand
+	// the step this session already claimed (fresh or existing_assignment), which
+	// stalled graph.v2 workflows (#6462, sys-pxryan.20). Whatever did land is kept
+	// and the rest is logged. Pre-assignment is only retried if this session
+	// claims again in the same group before another session takes the sibling.
 	assigned, err := preassignHookContinuationGroup(bead, opts, ops, dir)
 	if err != nil {
-		fmt.Fprintf(stderr, "gc hook --claim: preassigning continuation group for %s: %v (non-fatal; returning held step, continuation retried next tick)\n", bead.ID, err) //nolint:errcheck
+		fmt.Fprintf(stderr, "gc hook --claim: preassigning continuation group for %s: %v (non-fatal; returning claimed step, affinity for unassigned siblings not guaranteed)\n", bead.ID, err) //nolint:errcheck
 	}
 	result.ContinuationAssigned = assigned
 	if writeErr := writeHookClaimResultLine(result, opts.JSON, stdout); writeErr != nil {

@@ -3801,7 +3801,7 @@ func realizePoolDesiredSessionsAt(
 	// reserve an (alias, slot) for a fresh create. Mutates used/usedSlots
 	// under serial control so dedup and slot allocation remain deterministic.
 	items := make([]poolRealizeWorkItem, 0, len(poolState.Requests))
-	boundByWork, reserved := poolSessionsBoundToDemandedWork(bp, cfgAgent, qualifiedName, poolState.Requests)
+	boundByWork, reserved := poolSessionsBoundToDemandedWork(bp, cfgAgent, qualifiedName, poolState.Requests, poolDecisionTime)
 	for _, request := range poolState.Requests {
 		// planItem runs the per-request selection and returns the work item;
 		// any early-out (skip path) sets item.skip and returns. The single
@@ -3810,9 +3810,13 @@ func realizePoolDesiredSessionsAt(
 			item := poolRealizeWorkItem{request: request}
 			var prefer *session.Info
 			selectUsed := used
+			affinityPick := false
+			var bound session.Info
 			if request.SessionBeadID == "" {
-				if bound, ok := boundByWork[strings.TrimSpace(request.WorkBeadID)]; ok && !used[bound.ID] {
+				var ok bool
+				if bound, ok = boundByWork[strings.TrimSpace(request.WorkBeadID)]; ok && !used[bound.ID] {
 					prefer = &bound
+					affinityPick = true
 				} else if len(reserved) > 0 {
 					// Leave sessions bound to other still-demanded work for
 					// those requests; positional reuse would re-point them.
@@ -3840,6 +3844,22 @@ func realizePoolDesiredSessionsAt(
 				}
 			}
 			sessionInfo, slot, plan, err := selectOrPlanPoolSessionBead(bp, cfgAgent, qualifiedName, prefer, request, poolDecisionTime, selectUsed, usedSlots)
+			if affinityPick && err != nil &&
+				!errors.Is(err, errPoolSessionCreateBudgetExhausted) &&
+				!errors.Is(err, errPoolSessionCreatePartial) {
+				// The bound session could not take the request (e.g. its slot
+				// is no longer claimable); fall back to ordinary selection
+				// without it or the sessions reserved for other demanded work.
+				selectUsed = make(map[string]bool, len(used)+len(reserved)+1)
+				for id := range used {
+					selectUsed[id] = true
+				}
+				for id := range reserved {
+					selectUsed[id] = true
+				}
+				selectUsed[bound.ID] = true
+				sessionInfo, slot, plan, err = selectOrPlanPoolSessionBead(bp, cfgAgent, qualifiedName, nil, request, poolDecisionTime, selectUsed, usedSlots)
+			}
 			if err != nil {
 				switch {
 				case errors.Is(err, errPoolSessionCreateBudgetExhausted):
@@ -4042,8 +4062,14 @@ func realizePoolDesiredSessionsAt(
 // selectOrPlanPoolSessionBead is otherwise positional (j-th request, j-th
 // reusable session), so any shift in request order or in the session set
 // between passes re-points every idle session's trigger — one store write and
-// one bead.updated event per session per reconcile tick (sys-rgwg4x).
-func poolSessionsBoundToDemandedWork(bp *agentBuildParams, cfgAgent *config.Agent, template string, requests []SessionRequest) (map[string]session.Info, map[string]bool) {
+// one bead.updated event per session per reconcile tick (#6090). Candidates
+// use the new-tier reuse filter, so held or quarantined sessions are neither
+// preferred nor reserved. Canonical singleton pools have a single identity and
+// need no affinity.
+func poolSessionsBoundToDemandedWork(bp *agentBuildParams, cfgAgent *config.Agent, template string, requests []SessionRequest, decisionTime time.Time) (map[string]session.Info, map[string]bool) {
+	if cfgAgent != nil && cfgAgent.UsesCanonicalSingletonPoolIdentity() {
+		return nil, nil
+	}
 	demanded := make(map[string]bool, len(requests))
 	for _, request := range requests {
 		if request.SessionBeadID != "" {
@@ -4058,7 +4084,7 @@ func poolSessionsBoundToDemandedWork(bp *agentBuildParams, cfgAgent *config.Agen
 	}
 	boundByWork := make(map[string]session.Info)
 	reserved := make(map[string]bool)
-	for _, info := range reusablePoolSessionInfos(bp, cfgAgent, template, nil) {
+	for _, info := range reusablePoolSessionInfosForRequest(bp, cfgAgent, template, SessionRequest{Template: template}, decisionTime, nil) {
 		if strings.TrimSpace(info.SessionNameMetadata) == "" {
 			continue
 		}

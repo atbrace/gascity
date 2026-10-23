@@ -2295,7 +2295,8 @@ func workflowInputDone(store beads.Store, candidate beads.Bead, identityCandidat
 // workflowStepAssignees lists every seat recorded on any step (open or closed)
 // of the workflow rooted at rootID: its assignee plus its gc.session_name and
 // gc.session_id claim provenance, which survive a reopen that clears the
-// assignee of a seat that died mid-step.
+// assignee of a seat that died mid-step. Closed steps and session provenance
+// are included on purpose so reopened steps of dead seats still count.
 func workflowStepAssignees(store beads.Store, rootID string) ([]string, error) {
 	steps, err := store.List(beads.ListQuery{
 		Metadata:      map[string]string{beadmeta.RootBeadIDMetadataKey: rootID},
@@ -2349,12 +2350,12 @@ func skipDoneWorkflow(store beads.Store, rootID string) error {
 
 const hookSkipDoneWorkflowCloseReason = "hook --claim: input convoy work already terminal; nothing to do"
 
-func hookInputDoneWithBdStore(_ context.Context, dir string, env []string, candidate beads.Bead, identityCandidates []string) (string, bool, error) {
-	return workflowInputDone(hookClaimBdStore(dir, env, ""), candidate, identityCandidates)
+func hookInputDoneWithBdStore(ctx context.Context, dir string, env []string, candidate beads.Bead, identityCandidates []string) (string, bool, error) {
+	return workflowInputDone(hookClaimBdStoreContext(ctx, dir, env, ""), candidate, identityCandidates)
 }
 
-func hookSkipDoneWorkflowWithBdStore(_ context.Context, dir string, env []string, rootID string) error {
-	return skipDoneWorkflow(hookClaimBdStore(dir, env, ""), rootID)
+func hookSkipDoneWorkflowWithBdStore(ctx context.Context, dir string, env []string, rootID string) error {
+	return skipDoneWorkflow(hookClaimBdStoreContext(ctx, dir, env, ""), rootID)
 }
 
 func hookClaimWithBdStore(ctx context.Context, dir string, env []string, beadID, assignee string) (beads.Bead, bool, error) {

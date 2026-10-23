@@ -185,6 +185,36 @@ func TestWorkflowInputDoneFalseWhenMemberHeldBySiblingSeatWhoseStepWasReopened(t
 	}
 }
 
+// A reopened step may keep only gc.session_id as provenance; a member whose
+// assignee is that session id is still held by this workflow's own seat.
+func TestWorkflowInputDoneFalseWhenMemberHeldBySessionIDOnlyProvenance(t *testing.T) {
+	store, root, step := seedDoneWorkflow(t, "open")
+	const deadSessionID = "gc-5g2aze"
+	if _, err := store.Create(beads.Bead{Title: "claim input", Status: "open", Metadata: map[string]string{
+		beadmeta.RootBeadIDMetadataKey:        root.ID,
+		beadmeta.ContinuationGroupMetadataKey: "pool-workflow",
+		beadmeta.RoutedToMetadataKey:          "rig/worker",
+		beadmeta.SessionIDMetadataKey:         deadSessionID,
+	}}); err != nil {
+		t.Fatalf("create reopened claim step: %v", err)
+	}
+	members, err := convoy.Members(store, root.Metadata[beadmeta.InputConvoyIDMetadataKey], true)
+	if err != nil || len(members) != 1 {
+		t.Fatalf("convoy.Members = %d, %v; want 1 member", len(members), err)
+	}
+	if err := store.Update(members[0].ID, beads.UpdateOpts{Status: strPtr("in_progress"), Assignee: strPtr(deadSessionID)}); err != nil {
+		t.Fatalf("update work: %v", err)
+	}
+
+	_, done, err := workflowInputDone(store, step, []string{"homeops__homeops-luna-gc-9b2b0a"})
+	if err != nil {
+		t.Fatalf("workflowInputDone: %v", err)
+	}
+	if done {
+		t.Fatal("done = true for a member held by a seat named only by gc.session_id provenance, want false")
+	}
+}
+
 func TestWorkflowInputDoneFalseWhenMemberAssignedToIdentityCandidate(t *testing.T) {
 	store, root, _ := seedDoneWorkflow(t, "handed_off")
 	convoyID := root.Metadata[beadmeta.InputConvoyIDMetadataKey]

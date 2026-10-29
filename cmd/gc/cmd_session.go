@@ -1982,7 +1982,7 @@ func cmdSessionClose(args []string, key string, stdout, stderr io.Writer, asJSON
 	// polling the store every cycle forever. The reconcile tick has the same
 	// reap as a backstop; doing it here means close takes effect now.
 	if cityErr == nil {
-		closedName := strings.TrimSpace(closedSessionBead.Metadata["session_name"])
+		closedName := strings.TrimSpace(sessionInfoFromBead(closedSessionBead).SessionNameMetadata)
 		for _, target := range reapNudgePollersForClosedSession(cityPath, closedName, stderr) {
 			fmt.Fprintf(stderr, "gc session close: reaped nudge poller %s\n", target) //nolint:errcheck // best-effort stderr
 		}
